@@ -362,39 +362,59 @@ workflows:
         checkout: none
         prompt: |
           Triage the code-review request on {{.inputs.repo}}#{{.inputs.pr}} ("{{.inputs.title}}").
-          Read the diff and description, then decide whether an automated review may
-          post itself ("auto") or this genuinely needs a human's own interactive
-          review ("manual").
+          Read the diff (`gh pr diff {{.inputs.repo}}#{{.inputs.pr}}`) and description, then
+          decide whether an automated review may post itself ("auto") or this
+          genuinely needs my own interactive review ("manual").
 
-          First judge the PR's quality — this is your confidence signal for "auto":
-          - tests_sufficient: does the change carry adequate tests for the behavior it
-            changes? Value real-world/integration validation and demonstrated results
-            most; unit tests alone are fine when that's the right level. A change that
-            legitimately needs no tests (pure docs/config) counts as sufficient (true).
-            Mark false only when it clearly warranted more testing than it got.
-          - docs_sufficient: is the documentation/description adequate? Most changes
-            need no doc updates (true). Mark false only when it clearly should have
-            documented something and didn't.
-          - glaring_holes: a glaring hole in the logic or test coverage — an obvious
-            bug, an unhandled case that matters, a meaningful untested path. Nitpicks
-            and style are NOT glaring holes; the review team catches those.
+          First judge the PR's quality — this is your confidence signal for going
+          "auto". Set each of these:
+          - tests_sufficient: does the change carry adequate tests for the behavior
+            it changes? Value REAL-WORLD validation most: integration/end-to-end
+            coverage, tests run against realistic or production-like inputs/data,
+            and demonstrated results (sample runs, actual outputs, before/after
+            evidence in the diff or PR description) are the strongest signal and
+            should push toward "auto". But unit tests alone are perfectly sufficient
+            when that's the right level for the change — plenty of things aren't
+            meaningfully real-world testable, and only-unit-tests is NOT itself a
+            reason to fail this. Mark false only when the change clearly warranted
+            real-world/integration validation (or more testing than it got) and
+            didn't get it, or when tests are missing for behavior that needs them. A
+            change that legitimately needs no tests (pure docs, comments, trivial
+            config) counts as sufficient (true).
+          - docs_sufficient: is the documentation/description adequate for what
+            changed? Most changes need no doc updates — that counts as sufficient
+            (true). Only mark false when a change clearly should have documented
+            something and didn't.
+          - glaring_holes: can you see a glaring hole in the logic or the test
+            coverage — an obvious bug, an unhandled case that matters, or a
+            meaningful untested path? Nitpicks and style are NOT glaring holes;
+            the automated reviewer catches those in its review.
 
-          DEFAULT TO "auto", harder when quality clears the bar: an adequately tested
-          and documented change with no glaring holes should be "auto" even at the
-          higher end of medium risk. "auto" does NOT mean no scrutiny — the review team
-          still reviews and flags concerns; it only means no human is needed to gate
-          posting.
+          DEFAULT TO "auto", and lean on it harder when quality clears the bar: a
+          change that is adequately tested and documented with no glaring holes
+          should be "auto" even at the higher end of medium risk — features,
+          refactors, bugfixes, tests, docs, UI, routine schema/config. "auto" does
+          NOT mean "no scrutiny": the review team still reviews it and flags
+          concerns; it only means no human is needed to gate posting the review.
 
-          Answer "manual" only when EITHER (a) the change is genuinely high-stakes —
-          alters security/authz/secrets or permission boundaries; touches payments or
-          money movement; is a destructive/irreversible data change; or changes prod
-          infra that could cause an outage or breach — OR (b) it fails the quality bar
-          in a way a human should weigh in on (a glaring logic/coverage hole, or clearly
-          missing tests on something consequential). A large diff or unclear
-          description alone is NOT a reason for "manual". When unsure, choose "auto".
+          Answer "manual" only when EITHER:
+          (a) the change is genuinely high-stakes and needs human judgment — it
+              clearly alters security/authentication/authorization/secrets or
+              permission/ACL boundaries; touches payments, billing, or money
+              movement; is a destructive or irreversible data change (drops/renames
+              columns or tables; risky backfills/migrations with data-loss risk);
+              or changes production infra that could cause an outage or breach (IAM,
+              networking/firewall, deploy/CD to prod); OR
+          (b) it fails the quality bar in a way I'd want to weigh in on — a glaring
+              logic or test-coverage hole, or clearly missing tests on something
+              consequential.
 
-          Return the structured output: decision, the three quality signals, and a
-          one-sentence reason referencing what you found on tests/docs/holes.
+          A large diff or unclear description alone is NOT a reason for "manual".
+          When unsure, choose "auto".
+
+          Return the structured output: decision, the three quality signals
+          (tests_sufficient, docs_sufficient, glaring_holes), and a one-sentence
+          reason that references what you found on tests/docs/holes.
         output_schema:
           type: object
           additionalProperties: false
