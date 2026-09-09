@@ -1,0 +1,476 @@
+# pr-review-team — a distributable conductor pack.
+#
+# Multi-lens PR review with an optional human hand-off. On a review request it
+# runs a panel of lens reviewers in parallel, refute-verifies every finding,
+# reconciles them deterministically into one ReviewRecord, then either
+# auto-posts the review or hands the DRAFT to a human to approve/edit/post.
+#
+# Define-behavior / bind-environment: this pack ships only BEHAVIOR (agents,
+# workflows, a disarmed trigger). It carries NO connectors and NO secrets — you
+# bind your github connector and (optionally) your own agent profiles in the
+# `packs:` block. Posting uses your github connector's own write identity, so no
+# broker secret is required.
+#
+# Install (in your config's `packs:` block):
+#   packs:
+#     review:
+#       source: github.com/NodeSpy/conductor-packs//pr-review-team        # or a local path
+#       connectors: { github: gh }                        # bind the pack's github -> your connector
+#       agents:                                            # bind roles to your profiles (or omit for defaults)
+#         reviewer: opus
+#         assessor: sonnet
+#         handoff:  sonnet-interactive
+#       triggers:
+#         on_review_request:
+#           enabled: true                                  # arm it
+#           repos:   [your-org/app]                        # scope it — a github trigger MUST name repos
+#   Then: `conductor init` (vendor + lock), `conductor pack plan`, `conductor validate`.
+
+pack:
+  name: pr-review-team
+  version: 1.0.0
+  description: Multi-lens PR review (correctness / security / design …) with refute-verify, deterministic reconcile, and an optional human hand-off.
+  tags: [review, github, code-quality, agents]
+  homepage: https://github.com/NodeSpy/conductor-packs
+  license: Apache-2.0
+  requires:
+    # The daemon versions this pack supports. The diff cap needs no special
+    # version; the oversized-prompt guard backstop landed in 0.8.1.
+    conductor: ">=0.8.0"
+    # Bind-only environment the pack needs — you wire these; the pack never
+    # ships them.
+    connectors: [github]
+    # Agent roles. A bound reviewer/assessor just needs to be a runnable
+    # profile; the hand-off agent must be able to post a review (the skill verb)
+    # and should be interactive (it asks a human before posting).
+    roles:
+      reviewer: {}
+      assessor: {}
+      handoff:
+        skill: [github.submit_review]
+
+# The public surface consumers may reference by qualified name. Everything else
+# is an internal implementation detail the author can refactor freely.
+exports:
+  workflows: [review-flow]
+  agents: [reviewer, assessor, handoff]
+
+# ---- Behavior the pack ships (auto-namespaced under the instance name) ----
+
+agents:
+  # The lens reviewers and the refute-verifier. No provider/model is pinned, so
+  # each falls through to your default runtime — bind them to heavier/cheaper
+  # profiles in the packs block (agents: { reviewer: opus, assessor: sonnet }).
+  reviewer:
+    workspace: worktree
+    guidance: "Review only what the diff changes. Be concrete and cite file:line. Silence beats a not-worth-it comment."
+  assessor:
+    workspace: worktree
+  # The hand-off agent posts the drafted review back on approval. It needs the
+  # submit_review verb through the conductor skill; it posts as the connector's
+  # own write identity (as: me), never as a broker secret — so no secrets_via /
+  # allow_secrets is needed here.
+  handoff:
+    workspace: local
+    skill:
+      verbs: [github.submit_review]
+
+workflows:
+  # ---- The review ENGINE: produces a ReviewRecord, never posts. ----
+  review-team:
+    description: "Multi-lens PR review: parallel lens reviewers, refute-only verify, deterministic reconcile."
+    inputs:
+      repo: { type: string, required: true }   # owner/name
+      pr: { type: integer, required: true }
+      # The review lenses — one parallel reviewer per entry. Override per run to
+      # review through a subset.
+      lenses:
+        default:
+          - name: Architecture
+            focus: >-
+              Dependency direction and module boundaries. Does this point dependencies the
+              right way, or couple layers that should stay apart? Leaky abstractions, a
+              lower layer reaching up, logic in the wrong place, a decision that will be
+              costly to unwind later. Not naming or file size — that is Refactoring.
+          - name: Complexity
+            focus: >-
+              Cognitive load of the changed code. Deep nesting, a function doing too much,
+              duplicated logic that should live in one place, control flow a reader will
+              struggle to follow or a maintainer will trip over. Not architecture, not style.
+          - name: Performance
+            focus: >-
+              Real performance risk introduced by the change. N+1 queries, unbounded loops
+              or allocations, work repeated in a hot path, a missing index or cache,
+              blocking work on a critical path. Only where it matters at this system's
+              scale — never micro-optimization.
+          - name: Refactoring
+            focus: >-
+              Structure and size. An oversized file or function that should be split, a
+              clear extraction that would simplify, dead code left behind, a pattern
+              applied inconsistently. Concrete, worth-doing cleanups — not taste-level
+              rewrites of working code.
+          - name: Security
+            focus: >-
+              Exploitable weaknesses. Injection (SQL/command/XSS), auth or authz gaps,
+              secrets in code or logs, missing input validation, unsafe deserialization,
+              SSRF, weak or misused crypto, path traversal. Anything an attacker could use
+              or that leaks data.
+          - name: Test quality
+            focus: >-
+              Whether the tests actually verify behavior. Assertions that assert nothing,
+              over-mocking that tests the mock instead of the code, tests coupled to
+              implementation detail, and new logic or failure paths with no coverage. Ask:
+              would this test catch the bug it exists for?
+    outputs:
+      event: "{{.reconcile.event}}"             # APPROVE | REQUEST_CHANGES
+      summary: "{{.reconcile.summary}}"         # the review body (one line)
+      comments: "{{.reconcile.comments}}"       # [{path, line, body}] — list preserved by sole-field-ref
+      review: "{{.reconcile.review}}"           # JSON {event, body, comments} — the ReviewRecord to show + post
+    steps:
+      # Upstream context via the github connector's read verbs (cache-aware,
+      # rate-limit-aware, the connector's own credentials).
+      - id: meta
+        uses: github.pr_get
+        options: { repo: "{{.inputs.repo}}", pr: "{{.inputs.pr}}" }   # -> .meta.title / .meta.body
+      - id: diff
+        uses: github.pr_diff
+        options: { repo: "{{.inputs.repo}}", pr: "{{.inputs.pr}}" }   # -> .diff.diff (unified diff)
+      # Repo-convention files (optional). continue_on_error makes a missing file
+      # render empty rather than failing the workflow.
+      - id: std_claude
+        uses: github.file
+        continue_on_error: true
+        options: { repo: "{{.inputs.repo}}", path: CLAUDE.md }
+      - id: std_agents
+        uses: github.file
+        continue_on_error: true
+        options: { repo: "{{.inputs.repo}}", path: AGENTS.md }
+      - id: std_contributing
+        uses: github.file
+        continue_on_error: true
+        options: { repo: "{{.inputs.repo}}", path: CONTRIBUTING.md }
+      - id: existing
+        # Review comments already on the PR — reviewers are told not to repeat
+        # them, and reconcile drops any finding on an already-commented line.
+        uses: github.review_comments
+        options: { repo: "{{.inputs.repo}}", pr: "{{.inputs.pr}}", all: true }
+
+      # paseo takes the prompt as ONE argv argument; the kernel caps a single arg
+      # at ~128KB (MAX_ARG_STRLEN). A large PR's full diff plus the repo-standards
+      # files overflows that and every reviewer dies with "argument list too long".
+      # Cap the diff so the prompt stays under the limit; note the cut so the lens
+      # reviews the visible portion honestly instead of guessing.
+      - id: diffcap
+        run: js
+        code: |
+          const MAX = 60000;
+          const d = (ctx.diff && ctx.diff.diff) || "";
+          if (d.length <= MAX) return { value: d };
+          return { value: d.slice(0, MAX) + "\n\n…[diff truncated at " + MAX +
+            " bytes for length — review the visible portion; name anything you'd " +
+            "want to verify in the omitted remainder rather than guessing]" };
+
+      - id: review
+        for_each: "{{.inputs.lenses}}"
+        parallel: true
+        type: agent
+        agent: reviewer
+        checkout: none
+        output_schema:
+          type: object
+          required: [findings]
+          properties:
+            findings:
+              type: array
+              items:
+                type: object
+                required: [path, line, blocking, body]
+                properties:
+                  path: { type: string }
+                  line: { type: integer }
+                  blocking: { type: boolean }
+                  body: { type: string }
+                  confidence: { type: string, enum: [high, medium, low] }
+        prompt: |
+          You are reviewing a GitHub pull request through ONE lens:
+          {{.item.name}} — {{.item.focus}}.
+
+          Review like a pragmatic senior engineer. Comment on the exact NEW-file line
+          where an issue lives. Cares about correctness, security, and sound design —
+          not style points.
+
+          RESTRAINT — this is the important rule. Most of your job is deciding what NOT
+          to say:
+          - If a thoughtful senior wouldn't bother raising it, say nothing. Don't post
+            it, don't mark it non-blocking, don't note that you considered it. Silence
+            is the correct output for a not-worth-it observation.
+          - Returning an empty findings list is a valid, good result. On clean code,
+            return []. Never manufacture or speculate a finding to look thorough — a
+            made-up or "maybe" finding is worse than silence.
+          - Signal density beats coverage. When a finding is borderline, leave it out.
+          - A finding you can't state plainly in one sentence is usually not worth
+            posting. Being unable to PROVE it from the diff alone is not a reason to
+            hedge — real issues often rest on base-branch or runtime behavior; state
+            them plainly and name what you'd check.
+
+          BLOCKING (blocking: true) only for genuine show-stoppers in your lens: real
+          bugs, logic errors, security holes, data-loss risk, real design flaws, or
+          violations of REPO STANDARDS. Style, naming, readability, minor perf,
+          optional refactors, and questions are blocking: false — no matter how many.
+          Before flagging something "missing", remember the diff only shows what
+          changed; a symbol absent from the diff may exist on the base branch.
+
+          VOICE: lead with the point; one thought per sentence; assume the author knows
+          their system; propose a concrete fix; ~60 words per comment; don't quote the
+          diff back.
+
+          REPO STANDARDS (this repo's own conventions — violating these is blocking):
+          {{.std_claude.text}}
+          {{.std_agents.text}}
+          {{.std_contributing.text}}
+
+          PULL REQUEST {{.inputs.repo}} #{{.inputs.pr}}: {{.meta.title}}
+          Description:
+          {{.meta.body}}
+
+          COMMENTS ALREADY ON THIS PR — do NOT repeat any of these, and don't
+          re-raise the same issue in different words or on a nearby line. Surface
+          only what isn't already covered:
+          {{range .existing.comments}}- {{.path}}:{{.line}} — {{.body}}
+          {{end}}
+          UNIFIED DIFF:
+          {{.diffcap.value}}
+
+          Output JSON matching the schema: a "findings" array (possibly empty). Each
+          finding: {path, line (NEW-file line in the diff), blocking, body, confidence}.
+
+      - id: flatten
+        run: js
+        code: |
+          const lenses = ctx.inputs.lenses || [];
+          const passes = (ctx.review && ctx.review.items) || [];
+          const out = [];
+          for (let i = 0; i < passes.length; i++) {
+            const fs = (passes[i] && passes[i].findings) || [];
+            for (const f of fs) {
+              out.push(Object.assign({ id: "f" + out.length, lens: (lenses[i] || {}).name || "?" }, f));
+            }
+          }
+          return { value: out };
+
+      - id: verify
+        for_each: "{{.flatten.value}}"
+        parallel: true
+        type: agent
+        agent: assessor
+        checkout: none
+        output_schema:
+          type: object
+          required: [id, verdict]
+          properties:
+            id: { type: string }
+            verdict: { type: string, enum: [keep, refuted] }
+            reason: { type: string }
+        prompt: |
+          You are the verification half of a code review of {{.inputs.repo}} #{{.inputs.pr}}.
+          A first pass produced the FINDING below. Your ONLY job is to catch it if it is
+          positively WRONG — a claim that would embarrass the reviewer if posted. You are
+          NOT grading how provable it is.
+
+          Default hard to "keep". A finding does NOT need to be provable from the diff:
+          most real issues depend on base-branch code, runtime behavior, or repo
+          conventions the diff can't show. Use the DIFF and PR DESCRIPTION as evidence.
+
+          Answer "refuted" ONLY when the evidence positively contradicts the finding —
+          e.g. it calls something "missing" that the diff doesn't actually remove; it
+          rests on a factual claim the diff/description plainly shows false; or it
+          describes behavior the code clearly doesn't have. If merely unsure, answer
+          "keep". Never refute a plausible, material finding just because it isn't
+          provable here.
+
+          Echo the finding's id in your output.
+
+          FINDING (id {{.item.id}}, lens {{.item.lens}}, at {{.item.path}}:{{.item.line}}, blocking={{.item.blocking}}):
+          {{.item.body}}
+
+          PR DESCRIPTION:
+          {{.meta.body}}
+
+          DIFF:
+          {{.diffcap.value}}
+
+          Output JSON: {"id":"{{.item.id}}","verdict":"keep"|"refuted","reason":"one sentence"}
+
+      - id: reconcile
+        run: js
+        code: |
+          const findings = (ctx.flatten && ctx.flatten.value) || [];
+          const verdict = {};
+          for (const v of ((ctx.verify && ctx.verify.items) || [])) {
+            if (v && v.id) verdict[v.id] = v.verdict;
+          }
+          const existing = {};
+          for (const e of ((ctx.existing && ctx.existing.comments) || [])) {
+            if (e && e.path) existing[String(e.path) + ":" + (e.line || 0)] = 1;
+          }
+          let kept = findings.filter(function (f) {
+            if (verdict[f.id] === "refuted") return false;
+            return !existing[String(f.path || "") + ":" + (f.line || 0)];
+          });
+          kept.sort(function (a, b) { return (b.blocking ? 1 : 0) - (a.blocking ? 1 : 0); });
+          const seen = {}; const uniq = [];
+          for (const f of kept) {
+            const k = String(f.path || "") + ":" + (f.line || 0);
+            if (!seen[k]) { seen[k] = 1; uniq.push(f); }
+          }
+          const blockers = uniq.filter(function (f) { return f.blocking; });
+          const event = blockers.length > 0 ? "REQUEST_CHANGES" : "APPROVE";
+          const comments = uniq.map(function (f) {
+            return { path: f.path, line: f.line, blocking: !!f.blocking, body: f.body };
+          });
+          const lensCount = new Set(uniq.map(function (f) { return f.lens; })).size;
+          const summary = blockers.length > 0
+            ? (blockers.length + " blocking issue(s) across " + lensCount + " lens(es); " + uniq.length + " comment(s) total.")
+            : (uniq.length > 0 ? (uniq.length + " optional suggestion(s); nothing blocks.") : "Looks good — no issues worth raising.");
+          const postComments = uniq.map(function (f) {
+            return { path: f.path, line: f.line, body: f.body };
+          });
+          return {
+            event: event,
+            summary: summary,
+            comments: comments,
+            review: JSON.stringify({ event: event, body: summary, comments: postComments }),
+          };
+
+  # ---- The review FLOW: triage, always review, then auto-post or hand off. ----
+  review-flow:
+    description: "Assess a PR, run the multi-lens review team, then auto-post or hand the draft to a human."
+    inputs:
+      repo: { type: string, required: true }
+      pr: { type: integer, required: true }
+      title: { type: string, default: "" }
+    outputs:
+      decision: "{{.assess.decision}}"          # auto | manual
+      event: "{{.review.event}}"                # the review team's verdict
+      review: "{{.review.review}}"              # the drafted ReviewRecord JSON
+    steps:
+      # 1. Triage: may an automated review post itself ("auto"), or does this
+      #    genuinely need a human ("manual")?
+      - id: assess
+        type: agent
+        agent: assessor
+        checkout: none
+        prompt: |
+          Triage the code-review request on {{.inputs.repo}}#{{.inputs.pr}} ("{{.inputs.title}}").
+          Read the diff and description, then decide whether an automated review may
+          post itself ("auto") or this genuinely needs a human's own interactive
+          review ("manual").
+
+          First judge the PR's quality — this is your confidence signal for "auto":
+          - tests_sufficient: does the change carry adequate tests for the behavior it
+            changes? Value real-world/integration validation and demonstrated results
+            most; unit tests alone are fine when that's the right level. A change that
+            legitimately needs no tests (pure docs/config) counts as sufficient (true).
+            Mark false only when it clearly warranted more testing than it got.
+          - docs_sufficient: is the documentation/description adequate? Most changes
+            need no doc updates (true). Mark false only when it clearly should have
+            documented something and didn't.
+          - glaring_holes: a glaring hole in the logic or test coverage — an obvious
+            bug, an unhandled case that matters, a meaningful untested path. Nitpicks
+            and style are NOT glaring holes; the review team catches those.
+
+          DEFAULT TO "auto", harder when quality clears the bar: an adequately tested
+          and documented change with no glaring holes should be "auto" even at the
+          higher end of medium risk. "auto" does NOT mean no scrutiny — the review team
+          still reviews and flags concerns; it only means no human is needed to gate
+          posting.
+
+          Answer "manual" only when EITHER (a) the change is genuinely high-stakes —
+          alters security/authz/secrets or permission boundaries; touches payments or
+          money movement; is a destructive/irreversible data change; or changes prod
+          infra that could cause an outage or breach — OR (b) it fails the quality bar
+          in a way a human should weigh in on (a glaring logic/coverage hole, or clearly
+          missing tests on something consequential). A large diff or unclear
+          description alone is NOT a reason for "manual". When unsure, choose "auto".
+
+          Return the structured output: decision, the three quality signals, and a
+          one-sentence reason referencing what you found on tests/docs/holes.
+        output_schema:
+          type: object
+          additionalProperties: false
+          required: [decision, tests_sufficient, docs_sufficient, glaring_holes, reason]
+          properties:
+            decision: { type: string, enum: [auto, manual] }
+            tests_sufficient: { type: boolean }
+            docs_sufficient: { type: boolean }
+            glaring_holes: { type: boolean }
+            reason: { type: string }
+
+      # 2. Always run the review team — both branches need the drafted review.
+      - id: review
+        workflow: review-team
+        with:
+          repo: "{{.inputs.repo}}"
+          pr: "{{.inputs.pr}}"
+
+      # 3a. AUTO: post the drafted review deterministically via the verb (as the
+      #     connector's own write identity).
+      - id: post
+        if: assess.decision == "auto"
+        uses: github.submit_review
+        options:
+          repo: "{{.inputs.repo}}"
+          pr: "{{.inputs.pr}}"
+          event: "{{.review.event}}"
+          body: "{{.review.summary}}"
+          comments: "{{.review.comments}}"      # list preserved through the sole-field-ref
+
+      # 3b. MANUAL: hand the DRAFT to a human. The agent presents it, asks, and on
+      #     approval posts it through the conductor skill. It does NOT re-review.
+      - id: handoff
+        if: assess.decision == "manual"
+        type: agent
+        agent: handoff
+        checkout: checkout-pr
+        background: true
+        prompt: |
+          Review request on {{.inputs.repo}}#{{.inputs.pr}} ("{{.inputs.title}}") was flagged
+          for a human's manual review: {{.assess.reason}}
+
+          A full multi-lens review has ALREADY been drafted for you — do NOT re-review
+          from scratch. Here is the drafted ReviewRecord (JSON: event, body, comments):
+
+          {{.review.review}}
+
+          1. Present the drafted review in full — the body plus every inline comment
+             (path:line — comment). Keep it readable.
+          2. ASK with your interactive question tool (AskUserQuestion) what to do —
+             post as-is / revise / discard — and WAIT for the answer. Do NOT just stop
+             or go idle: this must surface as "needs your input", not "ready".
+          3. Discuss and revise as needed (edit the body or drop/soften comments in the
+             draft you hold). Ask again every time you need input.
+          4. ONLY once explicitly approved, post the review through the conductor skill.
+             First discover your granted verb, then call it:
+
+               conductor discover                     # find your submit_review verb name
+               conductor call <that verb> \
+                 --repo {{.inputs.repo}} --pr {{.inputs.pr}} \
+                 --event <the draft's "event"> \
+                 --body <the approved body> \
+                 --comments '<the approved comments as a JSON array of {path,line,body}>'
+
+             Pass --comments as a single-quoted JSON array (one --comments flag). If
+             approved with no inline comments, pass '[]'. Never post without an explicit
+             go-ahead, and never post more than once.
+
+# The pack ships this trigger so you never rebuild the event mapping, but it
+# arrives DISARMED — no `enabled`, no repos. Arming it (enabled + repos) in the
+# instance block is the consent; a github trigger is REJECTED at load if armed
+# without repos.
+triggers:
+  - name: on_review_request
+    on: github.review_requested
+    steps:
+      - id: run
+        workflow: review-flow
+        with: { repo: "{{.repo}}", pr: "{{.number}}", title: "{{.title}}" }
