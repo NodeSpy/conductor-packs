@@ -28,7 +28,7 @@
 
 pack:
   name: pr-review-team
-  version: 1.1.0
+  version: 1.1.1
   description: Multi-lens PR review (correctness / security / design …) with refute-verify, deterministic reconcile, and an optional human hand-off.
   tags: [review, github, code-quality, agents]
   homepage: https://github.com/NodeSpy/conductor-packs
@@ -36,7 +36,7 @@ pack:
   requires:
     # The daemon versions this pack supports. The diff cap needs no special
     # version; the oversized-prompt guard backstop landed in 0.8.1.
-    conductor: ">=0.8.0"
+    conductor: ">=0.8.2"
     # Bind-only environment the pack needs — you wire these; the pack never
     # ships them.
     connectors: [github]
@@ -165,15 +165,15 @@ workflows:
       - id: std_claude
         uses: github.file
         continue_on_error: true
-        options: { repo: "{{.inputs.repo}}", path: CLAUDE.md }
+        options: { repo: "{{.inputs.repo}}", path: CLAUDE.md, optional: true }
       - id: std_agents
         uses: github.file
         continue_on_error: true
-        options: { repo: "{{.inputs.repo}}", path: AGENTS.md }
+        options: { repo: "{{.inputs.repo}}", path: AGENTS.md, optional: true }
       - id: std_contributing
         uses: github.file
         continue_on_error: true
-        options: { repo: "{{.inputs.repo}}", path: CONTRIBUTING.md }
+        options: { repo: "{{.inputs.repo}}", path: CONTRIBUTING.md, optional: true }
       - id: existing
         # Review comments already on the PR — reviewers are told not to repeat
         # them, and reconcile drops any finding on an already-commented line.
