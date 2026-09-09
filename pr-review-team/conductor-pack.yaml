@@ -28,7 +28,7 @@
 
 pack:
   name: pr-review-team
-  version: 1.0.0
+  version: 1.1.0
   description: Multi-lens PR review (correctness / security / design …) with refute-verify, deterministic reconcile, and an optional human hand-off.
   tags: [review, github, code-quality, agents]
   homepage: https://github.com/NodeSpy/conductor-packs
@@ -49,6 +49,20 @@ pack:
       handoff:
         skill: [github.submit_review]
 
+# Typed settings with defaults. The pack works drop-in with these — no agent
+# definitions to bind — and you override a model without editing the pack. The
+# defaults assume a Claude provider (the conductor/paseo norm); on a different
+# provider, set these to your models or bind the roles to your own profiles.
+settings:
+  heavy_model:
+    type: string
+    default: claude-opus-4-8[1m]
+    desc: model for the lens reviewers (the strongest pass)
+  light_model:
+    type: string
+    default: claude-sonnet-5[1m]
+    desc: model for triage (assess), refute-verify, and the hand-off agent
+
 # The public surface consumers may reference by qualified name. Everything else
 # is an internal implementation detail the author can refactor freely.
 exports:
@@ -58,20 +72,31 @@ exports:
 # ---- Behavior the pack ships (auto-namespaced under the instance name) ----
 
 agents:
-  # The lens reviewers and the refute-verifier. No provider/model is pinned, so
-  # each falls through to your default runtime — bind them to heavier/cheaper
-  # profiles in the packs block (agents: { reviewer: opus, assessor: sonnet }).
+  # Self-contained defaults so the pack runs drop-in — nothing to bind. The
+  # model comes from settings (override a setting without editing the pack); or
+  # bind a role in the packs block to swap the whole profile for one of yours.
   reviewer:
+    provider: claude
+    model: "${settings.heavy_model}"
+    mode: auto
     workspace: worktree
     guidance: "Review only what the diff changes. Be concrete and cite file:line. Silence beats a not-worth-it comment."
   assessor:
+    provider: claude
+    model: "${settings.light_model}"
+    mode: auto
     workspace: worktree
-  # The hand-off agent posts the drafted review back on approval. It needs the
-  # submit_review verb through the conductor skill; it posts as the connector's
-  # own write identity (as: me), never as a broker secret — so no secrets_via /
-  # allow_secrets is needed here.
+  # The hand-off agent presents the drafted review and posts it on approval. It
+  # posts as the connector's own write identity (as: me) through the skill, so no
+  # broker secret is needed; archive_when_done:false keeps it open for you to
+  # drive live.
   handoff:
-    workspace: local
+    provider: claude
+    model: "${settings.light_model}"
+    mode: auto
+    workspace: worktree
+    archive_when_done: false
+    guidance: "When you hand back, summarize in one or two lines and give clear choices; never paste a wall of analysis into the question."
     skill:
       verbs: [github.submit_review]
 
@@ -433,10 +458,22 @@ workflows:
           repo: "{{.inputs.repo}}"
           pr: "{{.inputs.pr}}"
 
-      # 3a. AUTO: post the drafted review deterministically via the verb (as the
-      #     connector's own write identity).
+      # Decide post-vs-hand-off. Auto-post when assess said "auto", OR when the
+      # review came back clean (no comments) — handing a human an empty "looks
+      # good" is pure friction. Otherwise (a manual PR with real comments) hand
+      # the draft to a person.
+      - id: gate
+        run: js
+        code: |
+          const auto = ctx.assess && ctx.assess.decision === "auto";
+          const comments = (ctx.review && ctx.review.comments) || [];
+          const empty = comments.length === 0;
+          return { post: auto || empty, handoff: !auto && !empty };
+
+      # POST: submit the drafted review deterministically via the verb (as the
+      # connector's own write identity).
       - id: post
-        if: assess.decision == "auto"
+        if: gate.post
         uses: github.submit_review
         options:
           repo: "{{.inputs.repo}}"
@@ -448,7 +485,7 @@ workflows:
       # 3b. MANUAL: hand the DRAFT to a human. The agent presents it, asks, and on
       #     approval posts it through the conductor skill. It does NOT re-review.
       - id: handoff
-        if: assess.decision == "manual"
+        if: gate.handoff
         type: agent
         agent: handoff
         checkout: checkout-pr

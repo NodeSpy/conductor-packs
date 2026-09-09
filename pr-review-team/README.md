@@ -19,20 +19,16 @@ The multi-lens review always runs, so the manual branch has a real drafted
 review to hand off — the human edits/approves it instead of reviewing from
 scratch.
 
-## Install
+## Install (drop-in)
 
-Add it to your config's `packs:` block, bind your github connector and (optionally)
-your own agent profiles, then arm the trigger:
+Bind your github connector and arm the trigger — that's it. The pack brings its
+own reviewer/assessor/hand-off agents, so you don't define any:
 
 ```yaml
 packs:
   review:
     source: github.com/NodeSpy/conductor-packs//pr-review-team   # or a local path
     connectors: { github: gh }                    # bind the pack's github -> your connector
-    agents:                                        # bind roles to your profiles (omit for defaults)
-      reviewer: opus
-      assessor: sonnet
-      handoff:  sonnet-interactive
     triggers:
       on_review_request:
         enabled: true                              # arm it
@@ -47,17 +43,34 @@ conductor pack plan       # preview what it adds (agents, skill grants, armed tr
 conductor validate
 ```
 
+The only thing you *must* bind is the `github` connector — it carries your
+credentials, so the pack can't ship it.
+
 ## What it needs (`requires:`)
 
 - **`conductor: >=0.8.0`** — the packs mechanism. (`>=0.8.1` also gives the
   oversized-prompt guard, though this pack caps the diff itself.)
-- **A `github` connector**, bound in the `packs:` block.
-- **Three agent roles**, bound to your profiles (or left as the bundled defaults,
-  which fall through to your default runtime):
-  - `reviewer` — runs each lens.
-  - `assessor` — triages auto-vs-manual and refute-verifies findings.
-  - `handoff` — presents the draft to a human and posts it on approval; it needs
-    the `github.submit_review` skill verb (declared for you on the bundled role).
+- **A `github` connector**, bound in the `packs:` block. That's the only bind.
+- The `reviewer` / `assessor` / `handoff` roles ship with working defaults (see
+  Tuning). Bind one to your own profile only if you want to override it.
+
+## Tuning
+
+- **Models** — the bundled agents default to a strong reviewer and a lighter
+  triage/verify/hand-off model (Claude). Override without touching the pack:
+
+  ```yaml
+  settings: { heavy_model: <your reviewer model>, light_model: <your other model> }
+  ```
+
+  On a non-Claude provider, set these to your models (or bind the roles to your
+  own profiles).
+- **Lenses** — the six review lenses are the `review-team` workflow's `lenses`
+  input default; override that input to review through a subset.
+- **Clean reviews auto-post** — when the team finds nothing (an APPROVE with no
+  comments), it posts the approval and skips the hand-off. A human is only pulled
+  in when there's something to weigh in on (a manual-flagged PR *with* comments).
+- **Large diffs** — the reviewer/verifier prompts cap the inlined diff at 60 KB.
 
 **No secrets.** Posting uses your github connector's own write identity, so the
 pack requires no broker secret.
