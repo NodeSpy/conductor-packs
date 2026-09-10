@@ -5,100 +5,113 @@
 # reconciles them deterministically into one ReviewRecord, then either
 # auto-posts the review or hands the DRAFT to a human to approve/edit/post.
 #
-# Define-behavior / bind-environment: this pack ships only BEHAVIOR (agents,
-# workflows, a disarmed trigger). It carries NO connectors and NO secrets — you
-# bind your github connector and (optionally) your own agent profiles in the
-# `packs:` block. Posting uses your github connector's own write identity, so no
-# broker secret is required.
+# Define-behavior / bind-environment: this pack ships only BEHAVIOR (workflows
+# and a disarmed trigger). It carries NO connectors and NO secrets — you bind
+# your github connector in the `packs:` block. Posting uses that connector's
+# own write identity, so no broker secret is required.
 #
 # Install (in your config's `packs:` block):
 #   packs:
 #     review:
-#       source: github.com/NodeSpy/conductor-packs//pr-review-team        # or a local path
+#       source: github.com/NodeSpy/conductor-packs//pr-review-team   # or a local path
+#       preset: claude                                    # or codex; omit for your default runtime
 #       connectors: { github: gh }                        # bind the pack's github -> your connector
-#       agents:                                            # bind roles to your profiles (or omit for defaults)
-#         reviewer: opus
-#         assessor: sonnet
-#         handoff:  sonnet-interactive
+#       steps:                                            # override a step by reference (optional)
+#         review-team/review: { model: my-fleet }
 #       triggers:
 #         on_review_request:
-#           enabled: true                                  # arm it
-#           repos:   [your-org/app]                        # scope it — a github trigger MUST name repos
+#           enabled: true                                 # arm it
+#           repos:   [your-org/app]                       # scope it — a github trigger MUST name repos
 #   Then: `conductor init` (vendor + lock), `conductor pack plan`, `conductor validate`.
 
 pack:
   name: pr-review-team
-  version: 1.1.1
+  version: 2.0.0
   description: Multi-lens PR review (correctness / security / design …) with refute-verify, deterministic reconcile, and an optional human hand-off.
   tags: [review, github, code-quality, agents]
   homepage: https://github.com/NodeSpy/conductor-packs
   license: Apache-2.0
   requires:
-    # The daemon versions this pack supports. The diff cap needs no special
-    # version; the oversized-prompt guard backstop landed in 0.8.1.
-    conductor: ">=0.8.2"
-    # Bind-only environment the pack needs — you wire these; the pack never
-    # ships them.
+    # The daemon versions this pack supports. 0.9.0 is the floor for the step
+    # surface this pack is written against: no `agents:` registry, behavior on
+    # the step, `x-` anchors with `extends:`, and skill grants bounded by
+    # requires.connectors.
+    conductor: ">=0.9.0"
+    # Bind-only environment the pack needs — you wire this; the pack never
+    # ships it.
+    # requires.connectors is the pack's CAPABILITY BOUNDARY as well as its
+    # socket list: the pack's skill.verbs may name no connector outside it,
+    # and its wildcards are bounded to it.
     connectors: [github]
-    # Agent roles. A bound reviewer/assessor just needs to be a runnable
-    # profile; the hand-off agent must be able to post a review (the skill verb)
-    # and should be interactive (it asks a human before posting).
-    roles:
-      reviewer: {}
-      assessor: {}
-      handoff:
-        skill: [github.submit_review]
 
-# Typed settings with defaults. The pack works drop-in with these — no agent
-# definitions to bind — and you override a model without editing the pack. The
-# defaults assume a Claude provider (the conductor/paseo norm); on a different
-# provider, set these to your models or bind the roles to your own profiles.
+# Typed settings with defaults, plus named presets. The pack runs drop-in with
+# no settings at all, and you pick a preset or override a setting WITHOUT
+# editing this file.
+#
+# The defaults are the wildcard `*` — "any model this runtime offers" — so a
+# fresh install resolves against whatever the consumer actually has instead of
+# pinning a provider's model id the pack cannot know they run. Pick a preset,
+# or set these to your own model ids or fleet names, to be specific.
 settings:
   heavy_model:
     type: string
-    default: claude-opus-4-8[1m]
-    desc: model for the lens reviewers (the strongest pass)
+    default: "*"
+    desc: model for the lens reviewers (the strongest pass); "*" = any your runtime offers
   light_model:
     type: string
-    default: claude-sonnet-5[1m]
-    desc: model for triage (assess), refute-verify, and the hand-off agent
+    default: "*"
+    desc: model for triage, refute-verify, and the hand-off agent; "*" = any your runtime offers
+
+presets:
+  claude:
+    heavy_model: claude-opus-4-8[1m]
+    light_model: claude-sonnet-5[1m]
+  codex:
+    heavy_model: gpt-5-pro
+    light_model: gpt-5
 
 # The public surface consumers may reference by qualified name. Everything else
-# is an internal implementation detail the author can refactor freely.
+# is an internal implementation detail the author can refactor freely. Step
+# exports are REFERENCES — <workflow>/<step-id>, the same address a consumer
+# writes to override one.
 exports:
-  workflows: [review-flow]
-  agents: [reviewer, assessor, handoff]
+  workflows: [review-flow, review-team]
+  steps:
+    - review-team/review
+    - review-flow/assess
+    - review-flow/handoff
 
-# ---- Behavior the pack ships (auto-namespaced under the instance name) ----
+# ---- Behavior the pack ships (namespaced under the instance name) ----
+#
+# There is no top-level steps: section. A step lives in the workflow that runs
+# it, and config shared between steps is parked under a top-level `x-` key —
+# the loader ignores those (the docker-compose extension-field convention).
+# Anchors are file-local, so this house style stays inside the pack.
+#
+# Two ways to pull one in, both used below:
+#   <<: *base       plain YAML. Dumb override — a copy of the base.
+#   extends: *base  conductor's merge. Lists append, guidance STACKS.
+x-templates:
+  # Every agent in this pack reads a diff and writes a judgement; none of them
+  # edits the tree, so none needs a checkout.
+  house: &house
+    type: agent
+    checkout: none
+    guidance: "Review only what the diff changes. Be concrete and cite file:line. Silence beats a not-worth-it comment."
 
-agents:
-  # Self-contained defaults so the pack runs drop-in — nothing to bind. The
-  # model comes from settings (override a setting without editing the pack); or
-  # bind a role in the packs block to swap the whole profile for one of yours.
-  reviewer:
-    provider: claude
+  # The lens panel: the strongest pass, one instance per lens.
+  panelist: &panelist
+    <<: *house
     model: "${settings.heavy_model}"
     mode: auto
     workspace: worktree
-    guidance: "Review only what the diff changes. Be concrete and cite file:line. Silence beats a not-worth-it comment."
-  assessor:
-    provider: claude
+
+  # Triage and refute-verify: cheaper, and they only ever judge.
+  triage: &triage
+    <<: *house
     model: "${settings.light_model}"
     mode: auto
     workspace: worktree
-  # The hand-off agent presents the drafted review and posts it on approval. It
-  # posts as the connector's own write identity (as: me) through the skill, so no
-  # broker secret is needed; archive_when_done:false keeps it open for you to
-  # drive live.
-  handoff:
-    provider: claude
-    model: "${settings.light_model}"
-    mode: auto
-    workspace: worktree
-    archive_when_done: false
-    guidance: "When you hand back, summarize in one or two lines and give clear choices; never paste a wall of analysis into the question."
-    skill:
-      verbs: [github.submit_review]
 
 workflows:
   # ---- The review ENGINE: produces a ReviewRecord, never posts. ----
@@ -151,6 +164,7 @@ workflows:
       summary: "{{.reconcile.summary}}"         # the review body (one line)
       comments: "{{.reconcile.comments}}"       # [{path, line, body}] — list preserved by sole-field-ref
       review: "{{.reconcile.review}}"           # JSON {event, body, comments} — the ReviewRecord to show + post
+      diff: "{{.diffcap.value}}"                # the capped diff, so a caller can reuse it
     steps:
       # Upstream context via the github connector's read verbs (cache-aware,
       # rate-limit-aware, the connector's own credentials).
@@ -195,12 +209,14 @@ workflows:
             " bytes for length — review the visible portion; name anything you'd " +
             "want to verify in the omitted remainder rather than guessing]" };
 
+      # The lens panel. `extends:` (not `<<:`) so this step's own guidance
+      # stacks UNDER the house voice rather than replacing it — and so a
+      # consumer's `review-team/review` override stacks under both.
       - id: review
+        extends: *panelist
         for_each: "{{.inputs.lenses}}"
         parallel: true
-        type: agent
-        agent: reviewer
-        checkout: none
+        guidance: "You are one lens of a panel. Stay inside your lens; another reviewer owns the rest."
         output_schema:
           type: object
           required: [findings]
@@ -284,11 +300,10 @@ workflows:
           return { value: out };
 
       - id: verify
+        extends: *triage
         for_each: "{{.flatten.value}}"
         parallel: true
-        type: agent
-        agent: assessor
-        checkout: none
+        guidance: "You are refuting, not grading. Default hard to keep."
         output_schema:
           type: object
           required: [id, verdict]
@@ -379,17 +394,33 @@ workflows:
       event: "{{.review.event}}"                # the review team's verdict
       review: "{{.review.review}}"              # the drafted ReviewRecord JSON
     steps:
+      # 0. The diff, fetched through the connector and PASSED IN to triage.
+      #    The assessor used to shell out to `gh pr diff`, which needed a
+      #    checkout, a gh binary, and credentials the pack never declared —
+      #    reaching outside its own interface to read what a verb already
+      #    returns.
+      - id: diff
+        uses: github.pr_diff
+        options: { repo: "{{.inputs.repo}}", pr: "{{.inputs.pr}}" }
+      - id: diffcap
+        run: js
+        code: |
+          const MAX = 60000;
+          const d = (ctx.diff && ctx.diff.diff) || "";
+          if (d.length <= MAX) return { value: d };
+          return { value: d.slice(0, MAX) + "\n\n…[diff truncated at " + MAX +
+            " bytes for length — judge the visible portion]" };
+
       # 1. Triage: may an automated review post itself ("auto"), or does this
       #    genuinely need a human ("manual")?
       - id: assess
-        type: agent
-        agent: assessor
-        checkout: none
+        extends: *triage
+        guidance: "You are triaging, not reviewing. The panel does the reviewing."
         prompt: |
           Triage the code-review request on {{.inputs.repo}}#{{.inputs.pr}} ("{{.inputs.title}}").
-          Read the diff (`gh pr diff {{.inputs.repo}}#{{.inputs.pr}}`) and description, then
-          decide whether an automated review may post itself ("auto") or this
-          genuinely needs my own interactive review ("manual").
+          The diff is below — read it and the description, then decide whether an
+          automated review may post itself ("auto") or this genuinely needs my own
+          interactive review ("manual").
 
           First judge the PR's quality — this is your confidence signal for going
           "auto". Set each of these:
@@ -440,6 +471,9 @@ workflows:
           Return the structured output: decision, the three quality signals
           (tests_sufficient, docs_sufficient, glaring_holes), and a one-sentence
           reason that references what you found on tests/docs/holes.
+
+          UNIFIED DIFF:
+          {{.diffcap.value}}
         output_schema:
           type: object
           additionalProperties: false
@@ -483,13 +517,24 @@ workflows:
           comments: "{{.review.comments}}"      # list preserved through the sole-field-ref
 
       # 3b. MANUAL: hand the DRAFT to a human. The agent presents it, asks, and on
-      #     approval posts it through the conductor skill. It does NOT re-review.
+      #     approval posts it. It does NOT re-review.
+      #
+      #     The prompt states INTENT only. github.submit_review is granted below,
+      #     and conductor injects the verb's own call form and options into the
+      #     agent's prompt (the capability card) — so the pack does not spell out
+      #     a CLI incantation that would rot the moment the surface moved.
       - id: handoff
         if: gate.handoff
-        type: agent
-        agent: handoff
+        <<: *house
+        model: "${settings.light_model}"
+        mode: auto
+        workspace: worktree
         checkout: checkout-pr
         background: true
+        archive_when_done: false
+        guidance: "When you hand back, summarize in one or two lines and give clear choices; never paste a wall of analysis into the question."
+        skill:
+          verbs: [github.submit_review]
         prompt: |
           Review request on {{.inputs.repo}}#{{.inputs.pr}} ("{{.inputs.title}}") was flagged
           for a human's manual review: {{.assess.reason}}
@@ -506,19 +551,11 @@ workflows:
              or go idle: this must surface as "needs your input", not "ready".
           3. Discuss and revise as needed (edit the body or drop/soften comments in the
              draft you hold). Ask again every time you need input.
-          4. ONLY once explicitly approved, post the review through the conductor skill.
-             First discover your granted verb, then call it:
+          4. ONLY once explicitly approved, submit it as the PR review on
+             {{.inputs.repo}}#{{.inputs.pr}}, with the approved event, body, and inline
+             comments. If approved with no inline comments, submit none.
 
-               conductor discover                     # find your submit_review verb name
-               conductor call <that verb> \
-                 --repo {{.inputs.repo}} --pr {{.inputs.pr}} \
-                 --event <the draft's "event"> \
-                 --body <the approved body> \
-                 --comments '<the approved comments as a JSON array of {path,line,body}>'
-
-             Pass --comments as a single-quoted JSON array (one --comments flag). If
-             approved with no inline comments, pass '[]'. Never post without an explicit
-             go-ahead, and never post more than once.
+          Never post without an explicit go-ahead, and never post more than once.
 
 # The pack ships this trigger so you never rebuild the event mapping, but it
 # arrives DISARMED — no `enabled`, no repos. Arming it (enabled + repos) in the
