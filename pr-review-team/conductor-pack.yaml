@@ -14,10 +14,10 @@
 #   packs:
 #     review:
 #       source: github.com/NodeSpy/conductor-packs//pr-review-team   # or a local path
-#       preset: claude                                    # or codex; omit for your default runtime
-#       connectors: { github: gh }                        # bind the pack's github -> your connector
-#       steps:                                            # override a step by reference (optional)
-#         review-team/review: { model: my-fleet }
+#       version: "~> 2.1"
+#       # No preset/connectors needed: the sole github connector auto-binds, and the
+#       # heavy/light fleets resolve against whatever your runtime offers. Pin a tier
+#       # only if you want to: models: { heavy: ["claude-opus-*"], light: ["claude-sonnet-*"] }
 #       triggers:
 #         on_review_request:
 #           enabled: true                                 # arm it
@@ -26,7 +26,7 @@
 
 pack:
   name: pr-review-team
-  version: 2.0.0
+  version: 2.1.0
   description: Multi-lens PR review (correctness / security / design …) with refute-verify, deterministic reconcile, and an optional human hand-off.
   tags: [review, github, code-quality, agents]
   homepage: https://github.com/NodeSpy/conductor-packs
@@ -44,31 +44,16 @@ pack:
     # and its wildcards are bounded to it.
     connectors: [github]
 
-# Typed settings with defaults, plus named presets. The pack runs drop-in with
-# no settings at all, and you pick a preset or override a setting WITHOUT
-# editing this file.
-#
-# The defaults are the wildcard `*` — "any model this runtime offers" — so a
-# fresh install resolves against whatever the consumer actually has instead of
-# pinning a provider's model id the pack cannot know they run. Pick a preset,
-# or set these to your own model ids or fleet names, to be specific.
-settings:
-  heavy_model:
-    type: string
-    default: "*"
-    desc: model for the lens reviewers (the strongest pass); "*" = any your runtime offers
-  light_model:
-    type: string
-    default: "*"
-    desc: model for triage, refute-verify, and the hand-off agent; "*" = any your runtime offers
-
-presets:
-  claude:
-    heavy_model: claude-opus-4-8[1m]
-    light_model: claude-sonnet-5[1m]
-  codex:
-    heavy_model: gpt-5-pro
-    light_model: gpt-5
+# MODEL TIERS as fleets. conductor resolves each against your runtime's roster
+# best-first (see the models:/fleets model), so the pack ships NO presets and NO
+# per-provider model ids — a fleet is provider-agnostic and lands on the
+# strongest thing you actually run. Override a tier per-instance with
+# `packs.<name>.models: { heavy: [...], light: [...] }`; otherwise these apply.
+models:
+  heavy:   # the lens reviewers — the strongest pass available
+    any: ["claude-opus-*", "gpt-5-pro", "gpt-5.*", "o3*", "gemini-*-pro"]
+  light:   # triage, refute-verify, and the hand-off agent — capable but cheaper
+    any: ["claude-sonnet-*", "gpt-5", "gpt-5-mini", "gemini-*-flash", "gemini-*-pro"]
 
 # The public surface consumers may reference by qualified name. Everything else
 # is an internal implementation detail the author can refactor freely. Step
@@ -102,14 +87,14 @@ x-templates:
   # The lens panel: the strongest pass, one instance per lens.
   panelist: &panelist
     <<: *house
-    model: "${settings.heavy_model}"
+    model: heavy
     mode: auto
     workspace: worktree
 
   # Triage and refute-verify: cheaper, and they only ever judge.
   triage: &triage
     <<: *house
-    model: "${settings.light_model}"
+    model: light
     mode: auto
     workspace: worktree
 
@@ -526,7 +511,7 @@ workflows:
       - id: handoff
         if: gate.handoff
         <<: *house
-        model: "${settings.light_model}"
+        model: light
         mode: auto
         workspace: worktree
         checkout: checkout-pr
