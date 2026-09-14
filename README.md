@@ -20,7 +20,7 @@ syntax. In your config's `packs:` block:
 packs:
   review:
     source: github.com/NodeSpy/conductor-packs//pr-review-team
-    version: 1.0.0                                  # pin: source ...//pr-review-team@v1.0.0
+    version: "=2.0.0"                                # exact pin; a bare "2.0.0" floats to the newest >=2.0.0
     connectors: { github: gh }                      # bind the pack's required env to yours
     triggers:
       on_review_request: { enabled: true, repos: [your-org/app] }
@@ -34,9 +34,13 @@ conductor pack plan     # preview what it adds (agents, skill grants, armed trig
 conductor validate
 ```
 
-See each pack's own README for its `requires:` (what you bind), roles, and
-settings. Pin a version with `@<tag>` on the `source:`; the lockfile records the
-resolved sha.
+See each pack's own README for its `requires:` (what you bind) and settings.
+This is a monorepo of several packs under one repo, so each pack's git tags are
+component-prefixed — `<pack-dir>/vX.Y.Z` (e.g. `pr-review-team/v2.0.0`), not a
+bare `vX.Y.Z` — and `conductor init` resolves that prefix for you from the
+`version:` constraint. Pin with `version: "=X.Y.Z"` (exact) or `version: X.Y.Z`
+(floor, floats forward on the next `conductor init`/`pack update`); the
+lockfile records the resolved sha either way.
 
 ## Trust
 
