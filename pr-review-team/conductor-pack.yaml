@@ -20,7 +20,7 @@
 #   packs:
 #     review:
 #       source: github.com/NodeSpy/conductor-packs//pr-review-team   # or a local path
-#       version: "~> 2.6"
+#       version: "~> 2.7"
 #       # No preset/connectors needed: the sole github connector auto-binds, and the
 #       # heavy/light fleets resolve against whatever your runtime offers. Pin a tier
 #       # only if you want to: models: { heavy: ["claude-opus-*"], light: ["claude-sonnet-*"] }
@@ -32,7 +32,7 @@
 
 pack:
   name: pr-review-team
-  version: 2.6.0
+  version: 2.7.0
   description: Multi-lens PR review (correctness / security / design …) with refute-verify, deterministic reconcile, and an optional human hand-off.
   tags: [review, github, code-quality, agents]
   homepage: https://github.com/NodeSpy/conductor-packs
@@ -572,6 +572,10 @@ workflows:
           4. ONLY once explicitly approved, submit it as the PR review on
              {{.inputs.repo}}#{{.inputs.pr}}, with the approved event, body, and inline
              comments. If approved with no inline comments, submit none.
+          5. When we're DONE — the review is posted, or you discarded it, or there's
+             nothing left for me to decide — call `handoff.done` to release this
+             hand-off so its workspace is reclaimed. Do this promptly once finished;
+             don't leave it open waiting on nothing.
 
           Never post without an explicit go-ahead, and never post more than once.
 
