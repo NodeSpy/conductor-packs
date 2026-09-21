@@ -9,7 +9,7 @@
 # if the reason went away (merged/closed upstream, or approved elsewhere),
 # re-reviews from scratch when new commits are pushed, and an idle_timeout
 # reclaims a hand-off nobody closed — so stale drafts and lingering workspaces
-# don't pile up. Needs conductor >= 0.32.0.
+# don't pile up. Needs conductor >= 0.33.0.
 #
 # Define-behavior / bind-environment: this pack ships only BEHAVIOR (workflows
 # and a disarmed trigger). It carries NO connectors and NO secrets — you bind
@@ -20,7 +20,7 @@
 #   packs:
 #     review:
 #       source: github.com/NodeSpy/conductor-packs//pr-review-team   # or a local path
-#       version: "~> 2.4"
+#       version: "~> 2.5"
 #       # No preset/connectors needed: the sole github connector auto-binds, and the
 #       # heavy/light fleets resolve against whatever your runtime offers. Pin a tier
 #       # only if you want to: models: { heavy: ["claude-opus-*"], light: ["claude-sonnet-*"] }
@@ -32,20 +32,19 @@
 
 pack:
   name: pr-review-team
-  version: 2.4.0
+  version: 2.5.0
   description: Multi-lens PR review (correctness / security / design …) with refute-verify, deterministic reconcile, and an optional human hand-off.
   tags: [review, github, code-quality, agents]
   homepage: https://github.com/NodeSpy/conductor-packs
   license: Apache-2.0
   requires:
-    # The daemon versions this pack supports. 0.32.0 is the floor for the
-    # reactive hand-off surface the handoff step uses: `watch:` with
-    # handoff.bail (0.28.0), `idle_timeout:` (0.29.0), handoff.done auto-granted
-    # to the hand-off agent (0.30.0), and handoff.run_workflow — supersede the
-    # hand-off by re-running a named workflow so a new push re-reviews from
-    # scratch rather than re-presenting a stale draft (0.32.0). The rest of the
-    # pack's step surface is stable since 0.9.0.
-    conductor: ">=0.32.0"
+    # The daemon versions this pack supports. 0.33.0 is the floor for the
+    # reactive hand-off surface the handoff step uses: `watch:` as a
+    # steps-on-a-cadence mini-workflow (0.33.0) with handoff.bail / handoff.rerun
+    # / a `workflow:` step as actions, `idle_timeout:`, and handoff.done
+    # auto-granted to the hand-off agent. The rest of the pack's step surface is
+    # stable since 0.9.0.
+    conductor: ">=0.33.0"
     # Bind-only environment the pack needs — you wire this; the pack never
     # ships it.
     # requires.connectors is the pack's CAPABILITY BOUNDARY as well as its
@@ -529,19 +528,20 @@ workflows:
         guidance: "When you hand back, summarize in one or two lines and give clear choices; never paste a wall of analysis into the question."
         skill:
           verbs: [github.submit_review]
-        # REACTIVE: while this hand-off waits for a human, watch the PR. Bail if
-        # the reason to review it went away (merged/closed upstream, or approved
-        # elsewhere) so a stale draft never sits in front of you; on new commits
-        # run the review again — handoff.run_workflow re-runs the WHOLE
-        # review-flow on the new head (re-assess + re-review the team, then
-        # re-hand-off the fresh draft), never re-presenting the stale one. (The
-        # review is drafted UPSTREAM, so re-running just this step would show the
-        # same draft — hence run_workflow, not rerun_step.) First matching rule
-        # wins, so the bail cases take precedence.
+        # REACTIVE: while this hand-off waits for a human, run these steps every
+        # 2m. The `pr` fact step reads the PR; the action steps react. Bail if the
+        # reason to review went away (merged/closed upstream, or approved
+        # elsewhere) so a stale draft never sits in front of you. On new commits,
+        # re-run the WHOLE review-flow on the new head (re-assess + re-review the
+        # team, then re-hand-off the fresh draft) — a native `workflow:` step,
+        # since the review is drafted UPSTREAM and re-running just this step would
+        # show the same draft. First matching action wins, so bail takes
+        # precedence over the re-review.
         watch:
-          uses: github.pr_get
           every: 2m
-          on:
+          steps:
+            - id: pr
+              uses: github.pr_get
             - if: 'pr.merged == true || pr.state == "closed"'
               uses: handoff.bail
               options: { notify: "PR merged/closed upstream — closing this review hand-off." }
@@ -549,11 +549,9 @@ workflows:
               uses: handoff.bail
               options: { notify: "Approved elsewhere — closing this review hand-off." }
             - if: "pr.head_sha != handoff.pr.head_sha"
-              uses: handoff.run_workflow
-              options:
-                workflow: review-flow
-                with: { repo: "{{.repo}}", pr: "{{.pr}}", title: "{{.title}}" }
-                notify: "New commits pushed — re-reviewing on the new head."
+              workflow: review-flow
+              with: { repo: "{{.repo}}", pr: "{{.number}}", title: "{{.title}}" }
+              options: { notify: "New commits pushed — re-reviewing on the new head." }
         # Backstop: release a hand-off nobody closed so its workspace doesn't
         # linger. handoff.done is auto-granted to the agent (it releases early the
         # moment it has nothing more for you); this is the safety net.
