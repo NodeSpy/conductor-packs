@@ -1,0 +1,103 @@
+# pr-autopilot — a distributable conductor pack.
+#
+# The "conductor babysits my PRs" suite: an agent reacts to the routine PR events
+# so they don't sit waiting on a human —
+#   - failing checks   → find the cause and push a fix (+ auto re-run on a flake)
+#   - merge conflict    → resolve against the base and push
+#   - changes requested → address the feedback, push, and re-request review
+#   - new comment       → make the change or answer the question
+# Pair it with the ci-unsticker pack (hung-CI recovery) and pr-review-team
+# (multi-lens review + hand-off) for the full autopilot.
+#
+# Define-behavior / bind-environment: this pack ships only BEHAVIOR (disarmed
+# triggers). It carries NO connectors and NO secrets — you bind your github
+# connector in the `packs:` block; every action runs as that connector's
+# identity, and every agent pushes as you.
+#
+# Install (in your config's `packs:` block):
+#   packs:
+#     autopilot:
+#       source: github.com/NodeSpy/conductor-packs//pr-autopilot
+#       version: "~> 1.0"
+#       # heavy fleet resolves against whatever your runtime offers; pin if you like:
+#       #   models: { heavy: ["claude-opus-*"] }
+#       triggers:
+#         on_failing_checks:   { enabled: true, repos: [your-org/app] }
+#         on_merge_conflict:   { enabled: true, repos: [your-org/app] }
+#         on_changes_requested:{ enabled: true, repos: [your-org/app] }
+#         on_new_comment:
+#           enabled: true
+#           repos:  [your-org/app]
+#           # RECOMMENDED: don't respond to bot chatter (CI bots, dependabot, …).
+#           # Quote the logins — the trailing [bot] is a YAML flow-sequence trap:
+#           filter: { not_comment_author: ["github-actions[bot]", "dependabot[bot]"] }
+#   Then: `conductor init` (vendor + lock), `conductor pack plan`, `conductor validate`.
+
+pack:
+  name: pr-autopilot
+  version: 1.0.0
+  description: Autopilot for routine PR events — fix red CI, resolve conflicts, address requested changes, answer comments. One agent per event, scoped to your repos.
+  tags: [github, ci, automation, agents, maintenance]
+  homepage: https://github.com/NodeSpy/conductor-packs
+  license: Apache-2.0
+  requires:
+    # A conservative floor: promptless agent steps (the event is handed to the
+    # agent), flaky_rerun, gh.rerequest_review, and these triggers are all stable
+    # well before 0.19.0, a safe tested baseline.
+    conductor: ">=0.19.0"
+    connectors: [github]
+
+# The worker model as a fleet — conductor resolves it against your runtime's
+# roster best-first, so the pack ships no provider-specific ids. Override with
+# `packs.<name>.models: { heavy: [...] }`.
+models:
+  heavy:
+    any: ["claude-opus-*", "gpt-5-pro", "gpt-5.*", "o3*", "gemini-*-pro"]
+
+x-templates:
+  # One worker shape for every behavior: a strong model in its own worktree,
+  # reaped when it finishes. The step carries no prompt — conductor hands the
+  # agent the event that fired (the failing checks, the conflict, the comment),
+  # and the per-trigger `guidance` below says what to do with it.
+  fixer: &fixer
+    type: agent
+    model: heavy
+    workspace: worktree
+    wait_timeout: 30m
+    archive_when_done: true
+
+# Triggers ship DISARMED — no `enabled`, no repos. Arming (enabled + repos) in
+# the instance block is the consent; a github trigger is rejected at load if
+# armed without repos.
+triggers:
+  - name: on_failing_checks
+    on: github.failing_checks
+    options:
+      # Re-run once before engaging an agent — most red CI is a flake.
+      flaky_rerun: { enabled: true, max: 1 }
+    steps:
+      - <<: *fixer
+        guidance: "CI is red on this PR. Find why and push a fix on the PR branch. Don't touch unrelated code; if it's genuinely a flake and a re-run cleared it, do nothing."
+
+  - name: on_merge_conflict
+    on: github.merge_conflict
+    steps:
+      - <<: *fixer
+        guidance: "This PR conflicts with its base branch. Resolve the conflicts faithfully (keep both sides' intent), then push."
+
+  - name: on_changes_requested
+    on: github.changes_requested
+    steps:
+      - id: address
+        <<: *fixer
+        guidance: "A reviewer requested changes. Address the feedback concretely and push; don't argue in code. If something can't be done, that's a reason to leave a brief reply, not to guess."
+      - id: rerequest
+        # Ping the reviewer back once the changes are pushed.
+        uses: github.rerequest_review
+        options: { repo: "{{.repo}}", pr: "{{.pr}}", reviewers: ["{{.author}}"] }
+
+  - name: on_new_comment
+    on: github.new_comment
+    steps:
+      - <<: *fixer
+        guidance: "Someone commented on this PR. If it asks for a change, make it and push; if it's a question, answer it briefly. (Arm this trigger with a not_comment_author filter so bot chatter never reaches here.)"
