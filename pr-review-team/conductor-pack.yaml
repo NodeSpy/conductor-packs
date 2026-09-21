@@ -5,6 +5,11 @@
 # reconciles them deterministically into one ReviewRecord, then either
 # auto-posts the review or hands the DRAFT to a human to approve/edit/post.
 #
+# The hand-off is REACTIVE: while it waits for you it watches the PR and bails
+# if the reason went away (merged/closed upstream, or approved elsewhere), and
+# an idle_timeout reclaims a hand-off nobody closed — so stale drafts and
+# lingering workspaces don't pile up. Needs conductor >= 0.30.0.
+#
 # Define-behavior / bind-environment: this pack ships only BEHAVIOR (workflows
 # and a disarmed trigger). It carries NO connectors and NO secrets — you bind
 # your github connector in the `packs:` block. Posting uses that connector's
@@ -14,7 +19,7 @@
 #   packs:
 #     review:
 #       source: github.com/NodeSpy/conductor-packs//pr-review-team   # or a local path
-#       version: "~> 2.1"
+#       version: "~> 2.2"
 #       # No preset/connectors needed: the sole github connector auto-binds, and the
 #       # heavy/light fleets resolve against whatever your runtime offers. Pin a tier
 #       # only if you want to: models: { heavy: ["claude-opus-*"], light: ["claude-sonnet-*"] }
@@ -26,17 +31,18 @@
 
 pack:
   name: pr-review-team
-  version: 2.1.0
+  version: 2.2.0
   description: Multi-lens PR review (correctness / security / design …) with refute-verify, deterministic reconcile, and an optional human hand-off.
   tags: [review, github, code-quality, agents]
   homepage: https://github.com/NodeSpy/conductor-packs
   license: Apache-2.0
   requires:
-    # The daemon versions this pack supports. 0.9.0 is the floor for the step
-    # surface this pack is written against: no `agents:` registry, behavior on
-    # the step, `x-` anchors with `extends:`, and skill grants bounded by
-    # requires.connectors.
-    conductor: ">=0.9.0"
+    # The daemon versions this pack supports. 0.30.0 is the floor for the
+    # reactive hand-off surface the handoff step uses: `watch:` with
+    # handoff.bail (0.28.0), `idle_timeout:` (0.29.0), and handoff.done
+    # auto-granted to the hand-off agent (0.30.0). The rest of the pack's step
+    # surface has been stable since 0.9.0.
+    conductor: ">=0.30.0"
     # Bind-only environment the pack needs — you wire this; the pack never
     # ships it.
     # requires.connectors is the pack's CAPABILITY BOUNDARY as well as its
@@ -520,6 +526,27 @@ workflows:
         guidance: "When you hand back, summarize in one or two lines and give clear choices; never paste a wall of analysis into the question."
         skill:
           verbs: [github.submit_review]
+        # REACTIVE: while this hand-off waits for a human, watch the PR and bail
+        # if the reason to review it went away — merged/closed upstream, or
+        # approved by someone else. A stale draft never sits in front of you, and
+        # the workspace is reclaimed. (No refresh rule here: the review was
+        # DRAFTED upstream by review-team, so re-dispatching this step would only
+        # re-present the same draft — a head change is better handled by a fresh
+        # review_requested. handoff.refresh fits a hand-off that reviews itself.)
+        watch:
+          uses: github.pr_get
+          every: 2m
+          on:
+            - if: 'pr.merged == true || pr.state == "closed"'
+              uses: handoff.bail
+              options: { notify: "PR merged/closed upstream — closing this review hand-off." }
+            - if: 'pr.review_decision == "APPROVED"'
+              uses: handoff.bail
+              options: { notify: "Approved elsewhere — closing this review hand-off." }
+        # Backstop: release a hand-off nobody closed so its workspace doesn't
+        # linger. handoff.done is auto-granted to the agent (it releases early the
+        # moment it has nothing more for you); this is the safety net.
+        idle_timeout: 24h
         prompt: |
           Review request on {{.inputs.repo}}#{{.inputs.pr}} ("{{.inputs.title}}") was flagged
           for a human's manual review: {{.assess.reason}}
