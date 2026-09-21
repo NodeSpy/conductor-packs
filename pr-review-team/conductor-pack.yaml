@@ -20,7 +20,7 @@
 #   packs:
 #     review:
 #       source: github.com/NodeSpy/conductor-packs//pr-review-team   # or a local path
-#       version: "~> 2.5"
+#       version: "~> 2.6"
 #       # No preset/connectors needed: the sole github connector auto-binds, and the
 #       # heavy/light fleets resolve against whatever your runtime offers. Pin a tier
 #       # only if you want to: models: { heavy: ["claude-opus-*"], light: ["claude-sonnet-*"] }
@@ -32,7 +32,7 @@
 
 pack:
   name: pr-review-team
-  version: 2.5.0
+  version: 2.6.0
   description: Multi-lens PR review (correctness / security / design …) with refute-verify, deterministic reconcile, and an optional human hand-off.
   tags: [review, github, code-quality, agents]
   homepage: https://github.com/NodeSpy/conductor-packs
@@ -544,14 +544,11 @@ workflows:
               uses: github.pr_get
             - if: 'pr.merged == true || pr.state == "closed"'
               uses: handoff.bail
-              options: { notify: "PR merged/closed upstream — closing this review hand-off." }
             - if: 'pr.review_decision == "APPROVED"'
               uses: handoff.bail
-              options: { notify: "Approved elsewhere — closing this review hand-off." }
             - if: "pr.head_sha != handoff.pr.head_sha"
               workflow: review-flow
               with: { repo: "{{.repo}}", pr: "{{.number}}", title: "{{.title}}" }
-              options: { notify: "New commits pushed — re-reviewing on the new head." }
         # Backstop: release a hand-off nobody closed so its workspace doesn't
         # linger. handoff.done is auto-granted to the agent (it releases early the
         # moment it has nothing more for you); this is the safety net.
