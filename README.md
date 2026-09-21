@@ -12,6 +12,7 @@ block.
 | [`pr-review-team`](pr-review-team/) | Multi-lens PR review (parallel lens reviewers → refute-verify → deterministic reconcile) with auto-post or a reactive human hand-off | `github.com/NodeSpy/conductor-packs//pr-review-team` |
 | [`pr-autopilot`](pr-autopilot/) | Autopilot for routine PR events — fix red CI, resolve conflicts, address requested changes, answer comments (one agent per event) | `github.com/NodeSpy/conductor-packs//pr-autopilot` |
 | [`ci-unsticker`](ci-unsticker/) | Unstick hung CI — cancel the stalled run, wait for it to settle, then re-run. Pure verbs, no agent, no cost | `github.com/NodeSpy/conductor-packs//ci-unsticker` |
+| [`audiobookshelf-import`](audiobookshelf-import/) | Audible → Audiobookshelf pipeline: a Libation discovery pass (scan/export/liberate) + an import pass (upload each staged M4B into ABS, then prune), on two schedules. Needs the `libation` + `audiobookshelf` connectors and a `cron` connector you supply | `github.com/NodeSpy/conductor-packs//audiobookshelf-import` |
 
 Together these three are the full "conductor babysits my PRs" setup: review +
 maintenance + CI recovery.

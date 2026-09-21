@@ -1,0 +1,176 @@
+# audiobookshelf-import — a distributable conductor pack.
+#
+# Automatic Audible → Audiobookshelf pipeline, as a conductor pack. Mirrors
+# github.com/NodeSpy/audiobookshelf-import (which wires the same thing with shell
+# scripts + cron) using the `libation` and `audiobookshelf` connectors:
+#
+#   discover  (schedule)  lib.scan → lib.export → lib.liberate     → M4Bs on disk
+#   import    (schedule)  enumerate staged → abs.upload each → prune the local file
+#
+# The two halves are deliberately SEPARATE (two triggers on different intervals),
+# for the same reason the original splits them into two containers: a 50-hour
+# download must not delay detection of the next purchase.
+#
+# Define-behavior / bind-environment: this pack ships only BEHAVIOR. You bind two
+# connectors in your `packs:` block — `libation` (an already-authenticated
+# LibationCli; login is a manual one-time OAuth, out of scope) and
+# `audiobookshelf` (base_url + token) — and set your library/folder/staging via
+# step overrides.
+#
+# Install (in your config's `packs:` block):
+#   packs:
+#     audiobooks:
+#       source: github.com/NodeSpy/conductor-packs//audiobookshelf-import
+#       version: "~> 1.0"
+#       connectors: { libation: lib, audiobookshelf: abs }   # bind to your connector names
+#       steps:
+#         # your ABS target + where Libation drops M4Bs — the only per-install values:
+#         import-one/upload: { options: { library: "<library_id>", folder: "<folder_id>" } }
+#         discover/manifest: { options: { path: "/data/library.json" } }
+#       triggers:
+#         discover: { enabled: true }
+#         import:   { enabled: true }
+#   Then: `conductor init`, `conductor pack plan`, `conductor validate`.
+#
+# NOTE (staging dir): the pack defaults the staging directory to /data (where the
+# `libation` connector's `dir:` points). If yours differs, override the enumerate
+# and prune command steps' STAGING too (see import-one/prune and import/enumerate).
+
+pack:
+  name: audiobookshelf-import
+  version: 1.0.0
+  description: Audible → Audiobookshelf pipeline — a discovery pass (Libation scan/export/liberate) and an import pass (upload each staged M4B into ABS, then prune), on two schedules.
+  tags: [audiobookshelf, libation, audible, media, pipeline]
+  homepage: https://github.com/NodeSpy/conductor-packs
+  license: Apache-2.0
+  requires:
+    # A conservative floor covering the cli engine, for_each over a called
+    # workflow, and step-option overrides.
+    conductor: ">=0.33.0"
+    # Bind THREE: libation (download half), audiobookshelf (import half), and a
+    # `cron` connector (the schedule source — a pack can't ship connectors, so
+    # you supply one and define the schedule names this pack references:
+    # `discover`, `import`, and `seed`).
+    connectors: [libation, audiobookshelf, cron]
+
+# --------------------------------------------------------------------------
+# Tunables (mirror the original's .env). Defaults match the upstream project;
+# override per install with `packs.<name>.steps.<ref>.options`.
+#   DISCOVER_INTERVAL 6h   MAX_NEW 25   IMPORT_SWEEP 5m   MIN_AGE 60s   WORKERS 3
+# --------------------------------------------------------------------------
+
+workflows:
+  # ---- Discovery: ask Audible what's new, download it. Never imports. ----
+  discover:
+    description: "One discovery pass: scan Audible, export the manifest, liberate up to MAX_NEW eligible books."
+    steps:
+      - id: scan
+        uses: libation.scan
+      - id: manifest
+        uses: libation.export
+        options: { path: /data/library.json, parse: true }
+      - id: fetch
+        # limit_books is the MAX_NEW guard: a fresh/misseeded DB reports the whole
+        # library as pending, and this caps a runaway first pull. liberate's
+        # non-zero exit (a denied license) is data, not an error — the pass still
+        # progressed on the rest.
+        uses: libation.liberate
+        options: { limit_books: 25 }
+        # A big backlog can exceed the libation connector's default 60m per-verb
+        # timeout — raise it on the connector (`timeout:`), not here.
+
+  # ---- Import one staged book: upload it to ABS, prune the local file. ----
+  #      Called once per staged book by the import trigger's for_each.
+  import-one:
+    description: "Upload one staged audiobook into Audiobookshelf, then delete the local file on success."
+    inputs:
+      title:  { type: string, required: true }
+      author: { type: string, default: "" }
+      series: { type: string, default: "" }
+      file:   { type: string, required: true }   # absolute path to the .m4b
+    steps:
+      - id: upload
+        uses: audiobookshelf.upload
+        # library + folder are your ABS target — override them at install
+        # (packs.<name>.steps.import-one/upload.options).
+        options:
+          library: REQUIRED_OVERRIDE_library_id
+          folder:  REQUIRED_OVERRIDE_folder_id
+          title:  "{{.inputs.title}}"
+          author: "{{.inputs.author}}"
+          series: "{{.inputs.series}}"
+          files:  ["{{.inputs.file}}"]
+      - id: prune
+        # Delete the local copy only after a 2xx upload. Libation records
+        # "downloaded" in its own DB and does NOT cross-check the folder, so
+        # deleting the file never triggers a re-download (see the upstream README,
+        # "Why pruning is safe").
+        if: "upload.status_code >= 200 && upload.status_code < 300"
+        use: cli
+        command: [rm, -f, "{{.inputs.file}}"]
+
+triggers:
+  # 1. DISCOVER — every DISCOVER_INTERVAL. Shipped disarmed; arm with enabled:true
+  #    and (optionally) override `every`.
+  - name: discover
+    on: cron.discover
+    steps:
+      - id: run
+        workflow: discover
+
+  # 2. IMPORT — every IMPORT_SWEEP. Enumerate staged M4Bs (skipping ones still
+  #    settling, < MIN_AGE old), read each file's own tags for title/author via
+  #    ffprobe, then upload+prune each via the import-one workflow. An import pass
+  #    with nothing staged returns after the `find` without touching ABS.
+  - name: import
+    on: cron.import
+    steps:
+      - id: enumerate
+        use: cli
+        # Emits {"books":[{title,author,series,file}]} on stdout — conductor reads
+        # that as this step's outputs. ffprobe reads the M4B's own metadata, so no
+        # fragile manifest-to-file correlation. MIN_AGE: skip files touched in the
+        # last 60s (still downloading / not settled).
+        command:
+          - bash
+          - -c
+          - |
+            set -euo pipefail
+            STAGING="${STAGING:-/data}"
+            MIN_AGE="${MIN_AGE:-60}"
+            books='[]'
+            while IFS= read -r -d '' f; do
+              # settled? skip files modified within MIN_AGE seconds
+              now=$(date +%s); mt=$(stat -c %Y "$f" 2>/dev/null || echo 0)
+              [ $((now - mt)) -lt "$MIN_AGE" ] && continue
+              title=$(ffprobe -v quiet -show_entries format_tags=title  -of default=nw=1:nk=1 "$f" 2>/dev/null || true)
+              author=$(ffprobe -v quiet -show_entries format_tags=artist -of default=nw=1:nk=1 "$f" 2>/dev/null || true)
+              series=$(ffprobe -v quiet -show_entries format_tags=album  -of default=nw=1:nk=1 "$f" 2>/dev/null || true)
+              [ -z "$title" ] && title=$(basename "$f" .m4b)
+              books=$(jq -c --arg t "$title" --arg a "$author" --arg s "$series" --arg f "$f" \
+                '. + [{title:$t, author:$a, series:$s, file:$f}]' <<<"$books")
+            done < <(find "$STAGING" -type f -name '*.m4b' -print0 2>/dev/null)
+            jq -cn --argjson b "$books" '{books:$b}'
+      - id: import
+        for_each: "{{.enumerate.books}}"
+        workflow: import-one
+        with:
+          title:  "{{.item.title}}"
+          author: "{{.item.author}}"
+          series: "{{.item.series}}"
+          file:   "{{.item.file}}"
+
+  # 3. SEED (one-time, DISARMED — run by hand). Tell Libation it already holds
+  #    what's on disk, so the first discover doesn't try to pull the whole
+  #    library. Mirrors seed-liberated.py. Enable + run once, then disable.
+  - name: seed
+    on: cron.seed
+    steps:
+      - id: scan
+        uses: libation.scan
+      - id: seed
+        uses: libation.set_status
+        options: { status: downloaded }
+      - id: verify
+        uses: libation.export
+        options: { path: /data/library.json, parse: true }
