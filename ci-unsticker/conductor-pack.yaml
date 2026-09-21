@@ -1,0 +1,63 @@
+# ci-unsticker — a distributable conductor pack.
+#
+# Unstick a hung CI run: when a PR's checks sit in a non-terminal state past a
+# threshold, cancel the stuck run, WAIT for the cancel to actually land (the run
+# reaches a terminal `completed` state), then re-run it. Pure verbs — no agent,
+# no model, no cost — so it's a safe drop-in for any repo with flaky/hanging CI.
+#
+# Define-behavior / bind-environment: this pack ships only BEHAVIOR (one disarmed
+# trigger). It carries NO connectors and NO secrets — you bind your github
+# connector in the `packs:` block; all actions run as that connector's identity.
+#
+# Install (in your config's `packs:` block):
+#   packs:
+#     unstick:
+#       source: github.com/NodeSpy/conductor-packs//ci-unsticker
+#       version: "~> 1.0"
+#       triggers:
+#         on_stuck_checks:
+#           enabled: true                 # arm it
+#           repos:   [your-org/app]       # scope it — a github trigger MUST name repos
+#   Then: `conductor init` (vendor + lock), `conductor pack plan`, `conductor validate`.
+
+pack:
+  name: ci-unsticker
+  version: 1.0.0
+  description: Unstick hung CI — cancel the stalled run, wait for it to settle, then re-run. Pure verbs, no agent.
+  tags: [ci, github, maintenance]
+  homepage: https://github.com/NodeSpy/conductor-packs
+  license: Apache-2.0
+  requires:
+    # A conservative floor: this pack uses the stuck_checks trigger, the
+    # wait_for helper, and gh.get_run/cancel_run/rerun_run — all stable well
+    # before 0.19.0, which is a safe tested baseline.
+    conductor: ">=0.19.0"
+    connectors: [github]
+
+# The pack ships this trigger DISARMED — no `enabled`, no repos. Arming it
+# (enabled + repos) in the instance block is the consent; a github trigger is
+# rejected at load if armed without repos. The cadence (how often to look, and
+# how long a run must be stuck before acting) ships as sane defaults you can
+# override per instance.
+triggers:
+  - name: on_stuck_checks
+    on: github.stuck_checks
+    options:
+      poll_interval: 15m
+      stuck_after: 30m
+    steps:
+      # Cancel the stuck run, WAIT for the cancel to land (the run reaches a
+      # terminal `completed` state), then re-run it — all github verbs, acting as
+      # your connector's identity, repo-scoped. wait_for polls gh.get_run instead
+      # of guessing a fixed sleep; on a >2m stall it errors and the poller retries.
+      - uses: github.cancel_run
+        options: { repo: "{{.repo}}", run_id: "{{.run_id}}" }
+      - id: settle
+        wait_for:
+          uses: github.get_run
+          options: { repo: "{{.repo}}", run_id: "{{.run_id}}" }
+          until: "status == 'completed'"
+          every: 5s
+          timeout: 2m
+      - uses: github.rerun_run
+        options: { repo: "{{.repo}}", run_id: "{{.run_id}}" }
