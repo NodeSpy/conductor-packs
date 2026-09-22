@@ -79,16 +79,19 @@
 
 pack:
   name: audiobookshelf-import
-  version: 2.1.0
+  version: 2.2.0
   description: Audible -> Audiobookshelf pipeline (thin wrapper around the upstream sync.py / license-guard.py) -- a Libation discovery pass and a full import pass, on two schedules.
   tags: [audiobookshelf, libation, audible, media, pipeline]
   homepage: https://github.com/NodeSpy/conductor-packs
   license: Apache-2.0
   requires:
-    # >=0.43.0: ${pack.dir} (the pack ships its own sync.py/license-guard.py/
-    # seed-liberated.py under scripts/ and references them by pack dir). fswatch
-    # (>=0.38.0) and the cli engine predate it.
-    conductor: ">=0.43.0"
+    # >=0.44.0: this pack's cli steps declare `isolation:` with a filesystem
+    # allow-list (`fs:`) — the pivot_root namespace jail. On <0.44 that field is
+    # unknown (strict-decoded → load error), and the confined-by-default sandbox
+    # for pack code did not exist. >=0.43.0 gave us ${pack.dir} (the pack ships
+    # its own sync.py/license-guard.py/seed-liberated.py under scripts/); fswatch
+    # (>=0.38.0) and the cli engine predate both.
+    conductor: ">=0.44.0"
     # cron: the sweep schedules. fswatch: the low-latency import trigger. The
     # scripts reach LibationCli and ABS themselves, so no libation/audiobookshelf
     # connector is needed.
@@ -158,6 +161,18 @@ workflows:
     steps:
       - id: import
         use: cli
+        isolation:
+          # Least-privilege filesystem JAIL (conductor >=0.44). The script sees
+          # ONLY the Libation root (books, import lock, sync state) and its own
+          # shipped scripts — the daemon's config/state/secrets are hidden by
+          # ABSENCE, not merely masked. Network is left open (shared host net):
+          # sync.py talks to ABS at abs_url, and there is no proxy in the way.
+          # If books_root is set OUTSIDE lib_root, add it here; if you want ABS
+          # egress locked down, add `network: { deny: true, egress: [host:port] }`.
+          mode: namespace
+          fs:
+            - "${settings.lib_root}"
+            - "${pack.dir}"
         env:
           SCRIPTS_DIR: "${pack.dir}/scripts"
           LIB_ROOT: "${settings.lib_root}"
@@ -210,6 +225,15 @@ triggers:
     steps:
       - id: discover
         use: cli
+        isolation:
+          # fs jail (conductor >=0.44): the Libation root + shipped scripts only.
+          # Network open — LibationCli reaches Audible and cannot honor an egress
+          # proxy, so egress is not lockable here. If libation_cli lives outside
+          # /usr (e.g. /opt/libation/LibationCli), add its directory to fs.
+          mode: namespace
+          fs:
+            - "${settings.lib_root}"
+            - "${pack.dir}"
         env:
           SCRIPTS_DIR: "${pack.dir}/scripts"
           LIBATION_CLI: "${settings.libation_cli}"
@@ -300,6 +324,13 @@ triggers:
     steps:
       - id: seed
         use: cli
+        isolation:
+          # fs jail (conductor >=0.44): the Libation root + shipped scripts only.
+          # Network open (seed-liberated.py talks to ABS; LibationCli to Audible).
+          mode: namespace
+          fs:
+            - "${settings.lib_root}"
+            - "${pack.dir}"
         env:
           SCRIPTS_DIR: "${pack.dir}/scripts"
           LIBATION_CLI: "${settings.libation_cli}"
