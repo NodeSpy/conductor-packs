@@ -32,7 +32,7 @@
 
 pack:
   name: pr-review-team
-  version: 2.8.0
+  version: 2.8.1
   description: Multi-lens PR review (correctness / security / design …) with refute-verify, deterministic reconcile, and an optional human hand-off.
   tags: [review, github, code-quality, agents]
   homepage: https://github.com/NodeSpy/conductor-packs
@@ -90,6 +90,13 @@ x-templates:
   house: &house
     type: agent
     checkout: none
+    # Ride out a transient runtime blip (e.g. the paseo daemon restarting) rather
+    # than failing the whole review: retry a failed step up to 6 times, 30s apart
+    # (~3 min). Applies to every agent step that inherits house — assess, the
+    # panelists, and the interactive handoff (whose worktree clone is the step
+    # most exposed to a daemon-not-running error). Retries on any error; a genuine
+    # failure just surfaces after the bounded attempts.
+    retry: { max: 6, backoff: 30s }
     guidance: "Review only what the diff changes. Be concrete and cite file:line. Silence beats a not-worth-it comment."
 
   # The lens panel: the strongest pass, one instance per lens.
