@@ -45,12 +45,13 @@
 # INSTALL (in your config's `packs:` block)
 #
 #   connectors:
-#     timer: { use: cron, schedules: { discover: {every: 10m}, import: {every: 1m}, seed: {every: 24h} } }
+#     timer: { use: cron, schedules: { discover: {every: 10m}, import: {every: 10m}, seed: {every: 24h} } }
+#     books: { use: fswatch, watches: { staged: { path: /srv/Libation/books, match: "*.m4b", debounce: 15s } } }
 #   packs:
 #     audiobooks:
 #       source: github.com/NodeSpy/conductor-packs//audiobookshelf-import
 #       version: "~> 2.0"
-#       connectors: { cron: timer }
+#       connectors: { cron: timer, fswatch: books }
 #       settings:
 #         scripts_dir: /opt/audiobookshelf-import      # your checkout
 #         libation_cli: /opt/libation/LibationCli       # or just "LibationCli" if on PATH
@@ -59,15 +60,18 @@
 #         abs_library: Audiobooks
 #         abs_token: ${ABS_TOKEN}                        # token lives in the daemon env
 #       triggers:
-#         discover: { enabled: true }
-#         import:   { enabled: true }
+#         discover:    { enabled: true }
+#         import_fast: { enabled: true }   # event-driven (fswatch) -- seconds latency
+#         import:      { enabled: true }   # the sweep backstop -- longer interval is fine
 #   Then: conductor init, conductor pack plan, conductor validate.
 #
-# NOTE (no inotify): upstream imports on a filesystem event (seconds); conductor
-# has no filesystem-watch trigger source, so the `import` schedule IS the sweep --
-# latency is its interval, not seconds. An import pass with nothing staged returns
-# after one `find`, so a short interval is cheap. Everything else is at parity
-# because it is the same code.
+# NOTE (two import triggers): `import_fast` fires the moment a book settles
+# (fswatch, debounced); `import` is the periodic sweep. KEEP BOTH -- inotify is
+# lossy (events missed while the daemon is down, dropped on queue overflow,
+# uneven on some FUSE mounts), so the sweep is what turns a missed event into
+# latency rather than a book that never imports. The fswatch `path` must be the
+# same books dir as `lib_root/books`. An empty pass returns after one `find`, so
+# a frequent sweep is cheap. Everything else is at parity -- it is the same code.
 #
 # NOTE (state is preserved): .abs-synced.json, .license-denied.json, the lock
 # files, and any of your own files in the books dir are never touched by the pack
@@ -81,11 +85,13 @@ pack:
   homepage: https://github.com/NodeSpy/conductor-packs
   license: Apache-2.0
   requires:
-    # cli engine with per-step env:/workdir:, and pack settings substitution.
-    conductor: ">=0.33.0"
-    # Only a cron connector -- the schedule source. The scripts reach LibationCli
-    # and ABS themselves, so no libation/audiobookshelf connector is needed.
-    connectors: [cron]
+    # >=0.38.0: the `fswatch` builtin source (event-driven import). cli engine
+    # with per-step env:/workdir: and pack settings predate it.
+    conductor: ">=0.38.0"
+    # cron: the sweep schedules. fswatch: the low-latency import trigger. The
+    # scripts reach LibationCli and ABS themselves, so no libation/audiobookshelf
+    # connector is needed.
+    connectors: [cron, fswatch]
 
 settings:
   scripts_dir:
@@ -144,6 +150,60 @@ settings:
     type: boolean
     default: false
     desc: "The seed trigger reports only (dry run) unless this is true. Flip it, run once, then disarm seed."
+
+workflows:
+  # The import pass, shared by both import triggers (the cron sweep and the
+  # fswatch event). Mirrors docker/import.sh. The step's flock makes it safe for
+  # the two triggers to fire close together. An empty pass returns after one find
+  # without contacting ABS.
+  import:
+    description: "Push whatever audio is staged on disk into Audiobookshelf (sync.py --prune-source)."
+    steps:
+      - id: import
+        use: cli
+        env:
+          SCRIPTS_DIR: "${settings.scripts_dir}"
+          LIB_ROOT: "${settings.lib_root}"
+          LIB_BOOKS_ROOT: "${settings.books_root}"
+          ABS_URL: "${settings.abs_url}"
+          ABS_TOKEN: "${settings.abs_token}"
+          ABS_LIBRARY: "${settings.abs_library}"
+          AUDIO_EXT: "${settings.audio_ext}"
+          WORKERS: "${settings.workers}"
+          DURATION_TOLERANCE: "${settings.duration_tolerance}"
+          MIN_AGE: "${settings.min_age}"
+        command:
+          - bash
+          - -c
+          - |
+            set -uo pipefail
+            say() { printf '%s  %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"; }
+            SCRIPTS="${SCRIPTS_DIR:?SCRIPTS_DIR unset}"
+            LIB_ROOT="${LIB_ROOT:?LIB_ROOT unset}"
+            BOOKS="${LIB_BOOKS_ROOT:-$LIB_ROOT/books}"
+            MANIFEST="$BOOKS/library.json"
+            LOCK="$BOOKS/.import.lock"
+
+            exec 9>"$LOCK" || { say "FATAL: cannot open lock $LOCK"; exit 1; }
+            flock -n 9 || { say "another import pass is already running, skipping"; exit 0; }
+
+            if [ ! -f "$MANIFEST" ]; then
+              say "no manifest at $MANIFEST yet - waiting for the first discovery pass"
+              exit 0
+            fi
+
+            staged=$(find "$BOOKS" -type f -name "*.${AUDIO_EXT:-m4b}" -print -quit 2>/dev/null)
+            [ -z "$staged" ] && exit 0
+
+            say "=== import start ==="
+            python3 "$SCRIPTS/sync.py" \
+              --source-root "$BOOKS" \
+              --prune-source \
+              --state "$BOOKS/.abs-synced.json" \
+              --workers "${WORKERS:-3}"
+            rc=$?
+            say "=== import done (rc=$rc) ==="
+            exit "$rc"
 
 triggers:
   # 1. DISCOVER -- ask Audible what's new and download the eligible books. Mirrors
@@ -215,57 +275,25 @@ triggers:
             fi
             say "=== discover done ==="
 
-  # 2. IMPORT -- push whatever is staged on disk into ABS. Mirrors docker/import.sh.
-  #    This schedule's interval is the import latency (no inotify on conductor); an
-  #    empty pass returns after one find without contacting ABS.
+  # 2. IMPORT (fast) -- fire the moment a book settles on disk, via the fswatch
+  #    source. Debounced (collapses one download's burst of events into a single
+  #    pass); latency is seconds, not a poll interval.
+  - name: import_fast
+    "on": fswatch.staged
+    steps:
+      - id: run
+        workflow: import
+
+  # 3. IMPORT (sweep) -- the backstop. fswatch/inotify is lossy (events missed
+  #    while the daemon is down, dropped on queue overflow, uneven on some FUSE
+  #    mounts), so a periodic pass guarantees a missed event costs latency, not a
+  #    book that never imports. Cheap: an empty pass returns after one find. Runs
+  #    the SAME workflow; the import lock serializes the two.
   - name: import
     "on": cron.import
     steps:
-      - id: import
-        use: cli
-        env:
-          SCRIPTS_DIR: "${settings.scripts_dir}"
-          LIB_ROOT: "${settings.lib_root}"
-          LIB_BOOKS_ROOT: "${settings.books_root}"
-          ABS_URL: "${settings.abs_url}"
-          ABS_TOKEN: "${settings.abs_token}"
-          ABS_LIBRARY: "${settings.abs_library}"
-          AUDIO_EXT: "${settings.audio_ext}"
-          WORKERS: "${settings.workers}"
-          DURATION_TOLERANCE: "${settings.duration_tolerance}"
-          MIN_AGE: "${settings.min_age}"
-        command:
-          - bash
-          - -c
-          - |
-            set -uo pipefail
-            say() { printf '%s  %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"; }
-            SCRIPTS="${SCRIPTS_DIR:?SCRIPTS_DIR unset}"
-            LIB_ROOT="${LIB_ROOT:?LIB_ROOT unset}"
-            BOOKS="${LIB_BOOKS_ROOT:-$LIB_ROOT/books}"
-            MANIFEST="$BOOKS/library.json"
-            LOCK="$BOOKS/.import.lock"
-
-            exec 9>"$LOCK" || { say "FATAL: cannot open lock $LOCK"; exit 1; }
-            flock -n 9 || { say "another import pass is already running, skipping"; exit 0; }
-
-            if [ ! -f "$MANIFEST" ]; then
-              say "no manifest at $MANIFEST yet - waiting for the first discovery pass"
-              exit 0
-            fi
-
-            staged=$(find "$BOOKS" -type f -name "*.${AUDIO_EXT:-m4b}" -print -quit 2>/dev/null)
-            [ -z "$staged" ] && exit 0
-
-            say "=== import start ==="
-            python3 "$SCRIPTS/sync.py" \
-              --source-root "$BOOKS" \
-              --prune-source \
-              --state "$BOOKS/.abs-synced.json" \
-              --workers "${WORKERS:-3}"
-            rc=$?
-            say "=== import done (rc=$rc) ==="
-            exit "$rc"
+      - id: run
+        workflow: import
 
   # 3. SEED (disarmed; one-time). Tell Libation it already holds what ABS holds, so
   #    a fresh install doesn't re-download the back catalogue. Reports only unless
