@@ -1,10 +1,11 @@
 # audiobookshelf-import — a distributable conductor pack.
 #
-# Automatic Audible -> Audiobookshelf pipeline. This pack is a THIN WRAPPER around
-# the real scripts at github.com/NodeSpy/audiobookshelf-import: conductor owns the
-# scheduling, run history, pause, and failure surfacing that its `loop.sh` did by
-# hand, and shells out to the upstream `sync.py` / `license-guard.py` /
-# `seed-liberated.py` for the import itself. Those ~1200 lines carry logic worth
+# Automatic Audible -> Audiobookshelf pipeline. This pack BUNDLES the real scripts
+# from github.com/NodeSpy/audiobookshelf-import (under scripts/) and runs them:
+# conductor owns the scheduling, run history, pause, and failure surfacing that
+# its `loop.sh` did by hand, and shells out to the shipped `sync.py` /
+# `license-guard.py` / `seed-liberated.py` for the import itself. Those ~1200
+# lines carry logic worth
 # not reimplementing: duplicate detection, ASIN match verification, audio
 # integrity checks, license-denial backoff, author-spelling reconcile, the
 # series-prefix-clash guard, and companion/leftover cleanup.
@@ -36,9 +37,9 @@
 #      Libation is set up.
 #   2. python3 with `requests`  (pip install requests).  ffprobe, jq, flock must
 #      be on PATH.  sync.py/license-guard.py read everything from env.
-#   3. A checkout of github.com/NodeSpy/audiobookshelf-import at `scripts_dir`
-#      (you maintain it; `git pull` to update -- upstream stays authoritative).
-#   4. An ABS API key (Settings -> API Keys). Supply it via the daemon's env and
+#      (The scripts themselves ship WITH the pack under scripts/ -- nothing to
+#      check out; conductor runs them from the pack's vendored dir.)
+#   3. An ABS API key (Settings -> API Keys). Supply it via the daemon's env and
 #      wire it in as `abs_token: ${ABS_TOKEN}` (see install below).
 #
 # ------------------------------------------------------------------------------
@@ -53,7 +54,6 @@
 #       version: "~> 2.0"
 #       connectors: { cron: timer, fswatch: books }
 #       settings:
-#         scripts_dir: /opt/audiobookshelf-import      # your checkout
 #         libation_cli: /opt/libation/LibationCli       # or just "LibationCli" if on PATH
 #         lib_root: /srv/Libation                        # holds config/, db/, books/
 #         abs_url: http://localhost:13378
@@ -79,25 +79,22 @@
 
 pack:
   name: audiobookshelf-import
-  version: 2.0.0
+  version: 2.1.0
   description: Audible -> Audiobookshelf pipeline (thin wrapper around the upstream sync.py / license-guard.py) -- a Libation discovery pass and a full import pass, on two schedules.
   tags: [audiobookshelf, libation, audible, media, pipeline]
   homepage: https://github.com/NodeSpy/conductor-packs
   license: Apache-2.0
   requires:
-    # >=0.38.0: the `fswatch` builtin source (event-driven import). cli engine
-    # with per-step env:/workdir: and pack settings predate it.
-    conductor: ">=0.38.0"
+    # >=0.43.0: ${pack.dir} (the pack ships its own sync.py/license-guard.py/
+    # seed-liberated.py under scripts/ and references them by pack dir). fswatch
+    # (>=0.38.0) and the cli engine predate it.
+    conductor: ">=0.43.0"
     # cron: the sweep schedules. fswatch: the low-latency import trigger. The
     # scripts reach LibationCli and ABS themselves, so no libation/audiobookshelf
     # connector is needed.
     connectors: [cron, fswatch]
 
 settings:
-  scripts_dir:
-    type: string
-    default: /opt/audiobookshelf-import
-    desc: "Checkout of github.com/NodeSpy/audiobookshelf-import (holds sync.py, license-guard.py, seed-liberated.py)."
   libation_cli:
     type: string
     default: LibationCli
@@ -162,7 +159,7 @@ workflows:
       - id: import
         use: cli
         env:
-          SCRIPTS_DIR: "${settings.scripts_dir}"
+          SCRIPTS_DIR: "${pack.dir}/scripts"
           LIB_ROOT: "${settings.lib_root}"
           LIB_BOOKS_ROOT: "${settings.books_root}"
           ABS_URL: "${settings.abs_url}"
@@ -214,7 +211,7 @@ triggers:
       - id: discover
         use: cli
         env:
-          SCRIPTS_DIR: "${settings.scripts_dir}"
+          SCRIPTS_DIR: "${pack.dir}/scripts"
           LIBATION_CLI: "${settings.libation_cli}"
           LIB_ROOT: "${settings.lib_root}"
           LIB_BOOKS_ROOT: "${settings.books_root}"
@@ -304,7 +301,7 @@ triggers:
       - id: seed
         use: cli
         env:
-          SCRIPTS_DIR: "${settings.scripts_dir}"
+          SCRIPTS_DIR: "${pack.dir}/scripts"
           LIBATION_CLI: "${settings.libation_cli}"
           LIB_ROOT: "${settings.lib_root}"
           LIB_BOOKS_ROOT: "${settings.books_root}"
