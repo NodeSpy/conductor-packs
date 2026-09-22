@@ -1,176 +1,330 @@
 # audiobookshelf-import — a distributable conductor pack.
 #
-# Automatic Audible → Audiobookshelf pipeline, as a conductor pack. Mirrors
-# github.com/NodeSpy/audiobookshelf-import (which wires the same thing with shell
-# scripts + cron) using the `libation` and `audiobookshelf` connectors:
+# Automatic Audible -> Audiobookshelf pipeline. This pack is a THIN WRAPPER around
+# the real scripts at github.com/NodeSpy/audiobookshelf-import: conductor owns the
+# scheduling, run history, pause, and failure surfacing that its `loop.sh` did by
+# hand, and shells out to the upstream `sync.py` / `license-guard.py` /
+# `seed-liberated.py` for the import itself. Those ~1200 lines carry logic worth
+# not reimplementing: duplicate detection, ASIN match verification, audio
+# integrity checks, license-denial backoff, author-spelling reconcile, the
+# series-prefix-clash guard, and companion/leftover cleanup.
 #
-#   discover  (schedule)  lib.scan → lib.export → lib.liberate     → M4Bs on disk
-#   import    (schedule)  enumerate staged → abs.upload each → prune the local file
+#   discover  (schedule)  LibationCli scan -> export -> license-guard --eligible
+#                         -> liberate the eligible ASINs -> license-guard --record
+#                         -> re-export.  Never imports.
+#   import    (schedule)  sync.py --prune-source: dedup, verify, upload, wait for
+#                         ABS to index it, match by ASIN + verify it stuck, prune.
+#   seed      (manual)    seed-liberated.py: tell Libation it already holds what
+#                         ABS holds, so a fresh install doesn't re-download.
 #
-# The two halves are deliberately SEPARATE (two triggers on different intervals),
-# for the same reason the original splits them into two containers: a 50-hour
-# download must not delay detection of the next purchase.
+# The two halves are deliberately SEPARATE (two schedules), for the same reason
+# the original splits them: a 50-hour download must not delay the next scan.
 #
-# Define-behavior / bind-environment: this pack ships only BEHAVIOR. You bind two
-# connectors in your `packs:` block — `libation` (an already-authenticated
-# LibationCli; login is a manual one-time OAuth, out of scope) and
-# `audiobookshelf` (base_url + token) — and set your library/folder/staging via
-# step overrides.
+# RUNTIME: native on the host running conductor. The scripts talk to LibationCli
+# and the ABS API directly, so this pack binds NO libation/audiobookshelf
+# connector -- only a `cron` connector for the schedules. Everything the scripts
+# need is passed through each step's env from the pack settings below.
 #
-# Install (in your config's `packs:` block):
+# ------------------------------------------------------------------------------
+# PREREQUISITES (one-time, on the box -- the pack cannot do these for you)
+#
+#   1. LibationCli installed natively + a one-time Audible login (its config, db
+#      and master key under <lib_root>/config). Upstream ships Libation only as a
+#      Docker image, so this is the load-bearing native step; `libation_cli` must
+#      point at a working binary. The import half is independent of this -- it
+#      only needs the manifest, the files, and ABS -- so imports work even before
+#      Libation is set up.
+#   2. python3 with `requests`  (pip install requests).  ffprobe, jq, flock must
+#      be on PATH.  sync.py/license-guard.py read everything from env.
+#   3. A checkout of github.com/NodeSpy/audiobookshelf-import at `scripts_dir`
+#      (you maintain it; `git pull` to update -- upstream stays authoritative).
+#   4. An ABS API key (Settings -> API Keys). Supply it via the daemon's env and
+#      wire it in as `abs_token: ${ABS_TOKEN}` (see install below).
+#
+# ------------------------------------------------------------------------------
+# INSTALL (in your config's `packs:` block)
+#
+#   connectors:
+#     timer: { use: cron, schedules: { discover: {every: 10m}, import: {every: 10m}, seed: {every: 24h} } }
+#     books: { use: fswatch, watches: { staged: { path: /srv/Libation/books, match: "*.m4b", debounce: 15s } } }
 #   packs:
 #     audiobooks:
 #       source: github.com/NodeSpy/conductor-packs//audiobookshelf-import
-#       version: "~> 1.0"
-#       connectors: { libation: lib, audiobookshelf: abs }   # bind to your connector names
-#       steps:
-#         # your ABS target + where Libation drops M4Bs — the only per-install values:
-#         import-one/upload: { options: { library: "<library_id>", folder: "<folder_id>" } }
-#         discover/manifest: { options: { path: "/data/library.json" } }
+#       version: "~> 2.0"
+#       connectors: { cron: timer, fswatch: books }
+#       settings:
+#         scripts_dir: /opt/audiobookshelf-import      # your checkout
+#         libation_cli: /opt/libation/LibationCli       # or just "LibationCli" if on PATH
+#         lib_root: /srv/Libation                        # holds config/, db/, books/
+#         abs_url: http://localhost:13378
+#         abs_library: Audiobooks
+#         abs_token: ${ABS_TOKEN}                        # token lives in the daemon env
 #       triggers:
-#         discover: { enabled: true }
-#         import:   { enabled: true }
-#   Then: `conductor init`, `conductor pack plan`, `conductor validate`.
+#         discover:    { enabled: true }
+#         import_fast: { enabled: true }   # event-driven (fswatch) -- seconds latency
+#         import:      { enabled: true }   # the sweep backstop -- longer interval is fine
+#   Then: conductor init, conductor pack plan, conductor validate.
 #
-# NOTE (staging dir): the pack defaults the staging directory to /data (where the
-# `libation` connector's `dir:` points). If yours differs, override the enumerate
-# and prune command steps' STAGING too (see import-one/prune and import/enumerate).
+# NOTE (two import triggers): `import_fast` fires the moment a book settles
+# (fswatch, debounced); `import` is the periodic sweep. KEEP BOTH -- inotify is
+# lossy (events missed while the daemon is down, dropped on queue overflow,
+# uneven on some FUSE mounts), so the sweep is what turns a missed event into
+# latency rather than a book that never imports. The fswatch `path` must be the
+# same books dir as `lib_root/books`. An empty pass returns after one `find`, so
+# a frequent sweep is cheap. Everything else is at parity -- it is the same code.
+#
+# NOTE (state is preserved): .abs-synced.json, .license-denied.json, the lock
+# files, and any of your own files in the books dir are never touched by the pack
+# -- it only runs the scripts in place.
 
 pack:
   name: audiobookshelf-import
-  version: 1.0.0
-  description: Audible → Audiobookshelf pipeline — a discovery pass (Libation scan/export/liberate) and an import pass (upload each staged M4B into ABS, then prune), on two schedules.
+  version: 2.0.0
+  description: Audible -> Audiobookshelf pipeline (thin wrapper around the upstream sync.py / license-guard.py) -- a Libation discovery pass and a full import pass, on two schedules.
   tags: [audiobookshelf, libation, audible, media, pipeline]
   homepage: https://github.com/NodeSpy/conductor-packs
   license: Apache-2.0
   requires:
-    # A conservative floor covering the cli engine, for_each over a called
-    # workflow, and step-option overrides.
-    conductor: ">=0.33.0"
-    # Bind THREE: libation (download half), audiobookshelf (import half), and a
-    # `cron` connector (the schedule source — a pack can't ship connectors, so
-    # you supply one and define the schedule names this pack references:
-    # `discover`, `import`, and `seed`).
-    connectors: [libation, audiobookshelf, cron]
+    # >=0.38.0: the `fswatch` builtin source (event-driven import). cli engine
+    # with per-step env:/workdir: and pack settings predate it.
+    conductor: ">=0.38.0"
+    # cron: the sweep schedules. fswatch: the low-latency import trigger. The
+    # scripts reach LibationCli and ABS themselves, so no libation/audiobookshelf
+    # connector is needed.
+    connectors: [cron, fswatch]
 
-# --------------------------------------------------------------------------
-# Tunables (mirror the original's .env). Defaults match the upstream project;
-# override per install with `packs.<name>.steps.<ref>.options`.
-#   DISCOVER_INTERVAL 6h   MAX_NEW 25   IMPORT_SWEEP 5m   MIN_AGE 60s   WORKERS 3
-# --------------------------------------------------------------------------
+settings:
+  scripts_dir:
+    type: string
+    default: /opt/audiobookshelf-import
+    desc: "Checkout of github.com/NodeSpy/audiobookshelf-import (holds sync.py, license-guard.py, seed-liberated.py)."
+  libation_cli:
+    type: string
+    default: LibationCli
+    desc: "Path to the native LibationCli binary (or a bare name on PATH). Discovery + seed only."
+  lib_root:
+    type: string
+    default: /srv/Libation
+    desc: "Libation's root; holds config/, db/, and books/. license-guard keeps .license-denied.json here."
+  books_root:
+    type: string
+    default: ""
+    desc: "The staging dir the importer reads + prunes. Empty => <lib_root>/books."
+  abs_url:
+    type: string
+    default: http://localhost:13378
+    desc: "Audiobookshelf base URL, as reachable from this host."
+  abs_library:
+    type: string
+    default: Audiobooks
+    desc: "Target ABS library, by name (case-insensitive) or id."
+  abs_token:
+    type: string
+    default: ""
+    desc: "ABS API key. Set to ${ABS_TOKEN} so the token comes from the daemon env, not the config file."
+  max_new:
+    type: integer
+    default: 25
+    desc: "Ceiling on books liberated per discovery pass -- stops a fresh/misseeded DB from pulling the whole library."
+  workers:
+    type: integer
+    default: 3
+    desc: "Concurrent imports. Above 1, an ABS item is only claimed on an exact destination-path match."
+  retry_denied_hours:
+    type: number
+    default: 24
+    desc: "How long a license-denied book is held back before being retried."
+  audio_ext:
+    type: string
+    default: m4b
+    desc: "Audio file extension to stage and import."
+  duration_tolerance:
+    type: number
+    default: 0.05
+    desc: "Allowed drift vs the catalogue duration in the ffprobe integrity check."
+  min_age:
+    type: integer
+    default: 60
+    desc: "Seconds a file must be untouched before it is considered settled and importable."
+  seed_apply:
+    type: boolean
+    default: false
+    desc: "The seed trigger reports only (dry run) unless this is true. Flip it, run once, then disarm seed."
 
 workflows:
-  # ---- Discovery: ask Audible what's new, download it. Never imports. ----
-  discover:
-    description: "One discovery pass: scan Audible, export the manifest, liberate up to MAX_NEW eligible books."
+  # The import pass, shared by both import triggers (the cron sweep and the
+  # fswatch event). Mirrors docker/import.sh. The step's flock makes it safe for
+  # the two triggers to fire close together. An empty pass returns after one find
+  # without contacting ABS.
+  import:
+    description: "Push whatever audio is staged on disk into Audiobookshelf (sync.py --prune-source)."
     steps:
-      - id: scan
-        uses: libation.scan
-      - id: manifest
-        uses: libation.export
-        options: { path: /data/library.json, parse: true }
-      - id: fetch
-        # limit_books is the MAX_NEW guard: a fresh/misseeded DB reports the whole
-        # library as pending, and this caps a runaway first pull. liberate's
-        # non-zero exit (a denied license) is data, not an error — the pass still
-        # progressed on the rest.
-        uses: libation.liberate
-        options: { limit_books: 25 }
-        # A big backlog can exceed the libation connector's default 60m per-verb
-        # timeout — raise it on the connector (`timeout:`), not here.
-
-  # ---- Import one staged book: upload it to ABS, prune the local file. ----
-  #      Called once per staged book by the import trigger's for_each.
-  import-one:
-    description: "Upload one staged audiobook into Audiobookshelf, then delete the local file on success."
-    inputs:
-      title:  { type: string, required: true }
-      author: { type: string, default: "" }
-      series: { type: string, default: "" }
-      file:   { type: string, required: true }   # absolute path to the .m4b
-    steps:
-      - id: upload
-        uses: audiobookshelf.upload
-        # library + folder are your ABS target — override them at install
-        # (packs.<name>.steps.import-one/upload.options).
-        options:
-          library: REQUIRED_OVERRIDE_library_id
-          folder:  REQUIRED_OVERRIDE_folder_id
-          title:  "{{.inputs.title}}"
-          author: "{{.inputs.author}}"
-          series: "{{.inputs.series}}"
-          files:  ["{{.inputs.file}}"]
-      - id: prune
-        # Delete the local copy only after a 2xx upload. Libation records
-        # "downloaded" in its own DB and does NOT cross-check the folder, so
-        # deleting the file never triggers a re-download (see the upstream README,
-        # "Why pruning is safe").
-        if: "upload.status_code >= 200 && upload.status_code < 300"
+      - id: import
         use: cli
-        command: [rm, -f, "{{.inputs.file}}"]
-
-triggers:
-  # 1. DISCOVER — every DISCOVER_INTERVAL. Shipped disarmed; arm with enabled:true
-  #    and (optionally) override `every`.
-  - name: discover
-    on: cron.discover
-    steps:
-      - id: run
-        workflow: discover
-
-  # 2. IMPORT — every IMPORT_SWEEP. Enumerate staged M4Bs (skipping ones still
-  #    settling, < MIN_AGE old), read each file's own tags for title/author via
-  #    ffprobe, then upload+prune each via the import-one workflow. An import pass
-  #    with nothing staged returns after the `find` without touching ABS.
-  - name: import
-    on: cron.import
-    steps:
-      - id: enumerate
-        use: cli
-        # Emits {"books":[{title,author,series,file}]} on stdout — conductor reads
-        # that as this step's outputs. ffprobe reads the M4B's own metadata, so no
-        # fragile manifest-to-file correlation. MIN_AGE: skip files touched in the
-        # last 60s (still downloading / not settled).
+        env:
+          SCRIPTS_DIR: "${settings.scripts_dir}"
+          LIB_ROOT: "${settings.lib_root}"
+          LIB_BOOKS_ROOT: "${settings.books_root}"
+          ABS_URL: "${settings.abs_url}"
+          ABS_TOKEN: "${settings.abs_token}"
+          ABS_LIBRARY: "${settings.abs_library}"
+          AUDIO_EXT: "${settings.audio_ext}"
+          WORKERS: "${settings.workers}"
+          DURATION_TOLERANCE: "${settings.duration_tolerance}"
+          MIN_AGE: "${settings.min_age}"
         command:
           - bash
           - -c
           - |
-            set -euo pipefail
-            STAGING="${STAGING:-/data}"
-            MIN_AGE="${MIN_AGE:-60}"
-            books='[]'
-            while IFS= read -r -d '' f; do
-              # settled? skip files modified within MIN_AGE seconds
-              now=$(date +%s); mt=$(stat -c %Y "$f" 2>/dev/null || echo 0)
-              [ $((now - mt)) -lt "$MIN_AGE" ] && continue
-              title=$(ffprobe -v quiet -show_entries format_tags=title  -of default=nw=1:nk=1 "$f" 2>/dev/null || true)
-              author=$(ffprobe -v quiet -show_entries format_tags=artist -of default=nw=1:nk=1 "$f" 2>/dev/null || true)
-              series=$(ffprobe -v quiet -show_entries format_tags=album  -of default=nw=1:nk=1 "$f" 2>/dev/null || true)
-              [ -z "$title" ] && title=$(basename "$f" .m4b)
-              books=$(jq -c --arg t "$title" --arg a "$author" --arg s "$series" --arg f "$f" \
-                '. + [{title:$t, author:$a, series:$s, file:$f}]' <<<"$books")
-            done < <(find "$STAGING" -type f -name '*.m4b' -print0 2>/dev/null)
-            jq -cn --argjson b "$books" '{books:$b}'
-      - id: import
-        for_each: "{{.enumerate.books}}"
-        workflow: import-one
-        with:
-          title:  "{{.item.title}}"
-          author: "{{.item.author}}"
-          series: "{{.item.series}}"
-          file:   "{{.item.file}}"
+            set -uo pipefail
+            say() { printf '%s  %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"; }
+            SCRIPTS="${SCRIPTS_DIR:?SCRIPTS_DIR unset}"
+            LIB_ROOT="${LIB_ROOT:?LIB_ROOT unset}"
+            BOOKS="${LIB_BOOKS_ROOT:-$LIB_ROOT/books}"
+            MANIFEST="$BOOKS/library.json"
+            LOCK="$BOOKS/.import.lock"
 
-  # 3. SEED (one-time, DISARMED — run by hand). Tell Libation it already holds
-  #    what's on disk, so the first discover doesn't try to pull the whole
-  #    library. Mirrors seed-liberated.py. Enable + run once, then disable.
-  - name: seed
-    on: cron.seed
+            exec 9>"$LOCK" || { say "FATAL: cannot open lock $LOCK"; exit 1; }
+            flock -n 9 || { say "another import pass is already running, skipping"; exit 0; }
+
+            if [ ! -f "$MANIFEST" ]; then
+              say "no manifest at $MANIFEST yet - waiting for the first discovery pass"
+              exit 0
+            fi
+
+            staged=$(find "$BOOKS" -type f -name "*.${AUDIO_EXT:-m4b}" -print -quit 2>/dev/null)
+            [ -z "$staged" ] && exit 0
+
+            say "=== import start ==="
+            python3 "$SCRIPTS/sync.py" \
+              --source-root "$BOOKS" \
+              --prune-source \
+              --state "$BOOKS/.abs-synced.json" \
+              --workers "${WORKERS:-3}"
+            rc=$?
+            say "=== import done (rc=$rc) ==="
+            exit "$rc"
+
+triggers:
+  # 1. DISCOVER -- ask Audible what's new and download the eligible books. Mirrors
+  #    docker/discover.sh, path-corrected for a native host. Never imports.
+  - name: discover
+    "on": cron.discover
     steps:
-      - id: scan
-        uses: libation.scan
+      - id: discover
+        use: cli
+        env:
+          SCRIPTS_DIR: "${settings.scripts_dir}"
+          LIBATION_CLI: "${settings.libation_cli}"
+          LIB_ROOT: "${settings.lib_root}"
+          LIB_BOOKS_ROOT: "${settings.books_root}"
+          MAX_NEW: "${settings.max_new}"
+          RETRY_DENIED_HOURS: "${settings.retry_denied_hours}"
+        command:
+          - bash
+          - -c
+          - |
+            set -uo pipefail
+            say() { printf '%s  %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"; }
+            CLI="${LIBATION_CLI:?LIBATION_CLI unset}"
+            SCRIPTS="${SCRIPTS_DIR:?SCRIPTS_DIR unset}"
+            LIB_ROOT="${LIB_ROOT:?LIB_ROOT unset}"
+            BOOKS="${LIB_BOOKS_ROOT:-$LIB_ROOT/books}"
+            export LIB_ROOT LIB_BOOKS_ROOT="$BOOKS"
+            MANIFEST="$BOOKS/library.json"
+            MAX_NEW="${MAX_NEW:-25}"
+            LOCK="$BOOKS/.discover.lock"
+
+            exec 9>"$LOCK" || { say "FATAL: cannot open lock $LOCK"; exit 1; }
+            flock -n 9 || { say "another discovery pass is already running, skipping"; exit 0; }
+
+            say "=== discover start ==="
+            say "scanning Audible for new purchases"
+            "$CLI" scan || { say "FATAL: scan failed. If the log mentions ExistingAccessToken, re-create the Audible credentials (README 'Logging in')."; exit 1; }
+
+            say "exporting library manifest"
+            "$CLI" export -j -p "$MANIFEST" || { say "FATAL: export failed"; exit 1; }
+            [ -f "$MANIFEST" ] || { say "FATAL: export produced no $MANIFEST"; exit 1; }
+
+            mapfile -t eligible < <(python3 "$SCRIPTS/license-guard.py" --eligible 2>/dev/null)
+            pending=${#eligible[@]}
+            unavailable=$(jq '[.[] | select(.BookStatus != "Liberated")] | length' "$MANIFEST" 2>/dev/null || echo 0)
+            unavailable=$(( unavailable - pending ))
+
+            if [ "$pending" -eq 0 ]; then
+              if [ "$unavailable" -gt 0 ]; then
+                say "nothing new to download ($unavailable unavailable: not in the Audible library, or license denied)"
+              else
+                say "nothing new to download"
+              fi
+            elif [ "$pending" -gt "$MAX_NEW" ]; then
+              say "REFUSING to liberate: $pending books pending, ceiling is MAX_NEW=$MAX_NEW."
+              say "  A fresh database reports the whole library as pending. If Audiobookshelf already"
+              say "  holds these, run the seed trigger. If this really is a backlog, raise max_new."
+              exit 0
+            else
+              say "liberating $pending book(s)${unavailable:+, $unavailable unavailable}"
+              ids=(); for asin in "${eligible[@]}"; do ids+=(-i "$asin"); done
+              LIBLOG="$(mktemp /tmp/liberate.XXXXXX)"
+              "$CLI" liberate "${ids[@]}" 2>&1 | tee "$LIBLOG"
+              [ "${PIPESTATUS[0]}" -ne 0 ] && say "warning: liberate returned non-zero, continuing"
+              python3 "$SCRIPTS/license-guard.py" --record "$LIBLOG" || say "warning: could not record denials"
+              rm -f "$LIBLOG"
+              say "re-exporting manifest"
+              "$CLI" export -j -p "$MANIFEST" || say "warning: re-export failed"
+            fi
+            say "=== discover done ==="
+
+  # 2. IMPORT (fast) -- fire the moment a book settles on disk, via the fswatch
+  #    source. Debounced (collapses one download's burst of events into a single
+  #    pass); latency is seconds, not a poll interval.
+  - name: import_fast
+    "on": fswatch.staged
+    steps:
+      - id: run
+        workflow: import
+
+  # 3. IMPORT (sweep) -- the backstop. fswatch/inotify is lossy (events missed
+  #    while the daemon is down, dropped on queue overflow, uneven on some FUSE
+  #    mounts), so a periodic pass guarantees a missed event costs latency, not a
+  #    book that never imports. Cheap: an empty pass returns after one find. Runs
+  #    the SAME workflow; the import lock serializes the two.
+  - name: import
+    "on": cron.import
+    steps:
+      - id: run
+        workflow: import
+
+  # 3. SEED (disarmed; one-time). Tell Libation it already holds what ABS holds, so
+  #    a fresh install doesn't re-download the back catalogue. Reports only unless
+  #    seed_apply=true. Enable, set seed_apply, run once, then disarm.
+  - name: seed
+    "on": cron.seed
+    steps:
       - id: seed
-        uses: libation.set_status
-        options: { status: downloaded }
-      - id: verify
-        uses: libation.export
-        options: { path: /data/library.json, parse: true }
+        use: cli
+        env:
+          SCRIPTS_DIR: "${settings.scripts_dir}"
+          LIBATION_CLI: "${settings.libation_cli}"
+          LIB_ROOT: "${settings.lib_root}"
+          LIB_BOOKS_ROOT: "${settings.books_root}"
+          ABS_URL: "${settings.abs_url}"
+          ABS_TOKEN: "${settings.abs_token}"
+          ABS_LIBRARY: "${settings.abs_library}"
+          AUDIO_EXT: "${settings.audio_ext}"
+          SEED_APPLY: "${settings.seed_apply}"
+        command:
+          - bash
+          - -c
+          - |
+            set -uo pipefail
+            SCRIPTS="${SCRIPTS_DIR:?SCRIPTS_DIR unset}"
+            LIB_ROOT="${LIB_ROOT:?LIB_ROOT unset}"
+            export LIB_ROOT LIB_BOOKS_ROOT="${LIB_BOOKS_ROOT:-$LIB_ROOT/books}"
+            if [ "${SEED_APPLY:-false}" = "true" ]; then
+              echo "seed: applying (set-status downloaded for books ABS already holds)"
+              python3 "$SCRIPTS/seed-liberated.py" --apply
+            else
+              echo "seed: DRY RUN (report only). Set seed_apply=true to write."
+              python3 "$SCRIPTS/seed-liberated.py"
+            fi
