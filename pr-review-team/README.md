@@ -50,9 +50,8 @@ credentials, so the pack can't ship it.
 
 ## What it needs (`requires:`)
 
-- **`conductor: >=0.9.0`** — the step surface this pack is written against: no
-  `agents:` registry, behavior lives on the step, `x-` anchors with `extends:`,
-  and skill grants bounded by `requires.connectors`.
+- **`conductor: >=0.54.0`** — the release with `decide:` steps, which `assess`
+  and `verify` use.
 - **A `github` connector**, bound in the `packs:` block. That's the only bind.
 - The reviewer / assessor / hand-off behavior ships as steps with working
   defaults (see Tuning). Override one by qualified reference — `steps: {
@@ -70,6 +69,15 @@ credentials, so the pack can't ship it.
   `heavy_model` drives the lens panel (the strongest pass); `light_model`
   drives triage, refute-verify, and the hand-off agent. Both default to `"*"`
   (any model your runtime offers) when no preset or setting is given.
+- **Triage and refute-verify are `decide:` steps** — typed yes/no and choice
+  questions answered with probabilities, not agent runs. Any runtime in the
+  light tier answers them (an agent runtime through conductor's adapter, in one
+  restricted session). To have a decision runtime such as Jev answer first, add
+  its models to the tier — `models: { light: ["jev-*", "claude-sonnet-*"] }` —
+  with the runtime configured ([jev runtime](https://github.com/NodeSpy/conductor-plugins/blob/main/docs/runtimes/jev.md)).
+  `verify` refutes a finding only when P(refuted) ≥ 0.8. Record every decision
+  for calibration with `decide: { observe: <your SQL store> }` on the pack
+  instance ([Decide steps](https://github.com/NodeSpy/conductor/blob/main/docs/wiki/Decide-Steps.md)).
 - **Step overrides** — override any exported step by its qualified reference
   in the `packs:` block, e.g. `steps: { review-flow/handoff: { model: ... } }`.
   See `exports:` in the manifest for the full list of overridable steps.
