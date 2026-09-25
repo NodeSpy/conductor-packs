@@ -32,19 +32,18 @@
 
 pack:
   name: pr-review-team
-  version: 2.8.1
+  version: 2.9.0
   description: Multi-lens PR review (correctness / security / design …) with refute-verify, deterministic reconcile, and an optional human hand-off.
   tags: [review, github, code-quality, agents]
   homepage: https://github.com/NodeSpy/conductor-packs
   license: Apache-2.0
   requires:
-    # The daemon versions this pack supports. 0.33.0 is the floor for the
-    # reactive hand-off surface the handoff step uses: `watch:` as a
-    # steps-on-a-cadence mini-workflow (0.33.0) with handoff.bail / handoff.rerun
-    # / a `workflow:` step as actions, `idle_timeout:`, and handoff.done
-    # auto-granted to the hand-off agent. The rest of the pack's step surface is
-    # stable since 0.9.0.
-    conductor: ">=0.33.0"
+    # The daemon versions this pack supports. 0.54.0 is the floor for
+    # `decide:` steps (assess and verify): typed system_one/v1 decisions any
+    # runtime in the tier can answer. 0.33.0 brought the reactive hand-off
+    # surface the handoff step uses (`watch:`, handoff.bail / handoff.rerun,
+    # `idle_timeout:`, handoff.done auto-granted to the hand-off agent).
+    conductor: ">=0.54.0"
     # Bind-only environment the pack needs — you wire this; the pack never
     # ships it.
     # requires.connectors is the pack's CAPABILITY BOUNDARY as well as its
@@ -92,10 +91,11 @@ x-templates:
     checkout: none
     # Ride out a transient runtime blip (e.g. the paseo daemon restarting) rather
     # than failing the whole review: retry a failed step up to 6 times, 30s apart
-    # (~3 min). Applies to every agent step that inherits house — assess, the
-    # panelists, and the interactive handoff (whose worktree clone is the step
-    # most exposed to a daemon-not-running error). Retries on any error; a genuine
-    # failure just surfaces after the bounded attempts.
+    # (~3 min). Applies to every agent step that inherits house — the panelists
+    # and the interactive handoff (whose worktree clone is the step most exposed
+    # to a daemon-not-running error); the decide steps (assess, verify) set the
+    # same policy themselves. Retries on any error; a genuine failure just
+    # surfaces after the bounded attempts.
     retry: { max: 6, backoff: 30s }
     guidance: "Review only what the diff changes. Be concrete and cite file:line. Silence beats a not-worth-it comment."
 
@@ -103,13 +103,6 @@ x-templates:
   panelist: &panelist
     <<: *house
     model: heavy
-    mode: auto
-    workspace: worktree
-
-  # Triage and refute-verify: cheaper, and they only ever judge.
-  triage: &triage
-    <<: *house
-    model: light
     mode: auto
     workspace: worktree
 
@@ -299,55 +292,65 @@ workflows:
           }
           return { value: out };
 
+      # Refute-verify, as a decide: step — one yes/no question per finding,
+      # answered with a probability. Which model answers is the light tier's
+      # business: an agent runtime answers through conductor's system_one/v1
+      # adapter in one restricted session; a decision runtime the consumer
+      # added to the tier (e.g. `light: ["jev-*", …]`) answers natively.
+      # reconcile applies the pack's policy — refute only at >= 0.8 — so the
+      # threshold lives here, in the pack, not in any model.
+      #
+      # No default: on purpose. A runtime blip retries (the house policy) and
+      # then fails the review, as before, rather than quietly posting findings
+      # nothing verified.
       - id: verify
-        extends: *triage
         for_each: "{{.flatten.value}}"
         parallel: true
-        guidance: "You are refuting, not grading. Default hard to keep."
-        output_schema:
-          type: object
-          required: [id, verdict]
-          properties:
-            id: { type: string }
-            verdict: { type: string, enum: [keep, refuted] }
-            reason: { type: string }
-        prompt: |
-          You are the verification half of a code review of {{.inputs.repo}} #{{.inputs.pr}}.
-          A first pass produced the FINDING below. Your ONLY job is to catch it if it is
-          positively WRONG — a claim that would embarrass the reviewer if posted. You are
-          NOT grading how provable it is.
+        model: light
+        retry: { max: 6, backoff: 30s }
+        decide:
+          state: |
+            A first pass of a code review of {{.inputs.repo}} #{{.inputs.pr}} produced the
+            FINDING below.
 
-          Default hard to "keep". A finding does NOT need to be provable from the diff:
-          most real issues depend on base-branch code, runtime behavior, or repo
-          conventions the diff can't show. Use the DIFF and PR DESCRIPTION as evidence.
+            FINDING (lens {{.item.lens}}, at {{.item.path}}:{{.item.line}}, blocking={{.item.blocking}}):
+            {{.item.body}}
 
-          Answer "refuted" ONLY when the evidence positively contradicts the finding —
-          e.g. it calls something "missing" that the diff doesn't actually remove; it
-          rests on a factual claim the diff/description plainly shows false; or it
-          describes behavior the code clearly doesn't have. If merely unsure, answer
-          "keep". Never refute a plausible, material finding just because it isn't
-          provable here.
+            PR DESCRIPTION:
+            {{.meta.body}}
 
-          Echo the finding's id in your output.
-
-          FINDING (id {{.item.id}}, lens {{.item.lens}}, at {{.item.path}}:{{.item.line}}, blocking={{.item.blocking}}):
-          {{.item.body}}
-
-          PR DESCRIPTION:
-          {{.meta.body}}
-
-          DIFF:
-          {{.diffcap.value}}
-
-          Output JSON: {"id":"{{.item.id}}","verdict":"keep"|"refuted","reason":"one sentence"}
+            DIFF:
+            {{.diffcap.value}}
+          questions:
+            refuted:
+              type: noul
+              instructions: >-
+                You are refuting, not grading. Is this finding POSITIVELY WRONG — a
+                claim that would embarrass the reviewer if posted? A finding does NOT
+                need to be provable from the diff: most real issues depend on
+                base-branch code, runtime behavior, or repo conventions the diff can't
+                show. Answer yes ONLY when the diff or PR description positively
+                contradicts the finding — it calls something "missing" that the diff
+                doesn't actually remove; it rests on a factual claim the
+                diff/description plainly shows false; or it describes behavior the code
+                clearly doesn't have. A plausible, material finding that merely isn't
+                provable here is NOT refuted.
+              criteria:
+                true: The diff or PR description positively contradicts the finding.
+                false: The finding is plausible, or merely unprovable from the diff.
 
       - id: reconcile
         run: js
         code: |
           const findings = (ctx.flatten && ctx.flatten.value) || [];
+          // verify runs once per finding, in flatten order. The pack's policy:
+          // refute only when P(refuted) >= 0.8 — default hard to keep.
+          const REFUTE_AT = 0.8;
           const verdict = {};
-          for (const v of ((ctx.verify && ctx.verify.items) || [])) {
-            if (v && v.id) verdict[v.id] = v.verdict;
+          const answers = (ctx.verify && ctx.verify.items) || [];
+          for (let i = 0; i < findings.length; i++) {
+            const a = answers[i] && answers[i].refuted;
+            verdict[findings[i].id] = a && a.noul >= REFUTE_AT ? "refuted" : "keep";
           }
           const existing = {};
           for (const e of ((ctx.existing && ctx.existing.comments) || [])) {
@@ -390,7 +393,7 @@ workflows:
       pr: { type: integer, required: true }
       title: { type: string, default: "" }
     outputs:
-      decision: "{{.assess.decision}}"          # auto | manual
+      decision: "{{.assessed.decision}}"        # auto | manual
       event: "{{.review.event}}"                # the review team's verdict
       review: "{{.review.review}}"              # the drafted ReviewRecord JSON
     steps:
@@ -412,78 +415,82 @@ workflows:
             " bytes for length — judge the visible portion]" };
 
       # 1. Triage: may an automated review post itself ("auto"), or does this
-      #    genuinely need a human ("manual")?
+      #    genuinely need a human ("manual")? A decide: step — four typed
+      #    questions in one call — so any runtime in the light tier can answer
+      #    it, a decision runtime included. `assessed` turns the answers into
+      #    the auto/manual decision and the reason the hand-off shows.
       - id: assess
-        extends: *triage
-        guidance: "You are triaging, not reviewing. The panel does the reviewing."
-        prompt: |
-          Triage the code-review request on {{.inputs.repo}}#{{.inputs.pr}} ("{{.inputs.title}}").
-          The diff is below — read it and the description, then decide whether an
-          automated review may post itself ("auto") or this genuinely needs my own
-          interactive review ("manual").
+        model: light
+        retry: { max: 6, backoff: 30s }
+        decide:
+          state: |
+            Code-review request on {{.inputs.repo}}#{{.inputs.pr}} ("{{.inputs.title}}").
 
-          First judge the PR's quality — this is your confidence signal for going
-          "auto". Set each of these:
-          - tests_sufficient: does the change carry adequate tests for the behavior
-            it changes? Value REAL-WORLD validation most: integration/end-to-end
-            coverage, tests run against realistic or production-like inputs/data,
-            and demonstrated results (sample runs, actual outputs, before/after
-            evidence in the diff or PR description) are the strongest signal and
-            should push toward "auto". But unit tests alone are perfectly sufficient
-            when that's the right level for the change — plenty of things aren't
-            meaningfully real-world testable, and only-unit-tests is NOT itself a
-            reason to fail this. Mark false only when the change clearly warranted
-            real-world/integration validation (or more testing than it got) and
-            didn't get it, or when tests are missing for behavior that needs them. A
-            change that legitimately needs no tests (pure docs, comments, trivial
-            config) counts as sufficient (true).
-          - docs_sufficient: is the documentation/description adequate for what
-            changed? Most changes need no doc updates — that counts as sufficient
-            (true). Only mark false when a change clearly should have documented
-            something and didn't.
-          - glaring_holes: can you see a glaring hole in the logic or the test
-            coverage — an obvious bug, an unhandled case that matters, or a
-            meaningful untested path? Nitpicks and style are NOT glaring holes;
-            the automated reviewer catches those in its review.
+            UNIFIED DIFF:
+            {{.diffcap.value}}
+          questions:
+            decision:
+              type: choice
+              instructions: >-
+                May an automated review post itself ("auto"), or does this change
+                genuinely need a human's interactive review ("manual")? DEFAULT TO
+                "auto", and lean on it harder when quality clears the bar: a change
+                that is adequately tested and documented with no glaring holes is
+                "auto" even at the higher end of medium risk — features, refactors,
+                bugfixes, tests, docs, UI, routine schema/config. "auto" does NOT mean
+                "no scrutiny": the review team still reviews it; it only means no human
+                is needed to gate posting the review. A large diff or unclear
+                description alone is NOT a reason for "manual". When unsure, "auto".
+              criteria:
+                auto: The review may post itself.
+                manual: >-
+                  EITHER the change is genuinely high-stakes and needs human judgment —
+                  it clearly alters security/authentication/authorization/secrets or
+                  permission/ACL boundaries; touches payments, billing, or money
+                  movement; is a destructive or irreversible data change (drops/renames
+                  columns or tables; risky backfills/migrations with data-loss risk); or
+                  changes production infra that could cause an outage or breach (IAM,
+                  networking/firewall, deploy/CD to prod) — OR it fails the quality bar
+                  in a way a human should weigh in on: a glaring logic or test-coverage
+                  hole, or clearly missing tests on something consequential.
+            tests_sufficient:
+              type: noul
+              instructions: >-
+                Does the change carry adequate tests for the behavior it changes? Value
+                real-world validation most — integration/end-to-end coverage, tests on
+                realistic inputs, demonstrated results in the diff or description — but
+                unit tests alone are sufficient when that is the right level for the
+                change, and a change that legitimately needs no tests (pure docs,
+                comments, trivial config) counts as sufficient. No only when the change
+                clearly warranted more validation than it got, or tests are missing for
+                behavior that needs them.
+            docs_sufficient:
+              type: noul
+              instructions: >-
+                Is the documentation/description adequate for what changed? Most changes
+                need no doc updates — that counts as sufficient. No only when the change
+                clearly should have documented something and didn't.
+            glaring_holes:
+              type: noul
+              instructions: >-
+                Is there a glaring hole in the logic or the test coverage — an obvious
+                bug, an unhandled case that matters, or a meaningful untested path?
+                Nitpicks and style are NOT glaring holes; the review team catches those.
 
-          DEFAULT TO "auto", and lean on it harder when quality clears the bar: a
-          change that is adequately tested and documented with no glaring holes
-          should be "auto" even at the higher end of medium risk — features,
-          refactors, bugfixes, tests, docs, UI, routine schema/config. "auto" does
-          NOT mean "no scrutiny": the review team still reviews it and flags
-          concerns; it only means no human is needed to gate posting the review.
-
-          Answer "manual" only when EITHER:
-          (a) the change is genuinely high-stakes and needs human judgment — it
-              clearly alters security/authentication/authorization/secrets or
-              permission/ACL boundaries; touches payments, billing, or money
-              movement; is a destructive or irreversible data change (drops/renames
-              columns or tables; risky backfills/migrations with data-loss risk);
-              or changes production infra that could cause an outage or breach (IAM,
-              networking/firewall, deploy/CD to prod); OR
-          (b) it fails the quality bar in a way I'd want to weigh in on — a glaring
-              logic or test-coverage hole, or clearly missing tests on something
-              consequential.
-
-          A large diff or unclear description alone is NOT a reason for "manual".
-          When unsure, choose "auto".
-
-          Return the structured output: decision, the three quality signals
-          (tests_sufficient, docs_sufficient, glaring_holes), and a one-sentence
-          reason that references what you found on tests/docs/holes.
-
-          UNIFIED DIFF:
-          {{.diffcap.value}}
-        output_schema:
-          type: object
-          additionalProperties: false
-          required: [decision, tests_sufficient, docs_sufficient, glaring_holes, reason]
-          properties:
-            decision: { type: string, enum: [auto, manual] }
-            tests_sufficient: { type: boolean }
-            docs_sufficient: { type: boolean }
-            glaring_holes: { type: boolean }
-            reason: { type: string }
+      # The auto/manual decision and a reason for the hand-off, from the
+      # typed answers (a decision carries no free text).
+      - id: assessed
+        run: js
+        code: |
+          const a = ctx.assess || {};
+          const decision = (a.decision && a.decision.choice) || "auto";
+          if (decision === "auto") return { decision: decision, reason: "" };
+          const why = [];
+          if (a.tests_sufficient && a.tests_sufficient.noul < 0.5) why.push("tests look insufficient for the behavior changed");
+          if (a.docs_sufficient && a.docs_sufficient.noul < 0.5) why.push("docs look out of date for what changed");
+          if (a.glaring_holes && a.glaring_holes.noul >= 0.5) why.push("there may be a glaring logic or coverage hole");
+          if (why.length === 0) why.push("the change looks high-stakes (security, money, destructive data, or production infra)");
+          return { decision: decision, reason: why.join("; ") + "." };
 
       # 2. Always run the review team — both branches need the drafted review.
       - id: review
@@ -499,7 +506,7 @@ workflows:
       - id: gate
         run: js
         code: |
-          const auto = ctx.assess && ctx.assess.decision === "auto";
+          const auto = ctx.assessed && ctx.assessed.decision === "auto";
           const comments = (ctx.review && ctx.review.comments) || [];
           const empty = comments.length === 0;
           return { post: auto || empty, handoff: !auto && !empty };
@@ -562,7 +569,7 @@ workflows:
         idle_timeout: 24h
         prompt: |
           Review request on {{.inputs.repo}}#{{.inputs.pr}} ("{{.inputs.title}}") was flagged
-          for a human's manual review: {{.assess.reason}}
+          for a human's manual review: {{.assessed.reason}}
 
           A full multi-lens review has ALREADY been drafted for you — do NOT re-review
           from scratch. Here is the drafted ReviewRecord (JSON: event, body, comments):
