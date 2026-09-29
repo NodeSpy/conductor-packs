@@ -35,16 +35,17 @@
 
 pack:
   name: pr-autopilot
-  version: 1.0.0
+  version: 1.1.0
   description: Autopilot for routine PR events — fix red CI, resolve conflicts, address requested changes, answer comments. One agent per event, scoped to your repos.
   tags: [github, ci, automation, agents, maintenance]
   homepage: https://github.com/NodeSpy/conductor-packs
   license: Apache-2.0
   requires:
-    # A conservative floor: promptless agent steps (the event is handed to the
-    # agent), flaky_rerun, gh.rerequest_review, and these triggers are all stable
-    # well before 0.19.0, a safe tested baseline.
-    conductor: ">=0.19.0"
+    # 0.57.0: gh.rerequest_review's only_outstanding guard (never re-requests a
+    # reviewer who has since approved), and the sweep no longer fires
+    # changes_requested for threads left open by an approver. Older conductors
+    # re-request unconditionally.
+    conductor: ">=0.57.0"
     connectors: [github]
 
 # The worker model as a fleet — conductor resolves it against your runtime's
@@ -92,9 +93,12 @@ triggers:
         <<: *fixer
         guidance: "A reviewer requested changes. Address the feedback concretely and push; don't argue in code. If something can't be done, that's a reason to leave a brief reply, not to guess."
       - id: rerequest
-        # Ping the reviewer back once the changes are pushed.
+        # Ping the reviewer back once the changes are pushed. only_outstanding
+        # (the default, spelled out) pings them only while their latest review
+        # still requests changes on an older commit — not if they've approved
+        # since, nothing new landed, or the PR closed.
         uses: github.rerequest_review
-        options: { repo: "{{.repo}}", pr: "{{.pr}}", reviewers: ["{{.author}}"] }
+        options: { repo: "{{.repo}}", pr: "{{.pr}}", reviewers: ["{{.author}}"], only_outstanding: true }
 
   - name: on_new_comment
     on: github.new_comment
