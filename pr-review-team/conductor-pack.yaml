@@ -10,8 +10,8 @@
 # re-reviews from scratch when new commits are pushed, and an idle_timeout
 # reclaims a hand-off nobody closed — so stale drafts and lingering workspaces
 # don't pile up. Needs conductor >= 0.57.0 (the release that added the agent
-# workspace jail, `github.pr_files` patches, and `isolation.writes` — see
-# `requires:` below for what that buys the pack).
+# workspace jail and `github.pr_files` patches — see `requires:` below for
+# what that buys the pack).
 #
 # Define-behavior / bind-environment: this pack ships only BEHAVIOR (workflows
 # and a disarmed trigger). It carries NO connectors and NO secrets — you bind
@@ -43,8 +43,7 @@ pack:
     # The daemon versions this pack supports. 0.57.0 is the floor for
     # whole-PR review (#154 §6): the lens reviewers run in a real `checkout:
     # checkout-pr` workspace jail instead of reading an inlined, capped diff,
-    # `github.pr_files` returns each changed file's `patch`, and
-    # `isolation.writes: read_only` is a recognized step-level narrowing.
+    # and `github.pr_files` returns each changed file's `patch`.
     # (0.57.0 is a superset of the older floors this pack also relies on:
     # 0.54.0 for `decide:` steps (assess and verify) and 0.33.0 for the
     # reactive hand-off surface the handoff step uses — `watch:`,
@@ -212,14 +211,13 @@ workflows:
       # same mechanism the handoff step below already uses) instead of an
       # inlined, 60 KB-capped diff. A cli/acp launch with no isolation block
       # runs inside the default workspace jail; this step also carries
-      # `output_schema`, which already makes it read-only by default (no git
-      # push, no gh writes) — `isolation.writes: read_only` below just says
-      # so explicitly, and can only narrow what the step could already do.
-      # `gh` reads and local `git` work happen inside the jail.
+      # `output_schema`, which makes it a review step: its `gh` and `git` are
+      # read-only (no push, no gh writes — the binaries' own profiles), and
+      # it is granted no write verbs. `gh` reads and local `git` work happen
+      # inside the jail.
       - id: review
         extends: *panelist
         checkout: checkout-pr
-        isolation: { writes: read_only }
         for_each: "{{.inputs.lenses}}"
         parallel: true
         guidance: "You are one lens of a panel. Stay inside your lens; another reviewer owns the rest."
