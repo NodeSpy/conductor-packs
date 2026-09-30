@@ -33,10 +33,9 @@ access to the PR, sized to what each step actually needs:
   counts, from `github.pr_files` with `all: true` — no 300-file diff cap, no
   60 KB text cap) and tells the reviewer the full change is `git diff
   origin/<base>...HEAD` in its own checkout, and that it may read any file
-  for context. The step still carries `output_schema` (so it was already
-  read-only by default: no git push, no gh writes) and now also sets
-  `isolation: { writes: read_only }` explicitly — that only narrows what was
-  already true, it does not change behavior.
+  for context. The step carries `output_schema`, which makes it a review
+  step: in the jail its `gh` and `git` are read-only (no push, no gh writes),
+  and it is granted no write verbs.
 - **`verify` judges each finding against bounded, per-finding context**
   instead of the whole PR's diff: the flagged file's own patch (looked up
   from `github.pr_files`) and a window of that file **at the PR head**,
@@ -55,8 +54,7 @@ access to the PR, sized to what each step actually needs:
   anymore. A caller that wants the raw diff should call `github.pr_diff`
   itself.
 - Bumped `requires.conductor` to `>=0.57.0`, the release that shipped the
-  agent workspace jail (#154), `github.pr_files[].patch`, and
-  `isolation.writes`.
+  agent workspace jail (#154) and `github.pr_files[].patch`.
 
 One tradeoff worth knowing: each lens reviewer now provisions its own PR
 worktree, so a review with the default six lenses does six parallel
@@ -95,7 +93,7 @@ credentials, so the pack can't ship it.
 ## What it needs (`requires:`)
 
 - **`conductor: >=0.57.0`** — the release with the agent workspace jail
-  (#154), `github.pr_files[].patch`, and `isolation.writes`, which the lens
+  (#154) and `github.pr_files[].patch`, which the lens
   reviewers, `verify`, and `assess` all rely on (see "2.10.0 — whole-PR
   reviews" above). It supersedes the older floors this pack also needs:
   0.54.0 for `decide:` steps (`assess` and `verify`), and 0.33.0 for the
