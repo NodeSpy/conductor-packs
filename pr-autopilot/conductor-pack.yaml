@@ -32,10 +32,24 @@
 #           # Quote the logins — the trailing [bot] is a YAML flow-sequence trap:
 #           filter: { not_comment_author: ["github-actions[bot]", "dependabot[bot]"] }
 #   Then: `conductor init` (vendor + lock), `conductor pack plan`, `conductor validate`.
+#
+# Progress on the PR: with conductor >= 0.60.0 every one of these runs shows on
+# the PR as you, without anything here asking for it. 👀 goes on the review or
+# comment it took, at dispatch, then 🚀 pushed / 👍 no push / 😕 gave up. A
+# pending → success/failure commit status goes on the PR head under your login.
+# That's the github connector's default for these your-PR events; this pack
+# carries no progress steps. To drop one face for one trigger, add to its arm
+# (needs conductor >= 0.60.0):
+#       on_failing_checks:
+#         enabled: true
+#         repos: [your-org/app]
+#         options: { progress: { status: false } }   # or reactions: false
+#   …or connector-wide: `progress: { reactions: false, status: false }` on
+#   your github connector.
 
 pack:
   name: pr-autopilot
-  version: 1.1.0
+  version: 1.1.1
   description: Autopilot for routine PR events — fix red CI, resolve conflicts, address requested changes, answer comments. One agent per event, scoped to your repos.
   tags: [github, ci, automation, agents, maintenance]
   homepage: https://github.com/NodeSpy/conductor-packs
