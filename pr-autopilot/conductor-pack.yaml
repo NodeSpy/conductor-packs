@@ -33,23 +33,31 @@
 #           filter: { not_comment_author: ["github-actions[bot]", "dependabot[bot]"] }
 #   Then: `conductor init` (vendor + lock), `conductor pack plan`, `conductor validate`.
 #
-# Progress on the PR: with conductor >= 0.60.0 every one of these runs shows on
-# the PR as you, without anything here asking for it. 👀 goes on the review or
-# comment it took, at dispatch, then 🚀 pushed / 👍 no push / 😕 gave up. A
-# pending → success/failure commit status goes on the PR head under your login.
-# That's the github connector's default for these your-PR events; this pack
-# carries no progress steps. To drop one face for one trigger, add to its arm
-# (needs conductor >= 0.60.0):
-#       on_failing_checks:
-#         enabled: true
-#         repos: [your-org/app]
-#         options: { progress: { status: false } }   # or reactions: false
-#   …or connector-wide: `progress: { reactions: false, status: false }` on
-#   your github connector.
+# Progress on the PR. Every flow here carries plain `hooks:` that show, as you,
+# that the event was taken and how it went. There is nothing hidden: the hooks
+# are below, and every word of them is a setting you can change.
+#   - reactions on the review/comment being handled (changes_requested,
+#     new_comment): 👀 at start, then 🚀 (it pushed) / 👍 (it didn't) at done,
+#     or 😕 at fail;
+#   - a commit status, one context per flow ("<you> / review", "<you> /
+#     comment", "<you> / ci-fix", "<you> / conflict"): `pending` at start, on
+#     the commit the run starts on. At done that SAME commit turns `success`.
+#     So when the run pushed, the PR's new head carries no row of this
+#     context, and the row simply disappears from the PR (GitHub has no way to
+#     delete a status; this is how it goes away). When it didn't push, a green
+#     ✓ stays on the unchanged head. At fail, the PR's current head turns
+#     `failure` with "gave up: <why>".
+# Rename, reword, or switch off per flow in your instance block:
+#       settings:
+#         ci_context:   "{{.me.login}} / autofix"   # rename a row
+#         ci_status:    false                       # no status for failing-checks runs
+#         reactions:    false                       # no reactions at all
+#         status_failed: "autopilot gave up: {{.run.reason}}"
+# The same hooks work on any trigger of your own; see the README.
 
 pack:
   name: pr-autopilot
-  version: 1.1.1
+  version: 1.2.0
   description: Autopilot for routine PR events — fix red CI, resolve conflicts, address requested changes, answer comments. One agent per event, scoped to your repos.
   tags: [github, ci, automation, agents, maintenance]
   homepage: https://github.com/NodeSpy/conductor-packs
@@ -59,7 +67,13 @@ pack:
     # reviewer who has since approved), and the sweep no longer fires
     # changes_requested for threads left open by an approver. Older conductors
     # re-request unconditionally.
-    conductor: ">=0.57.0"
+    #
+    # 0.60.0: the progress hooks below — {{.run.*}} run facts in workflow
+    # hooks, fail hooks on every failure path (incl. a dispatch that never
+    # came up and an engine park), github.react / github.set_status (pr:),
+    # {{.me.login}}, and `if: true` reading as true. Older conductors refuse
+    # the hooks at load, so a box on an older release keeps v1.1.x.
+    conductor: ">=0.60.0"
     connectors: [github]
 
 # The worker model as a fleet — conductor resolves it against your runtime's
@@ -68,6 +82,25 @@ pack:
 models:
   heavy:
     any: ["claude-opus-*", "gpt-5-pro", "gpt-5.*", "o3*", "gemini-*-pro"]
+
+# Every word a progress hook posts — overridable per instance (`settings:`).
+# Contexts and descriptions are templates rendered per run.
+settings:
+  reactions:        { type: boolean, default: true, desc: "react on the review/comment being handled: 👀 at start, then 🚀/👍 or 😕" }
+  review_status:    { type: boolean, default: true, desc: "post a status for changes_requested runs" }
+  review_context:   { type: string, default: "{{.me.login}} / review", desc: "the status context (row name) for changes_requested runs" }
+  review_working:   { type: string, default: "{{if .review_id}}addressing {{.author}}'s review{{else}}addressing unresolved review threads{{end}}", desc: "pending description, changes_requested" }
+  comment_status:   { type: boolean, default: true, desc: "post a status for new_comment runs" }
+  comment_context:  { type: string, default: "{{.me.login}} / comment", desc: "the status context for new_comment runs" }
+  comment_working:  { type: string, default: "replying to {{.author}}'s {{if .review_id}}review{{else}}comment{{end}}", desc: "pending description, new_comment" }
+  ci_status:        { type: boolean, default: true, desc: "post a status for failing_checks runs" }
+  ci_context:       { type: string, default: "{{.me.login}} / ci-fix", desc: "the status context for failing_checks runs" }
+  ci_working:       { type: string, default: "fixing failing check {{.failing_check}}", desc: "pending description, failing_checks" }
+  conflict_status:  { type: boolean, default: true, desc: "post a status for merge_conflict runs" }
+  conflict_context: { type: string, default: "{{.me.login}} / conflict", desc: "the status context for merge_conflict runs" }
+  conflict_working: { type: string, default: "resolving the merge conflict", desc: "pending description, merge_conflict" }
+  status_done:      { type: string, default: "{{if .run.pushed}}pushed {{.run.head_short}}{{else}}done — no changes pushed{{end}}", desc: "success description (on the commit the run started on)" }
+  status_failed:    { type: string, default: "gave up: {{.run.reason}}", desc: "failure description (on the PR's current head)" }
 
 x-templates:
   # One worker shape for every behavior: a strong model in its own worktree,
@@ -81,6 +114,25 @@ x-templates:
     wait_timeout: 30m
     archive_when_done: true
 
+  # Reactions on the review/comment the run handles — only for events that
+  # carry one (`reaction_subjects`). Hooks are best-effort: a reaction that
+  # fails to post is logged, never fails the run.
+  react_start: &react_start
+    at: start
+    if: "${settings.reactions} && reaction_subjects"
+    uses: github.react
+    options: { repo: "{{.repo}}", pr: "{{.pr}}", subjects: "{{.reaction_subjects}}", content: eyes }
+  react_done: &react_done
+    at: done
+    if: "${settings.reactions} && reaction_subjects"
+    uses: github.react
+    options: { repo: "{{.repo}}", pr: "{{.pr}}", subjects: "{{.reaction_subjects}}", content: "{{if .run.pushed}}rocket{{else}}+1{{end}}" }
+  react_fail: &react_fail
+    at: fail
+    if: "${settings.reactions} && reaction_subjects"
+    uses: github.react
+    options: { repo: "{{.repo}}", pr: "{{.pr}}", subjects: "{{.reaction_subjects}}", content: confused }
+
 # Triggers ship DISARMED — no `enabled`, no repos. Arming (enabled + repos) in
 # the instance block is the consent; a github trigger is rejected at load if
 # armed without repos.
@@ -90,18 +142,57 @@ triggers:
     options:
       # Re-run once before engaging an agent — most red CI is a flake.
       flaky_rerun: { enabled: true, max: 1 }
+    hooks:
+      - { at: start, if: "${settings.ci_status}", uses: github.set_status,
+          options: { repo: "{{.repo}}", sha: "{{.run.start_sha}}", state: pending, context: "${settings.ci_context}", description: "${settings.ci_working}" } }
+      # Success goes on the commit the run STARTED on, never the new head: after
+      # a push the PR's head has no row of this context, so the row is gone.
+      - { at: done, if: "${settings.ci_status}", uses: github.set_status,
+          options: { repo: "{{.repo}}", sha: "{{.run.start_sha}}", state: success, context: "${settings.ci_context}", description: "${settings.status_done}" } }
+      - { at: fail, if: "${settings.ci_status}", uses: github.set_status,
+          options: { repo: "{{.repo}}", pr: "{{.pr}}", state: failure, context: "${settings.ci_context}", description: "${settings.status_failed}" } }
+      # Pushed, then failed: the start commit's pending would be left behind.
+      - { at: fail, if: "${settings.ci_status} && run.pushed", uses: github.set_status,
+          options: { repo: "{{.repo}}", sha: "{{.run.start_sha}}", state: success, context: "${settings.ci_context}", description: "${settings.status_done}" } }
     steps:
       - <<: *fixer
         guidance: "CI is red on this PR. Find why and push a fix on the PR branch. Don't touch unrelated code; if it's genuinely a flake and a re-run cleared it, do nothing."
 
   - name: on_merge_conflict
     on: github.merge_conflict
+    hooks:
+      - { at: start, if: "${settings.conflict_status}", uses: github.set_status,
+          options: { repo: "{{.repo}}", sha: "{{.run.start_sha}}", state: pending, context: "${settings.conflict_context}", description: "${settings.conflict_working}" } }
+      # Success goes on the commit the run STARTED on, never the new head: after
+      # a push the PR's head has no row of this context, so the row is gone.
+      - { at: done, if: "${settings.conflict_status}", uses: github.set_status,
+          options: { repo: "{{.repo}}", sha: "{{.run.start_sha}}", state: success, context: "${settings.conflict_context}", description: "${settings.status_done}" } }
+      - { at: fail, if: "${settings.conflict_status}", uses: github.set_status,
+          options: { repo: "{{.repo}}", pr: "{{.pr}}", state: failure, context: "${settings.conflict_context}", description: "${settings.status_failed}" } }
+      # Pushed, then failed: the start commit's pending would be left behind.
+      - { at: fail, if: "${settings.conflict_status} && run.pushed", uses: github.set_status,
+          options: { repo: "{{.repo}}", sha: "{{.run.start_sha}}", state: success, context: "${settings.conflict_context}", description: "${settings.status_done}" } }
     steps:
       - <<: *fixer
         guidance: "This PR conflicts with its base branch. Resolve the conflicts faithfully (keep both sides' intent), then push."
 
   - name: on_changes_requested
     on: github.changes_requested
+    hooks:
+      - { at: start, if: "${settings.review_status}", uses: github.set_status,
+          options: { repo: "{{.repo}}", sha: "{{.run.start_sha}}", state: pending, context: "${settings.review_context}", description: "${settings.review_working}" } }
+      # Success goes on the commit the run STARTED on, never the new head: after
+      # a push the PR's head has no row of this context, so the row is gone.
+      - { at: done, if: "${settings.review_status}", uses: github.set_status,
+          options: { repo: "{{.repo}}", sha: "{{.run.start_sha}}", state: success, context: "${settings.review_context}", description: "${settings.status_done}" } }
+      - { at: fail, if: "${settings.review_status}", uses: github.set_status,
+          options: { repo: "{{.repo}}", pr: "{{.pr}}", state: failure, context: "${settings.review_context}", description: "${settings.status_failed}" } }
+      # Pushed, then failed: the start commit's pending would be left behind.
+      - { at: fail, if: "${settings.review_status} && run.pushed", uses: github.set_status,
+          options: { repo: "{{.repo}}", sha: "{{.run.start_sha}}", state: success, context: "${settings.review_context}", description: "${settings.status_done}" } }
+      - *react_start
+      - *react_done
+      - *react_fail
     steps:
       - id: address
         <<: *fixer
@@ -116,6 +207,21 @@ triggers:
 
   - name: on_new_comment
     on: github.new_comment
+    hooks:
+      - { at: start, if: "${settings.comment_status}", uses: github.set_status,
+          options: { repo: "{{.repo}}", sha: "{{.run.start_sha}}", state: pending, context: "${settings.comment_context}", description: "${settings.comment_working}" } }
+      # Success goes on the commit the run STARTED on, never the new head: after
+      # a push the PR's head has no row of this context, so the row is gone.
+      - { at: done, if: "${settings.comment_status}", uses: github.set_status,
+          options: { repo: "{{.repo}}", sha: "{{.run.start_sha}}", state: success, context: "${settings.comment_context}", description: "${settings.status_done}" } }
+      - { at: fail, if: "${settings.comment_status}", uses: github.set_status,
+          options: { repo: "{{.repo}}", pr: "{{.pr}}", state: failure, context: "${settings.comment_context}", description: "${settings.status_failed}" } }
+      # Pushed, then failed: the start commit's pending would be left behind.
+      - { at: fail, if: "${settings.comment_status} && run.pushed", uses: github.set_status,
+          options: { repo: "{{.repo}}", sha: "{{.run.start_sha}}", state: success, context: "${settings.comment_context}", description: "${settings.status_done}" } }
+      - *react_start
+      - *react_done
+      - *react_fail
     steps:
       - <<: *fixer
         guidance: "Someone commented on this PR. If it asks for a change, make it and push; if it's a question, answer it briefly. (Arm this trigger with a not_comment_author filter so bot chatter never reaches here.)"

@@ -10,7 +10,7 @@ block.
 | Pack | What it does | Source |
 |------|--------------|--------|
 | [`pr-review-team`](pr-review-team/) | Multi-lens PR review (parallel lens reviewers → refute-verify → deterministic reconcile) with auto-post or a reactive human hand-off | `github.com/NodeSpy/conductor-packs//pr-review-team` |
-| [`pr-autopilot`](pr-autopilot/) | Autopilot for routine PR events — fix red CI, resolve conflicts, address requested changes, answer comments (one agent per event) | `github.com/NodeSpy/conductor-packs//pr-autopilot` |
+| [`pr-autopilot`](pr-autopilot/) | Autopilot for routine PR events — fix red CI, resolve conflicts, address requested changes, answer comments (one agent per event), with progress shown on the PR as you (reactions + a status row per flow, every word a setting) | `github.com/NodeSpy/conductor-packs//pr-autopilot` |
 | [`ci-unsticker`](ci-unsticker/) | Unstick hung CI — cancel the stalled run, wait for it to settle, then re-run. Pure verbs, no agent, no cost | `github.com/NodeSpy/conductor-packs//ci-unsticker` |
 | [`audiobookshelf-import`](audiobookshelf-import/) | Audible → Audiobookshelf pipeline, as a thin wrapper around the upstream [`sync.py`/`license-guard.py`](https://github.com/NodeSpy/audiobookshelf-import): conductor schedules a Libation discovery pass and a full import pass; the proven scripts do the dedup/verify/match/prune. Runs natively; needs a `cron` connector, a scripts checkout, and a native LibationCli | `github.com/NodeSpy/conductor-packs//audiobookshelf-import` |
 
