@@ -46,7 +46,9 @@
 #     context, and the row simply disappears from the PR (GitHub has no way to
 #     delete a status; this is how it goes away). When it didn't push, a green
 #     ✓ stays on the unchanged head. At fail, the PR's current head turns
-#     `failure` with "gave up: <why>".
+#     `failure` with "gave up: <why>". At stop (the PR merged or closed under
+#     the run) the start commit turns `success` ("stopped — the PR merged")
+#     and the 👀 comes back off, so nothing is left behind on a closed PR.
 # Rename, reword, or switch off per flow in your instance block:
 #       settings:
 #         ci_context:   "{{.me.login}} / autofix"   # rename a row
@@ -57,7 +59,7 @@
 
 pack:
   name: pr-autopilot
-  version: 1.2.0
+  version: 1.3.0
   description: Autopilot for routine PR events — fix red CI, resolve conflicts, address requested changes, answer comments. One agent per event, scoped to your repos.
   tags: [github, ci, automation, agents, maintenance]
   homepage: https://github.com/NodeSpy/conductor-packs
@@ -70,7 +72,8 @@ pack:
     #
     # 0.60.0: the progress hooks below — {{.run.*}} run facts in workflow
     # hooks, fail hooks on every failure path (incl. a dispatch that never
-    # came up and an engine park), github.react / github.set_status (pr:),
+    # came up and an engine park), `at: stop` hooks (the PR closed mid-run),
+    # github.react (incl. remove: true) / github.set_status (pr:),
     # {{.me.login}}, and `if: true` reading as true. Older conductors refuse
     # the hooks at load, so a box on an older release keeps v1.1.x.
     conductor: ">=0.60.0"
@@ -101,6 +104,8 @@ settings:
   conflict_working: { type: string, default: "resolving the merge conflict", desc: "pending description, merge_conflict" }
   status_done:      { type: string, default: "{{if .run.pushed}}pushed {{.run.head_short}}{{else}}done — no changes pushed{{end}}", desc: "success description (on the commit the run started on)" }
   status_failed:    { type: string, default: "gave up: {{.run.reason}}", desc: "failure description (on the PR's current head)" }
+  status_stopped:   { type: string, default: "stopped — {{.run.reason}}", desc: "success description when the PR merged/closed under the run (on the commit the run started on)" }
+  stop_unreact:     { type: boolean, default: true, desc: "when the PR merged/closed under the run, take the 👀 back off the review/comment" }
 
 x-templates:
   # One worker shape for every behavior: a strong model in its own worktree,
@@ -132,6 +137,12 @@ x-templates:
     if: "${settings.reactions} && reaction_subjects"
     uses: github.react
     options: { repo: "{{.repo}}", pr: "{{.pr}}", subjects: "{{.reaction_subjects}}", content: confused }
+  # The PR merged/closed under the run: nothing to answer, so take the 👀 back.
+  react_stop: &react_stop
+    at: stop
+    if: "${settings.reactions} && ${settings.stop_unreact} && reaction_subjects"
+    uses: github.react
+    options: { repo: "{{.repo}}", pr: "{{.pr}}", subjects: "{{.reaction_subjects}}", content: eyes, remove: true }
 
 # Triggers ship DISARMED — no `enabled`, no repos. Arming (enabled + repos) in
 # the instance block is the consent; a github trigger is rejected at load if
@@ -154,6 +165,10 @@ triggers:
       # Pushed, then failed: the start commit's pending would be left behind.
       - { at: fail, if: "${settings.ci_status} && run.pushed", uses: github.set_status,
           options: { repo: "{{.repo}}", sha: "{{.run.start_sha}}", state: success, context: "${settings.ci_context}", description: "${settings.status_done}" } }
+      # The PR merged/closed under the run: resolve the pending so nothing is
+      # left spinning on the closed PR.
+      - { at: stop, if: "${settings.ci_status}", uses: github.set_status,
+          options: { repo: "{{.repo}}", sha: "{{.run.start_sha}}", state: success, context: "${settings.ci_context}", description: "${settings.status_stopped}" } }
     steps:
       - <<: *fixer
         guidance: "CI is red on this PR. Find why and push a fix on the PR branch. Don't touch unrelated code; if it's genuinely a flake and a re-run cleared it, do nothing."
@@ -172,6 +187,10 @@ triggers:
       # Pushed, then failed: the start commit's pending would be left behind.
       - { at: fail, if: "${settings.conflict_status} && run.pushed", uses: github.set_status,
           options: { repo: "{{.repo}}", sha: "{{.run.start_sha}}", state: success, context: "${settings.conflict_context}", description: "${settings.status_done}" } }
+      # The PR merged/closed under the run: resolve the pending so nothing is
+      # left spinning on the closed PR.
+      - { at: stop, if: "${settings.conflict_status}", uses: github.set_status,
+          options: { repo: "{{.repo}}", sha: "{{.run.start_sha}}", state: success, context: "${settings.conflict_context}", description: "${settings.status_stopped}" } }
     steps:
       - <<: *fixer
         guidance: "This PR conflicts with its base branch. Resolve the conflicts faithfully (keep both sides' intent), then push."
@@ -190,9 +209,14 @@ triggers:
       # Pushed, then failed: the start commit's pending would be left behind.
       - { at: fail, if: "${settings.review_status} && run.pushed", uses: github.set_status,
           options: { repo: "{{.repo}}", sha: "{{.run.start_sha}}", state: success, context: "${settings.review_context}", description: "${settings.status_done}" } }
+      # The PR merged/closed under the run: resolve the pending so nothing is
+      # left spinning on the closed PR.
+      - { at: stop, if: "${settings.review_status}", uses: github.set_status,
+          options: { repo: "{{.repo}}", sha: "{{.run.start_sha}}", state: success, context: "${settings.review_context}", description: "${settings.status_stopped}" } }
       - *react_start
       - *react_done
       - *react_fail
+      - *react_stop
     steps:
       - id: address
         <<: *fixer
@@ -219,9 +243,14 @@ triggers:
       # Pushed, then failed: the start commit's pending would be left behind.
       - { at: fail, if: "${settings.comment_status} && run.pushed", uses: github.set_status,
           options: { repo: "{{.repo}}", sha: "{{.run.start_sha}}", state: success, context: "${settings.comment_context}", description: "${settings.status_done}" } }
+      # The PR merged/closed under the run: resolve the pending so nothing is
+      # left spinning on the closed PR.
+      - { at: stop, if: "${settings.comment_status}", uses: github.set_status,
+          options: { repo: "{{.repo}}", sha: "{{.run.start_sha}}", state: success, context: "${settings.comment_context}", description: "${settings.status_stopped}" } }
       - *react_start
       - *react_done
       - *react_fail
+      - *react_stop
     steps:
       - <<: *fixer
         guidance: "Someone commented on this PR. If it asks for a change, make it and push; if it's a question, answer it briefly. (Arm this trigger with a not_comment_author filter so bot chatter never reaches here.)"
