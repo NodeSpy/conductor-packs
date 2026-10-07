@@ -9,7 +9,9 @@
 # if the reason went away (merged/closed upstream, or approved elsewhere),
 # re-reviews from scratch when new commits are pushed, and an idle_timeout
 # reclaims a hand-off nobody closed — so stale drafts and lingering workspaces
-# don't pile up. Needs conductor >= 0.33.0.
+# don't pile up. Needs conductor >= 0.57.0 (the release that added the agent
+# workspace jail and `github.pr_files` patches — see `requires:` below for
+# what that buys the pack).
 #
 # Define-behavior / bind-environment: this pack ships only BEHAVIOR (workflows
 # and a disarmed trigger). It carries NO connectors and NO secrets — you bind
@@ -20,7 +22,7 @@
 #   packs:
 #     review:
 #       source: github.com/NodeSpy/conductor-packs//pr-review-team   # or a local path
-#       version: "~> 2.8"
+#       version: "~> 2.10"
 #       # No preset/connectors needed: the sole github connector auto-binds, and the
 #       # heavy/light fleets resolve against whatever your runtime offers. Pin a tier
 #       # only if you want to: models: { heavy: ["claude-opus-*"], light: ["claude-sonnet-*"] }
@@ -32,18 +34,22 @@
 
 pack:
   name: pr-review-team
-  version: 2.9.0
+  version: 2.10.0
   description: Multi-lens PR review (correctness / security / design …) with refute-verify, deterministic reconcile, and an optional human hand-off.
   tags: [review, github, code-quality, agents]
   homepage: https://github.com/NodeSpy/conductor-packs
   license: Apache-2.0
   requires:
-    # The daemon versions this pack supports. 0.54.0 is the floor for
-    # `decide:` steps (assess and verify): typed system_one/v1 decisions any
-    # runtime in the tier can answer. 0.33.0 brought the reactive hand-off
-    # surface the handoff step uses (`watch:`, handoff.bail / handoff.rerun,
-    # `idle_timeout:`, handoff.done auto-granted to the hand-off agent).
-    conductor: ">=0.54.0"
+    # The daemon versions this pack supports. 0.57.0 is the floor for
+    # whole-PR review (#154 §6): the lens reviewers run in a real `checkout:
+    # checkout-pr` workspace jail instead of reading an inlined, capped diff,
+    # and `github.pr_files` returns each changed file's `patch`.
+    # (0.57.0 is a superset of the older floors this pack also relies on:
+    # 0.54.0 for `decide:` steps (assess and verify) and 0.33.0 for the
+    # reactive hand-off surface the handoff step uses — `watch:`,
+    # handoff.bail / handoff.rerun, `idle_timeout:`, handoff.done
+    # auto-granted to the hand-off agent.)
+    conductor: ">=0.57.0"
     # Bind-only environment the pack needs — you wire this; the pack never
     # ships it.
     # requires.connectors is the pack's CAPABILITY BOUNDARY as well as its
@@ -84,8 +90,9 @@ exports:
 #   <<: *base       plain YAML. Dumb override — a copy of the base.
 #   extends: *base  conductor's merge. Lists append, guidance STACKS.
 x-templates:
-  # Every agent in this pack reads a diff and writes a judgement; none of them
-  # edits the tree, so none needs a checkout.
+  # Every agent in this pack reads PR context and writes a judgement; none of
+  # them pushes anything, so none needs write access — the lens reviewers get
+  # a checkout (see `panelist` below) to READ the tree, not to change it.
   house: &house
     type: agent
     checkout: none
@@ -97,7 +104,7 @@ x-templates:
     # same policy themselves. Retries on any error; a genuine failure just
     # surfaces after the bounded attempts.
     retry: { max: 6, backoff: 30s }
-    guidance: "Review only what the diff changes. Be concrete and cite file:line. Silence beats a not-worth-it comment."
+    guidance: "Review only what the PR changes. Be concrete and cite file:line. Silence beats a not-worth-it comment."
 
   # The lens panel: the strongest pass, one instance per lens.
   panelist: &panelist
@@ -157,16 +164,24 @@ workflows:
       summary: "{{.reconcile.summary}}"         # the review body (one line)
       comments: "{{.reconcile.comments}}"       # [{path, line, body}] — list preserved by sole-field-ref
       review: "{{.reconcile.review}}"           # JSON {event, body, comments} — the ReviewRecord to show + post
-      diff: "{{.diffcap.value}}"                # the capped diff, so a caller can reuse it
+      # No `diff:` output anymore (2.10 removed it, a breaking change for any
+      # consumer that reused it): a reviewer's checkout carries the real,
+      # uncapped diff now, and nothing internal renders a capped copy of it —
+      # see the `files`/`review` steps below. A caller that wants the raw diff
+      # should call `github.pr_diff` itself.
     steps:
       # Upstream context via the github connector's read verbs (cache-aware,
       # rate-limit-aware, the connector's own credentials).
       - id: meta
         uses: github.pr_get
-        options: { repo: "{{.inputs.repo}}", pr: "{{.inputs.pr}}" }   # -> .meta.title / .meta.body
-      - id: diff
-        uses: github.pr_diff
-        options: { repo: "{{.inputs.repo}}", pr: "{{.inputs.pr}}" }   # -> .diff.diff (unified diff)
+        options: { repo: "{{.inputs.repo}}", pr: "{{.inputs.pr}}" }   # -> .meta.title / .meta.body / .meta.base / .meta.head_sha
+      # Every changed file, with its status and line counts — and, where
+      # GitHub computed one, its unified-diff patch. `all: true` paginates
+      # past the first 100 files: 2.10 dropped the old 300-file diff cap, so
+      # a PR of any size gets its complete file list here.
+      - id: files
+        uses: github.pr_files
+        options: { repo: "{{.inputs.repo}}", pr: "{{.inputs.pr}}", all: true }   # -> .files.files: [{path, status, additions, deletions, changes, patch}]
       # Repo-convention files (optional). continue_on_error makes a missing file
       # render empty rather than failing the workflow.
       - id: std_claude
@@ -187,26 +202,22 @@ workflows:
         uses: github.review_comments
         options: { repo: "{{.inputs.repo}}", pr: "{{.inputs.pr}}", all: true }
 
-      # paseo takes the prompt as ONE argv argument; the kernel caps a single arg
-      # at ~128KB (MAX_ARG_STRLEN). A large PR's full diff plus the repo-standards
-      # files overflows that and every reviewer dies with "argument list too long".
-      # Cap the diff so the prompt stays under the limit; note the cut so the lens
-      # reviews the visible portion honestly instead of guessing.
-      - id: diffcap
-        run: js
-        code: |
-          const MAX = 60000;
-          const d = (ctx.diff && ctx.diff.diff) || "";
-          if (d.length <= MAX) return { value: d };
-          return { value: d.slice(0, MAX) + "\n\n…[diff truncated at " + MAX +
-            " bytes for length — review the visible portion; name anything you'd " +
-            "want to verify in the omitted remainder rather than guessing]" };
-
       # The lens panel. `extends:` (not `<<:`) so this step's own guidance
       # stacks UNDER the house voice rather than replacing it — and so a
       # consumer's `review-team/review` override stacks under both.
+      #
+      # 2.10 (#154 §6): each lens reviewer now gets a REAL PR checkout
+      # (`checkout: checkout-pr` — conductor's own worktree provisioning,
+      # same mechanism the handoff step below already uses) instead of an
+      # inlined, 60 KB-capped diff. A cli/acp launch with no isolation block
+      # runs inside the default workspace jail; this step also carries
+      # `output_schema`, which makes it a review step: its `gh` and `git` are
+      # read-only (no push, no gh writes — the binaries' own profiles), and
+      # it is granted no write verbs. `gh` reads and local `git` work happen
+      # inside the jail.
       - id: review
         extends: *panelist
+        checkout: checkout-pr
         for_each: "{{.inputs.lenses}}"
         parallel: true
         guidance: "You are one lens of a panel. Stay inside your lens; another reviewer owns the rest."
@@ -251,8 +262,9 @@ workflows:
           bugs, logic errors, security holes, data-loss risk, real design flaws, or
           violations of REPO STANDARDS. Style, naming, readability, minor perf,
           optional refactors, and questions are blocking: false — no matter how many.
-          Before flagging something "missing", remember the diff only shows what
-          changed; a symbol absent from the diff may exist on the base branch.
+          Before flagging something "missing", remember a symbol absent from the
+          change may exist elsewhere in the tree — you have the full checkout, so
+          check rather than guess.
 
           VOICE: lead with the point; one thought per sentence; assume the author knows
           their system; propose a concrete fix; ~60 words per comment; don't quote the
@@ -272,9 +284,15 @@ workflows:
           only what isn't already covered:
           {{range .existing.comments}}- {{.path}}:{{.line}} — {{.body}}
           {{end}}
-          UNIFIED DIFF:
-          {{.diffcap.value}}
+          YOUR CHECKOUT: you have a full local clone of this PR, checked out on its
+          head commit ({{.meta.head_sha}}) against base {{.meta.base}}. The complete,
+          UNCAPPED change is `git diff origin/{{.meta.base}}...HEAD` — run it yourself.
+          You may read any file in the tree for context (callers, tests, config,
+          imports) — you are not limited to the lines that changed.
 
+          CHANGED FILES ({{len .files.files}} total, +{{.meta.additions}}/-{{.meta.deletions}} lines):
+          {{range .files.files}}- {{.path}} ({{.status}}, +{{.additions}}/-{{.deletions}})
+          {{end}}
           Output JSON matching the schema: a "findings" array (possibly empty). Each
           finding: {path, line (NEW-file line in the diff), blocking, body, confidence}.
 
@@ -283,14 +301,95 @@ workflows:
         code: |
           const lenses = ctx.inputs.lenses || [];
           const passes = (ctx.review && ctx.review.items) || [];
+          // Index every changed file's own patch once, so each finding can carry
+          // just its own file's hunk(s) downstream (verify) instead of the whole
+          // PR's diff.
+          const filesByPath = {};
+          for (const f of (ctx.files && ctx.files.files) || []) {
+            if (f && f.path) filesByPath[f.path] = f;
+          }
           const out = [];
           for (let i = 0; i < passes.length; i++) {
             const fs = (passes[i] && passes[i].findings) || [];
             for (const f of fs) {
-              out.push(Object.assign({ id: "f" + out.length, lens: (lenses[i] || {}).name || "?" }, f));
+              const fileInfo = filesByPath[f.path];
+              out.push(Object.assign({
+                id: "f" + out.length,
+                lens: (lenses[i] || {}).name || "?",
+                patch: (fileInfo && fileInfo.patch) || "",
+              }, f));
             }
           }
           return { value: out };
+
+      # 2.10: the unique set of files any surviving finding touched, so the
+      # next step fetches each file's head-of-PR content ONCE rather than
+      # once per finding.
+      - id: paths
+        run: js
+        code: |
+          const findings = (ctx.flatten && ctx.flatten.value) || [];
+          const seen = {};
+          const out = [];
+          for (const f of findings) {
+            if (f.path && !seen[f.path]) { seen[f.path] = 1; out.push(f.path); }
+          }
+          return { value: out };
+
+      # The flagged file's content AT THE PR HEAD (not the base branch), one
+      # fetch per unique path. `optional: true` renders empty text instead of
+      # erroring for a file a finding names that no longer exists at head (a
+      # rename, a delete downstream of the reviewed diff); continue_on_error
+      # keeps one bad fetch from failing the whole review.
+      - id: headfiles
+        uses: github.file
+        for_each: "{{.paths.value}}"
+        parallel: true
+        continue_on_error: true
+        options: { repo: "{{.inputs.repo}}", path: "{{.item}}", ref: "{{.meta.head_sha}}", optional: true }
+
+      # Build each finding's bounded verify-time context: its own file's patch
+      # (already attached in `flatten`) plus a WINDOW of the file at head,
+      # centered on the flagged line — bounded by both a line-count radius and
+      # a hard byte cap, so a single huge file cannot blow up one finding's
+      # verify call regardless of the PR's overall size.
+      #
+      # There is no conductor template function to slice a file by line
+      # number (see internal/flow/template.go's templateFuncs — default,
+      # coalesce, kv, vault, memory, secret, kvContains; nothing text- or
+      # line-oriented) — this step does the slicing itself in `run: js`, the
+      # same mechanism the pre-2.10 diff cap used, rather than inventing a new
+      # template function.
+      - id: windows
+        run: js
+        code: |
+          const findings = (ctx.flatten && ctx.flatten.value) || [];
+          const paths = (ctx.paths && ctx.paths.value) || [];
+          const items = (ctx.headfiles && ctx.headfiles.items) || [];
+          const textByPath = {};
+          for (let i = 0; i < paths.length; i++) {
+            textByPath[paths[i]] = (items[i] && items[i].text) || "";
+          }
+          const RADIUS = 30;      // lines of context above/below the flagged line
+          const MAX_CHARS = 8000; // hard cap regardless of line length
+          function windowFor(path, line) {
+            const text = textByPath[path];
+            if (!text) return "";
+            const lines = text.split("\n");
+            const at = Math.max(1, line || 1);
+            const start = Math.max(1, at - RADIUS);
+            const end = Math.min(lines.length, at + RADIUS);
+            const out = [];
+            for (let n = start; n <= end; n++) out.push(n + ": " + lines[n - 1]);
+            let joined = out.join("\n");
+            if (joined.length > MAX_CHARS) {
+              joined = joined.slice(0, MAX_CHARS) + "\n…[window truncated at " + MAX_CHARS + " bytes]";
+            }
+            return joined;
+          }
+          return { value: findings.map(function (f) {
+            return Object.assign({}, f, { window: windowFor(f.path, f.line) });
+          }) };
 
       # Refute-verify, as a decide: step — one yes/no question per finding,
       # answered with a probability. Which model answers is the light tier's
@@ -300,11 +399,18 @@ workflows:
       # reconcile applies the pack's policy — refute only at >= 0.8 — so the
       # threshold lives here, in the pack, not in any model.
       #
+      # 2.10: state is now PER-FINDING and bounded — the finding's own file
+      # patch plus a head-of-PR line window (both from `windows` above) —
+      # instead of the whole PR's capped diff. `windows.value` is `flatten.
+      # value` in the same order with `patch`/`window` attached, so `reconcile`
+      # below still reads `verify.items[i]` against `flatten.value[i]`
+      # unchanged.
+      #
       # No default: on purpose. A runtime blip retries (the house policy) and
       # then fails the review, as before, rather than quietly posting findings
       # nothing verified.
       - id: verify
-        for_each: "{{.flatten.value}}"
+        for_each: "{{.windows.value}}"
         parallel: true
         model: light
         retry: { max: 6, backoff: 30s }
@@ -319,32 +425,38 @@ workflows:
             PR DESCRIPTION:
             {{.meta.body}}
 
-            DIFF:
-            {{.diffcap.value}}
+            THIS FILE'S PATCH (the diff hunk(s) touching {{.item.path}}):
+            {{.item.patch}}
+
+            {{.item.path}} AT THE PR HEAD, lines around {{.item.line}} (numbered):
+            {{.item.window}}
           questions:
             refuted:
               type: noul
               instructions: >-
                 You are refuting, not grading. Is this finding POSITIVELY WRONG — a
                 claim that would embarrass the reviewer if posted? A finding does NOT
-                need to be provable from the diff: most real issues depend on
-                base-branch code, runtime behavior, or repo conventions the diff can't
-                show. Answer yes ONLY when the diff or PR description positively
-                contradicts the finding — it calls something "missing" that the diff
-                doesn't actually remove; it rests on a factual claim the
-                diff/description plainly shows false; or it describes behavior the code
-                clearly doesn't have. A plausible, material finding that merely isn't
-                provable here is NOT refuted.
+                need to be provable from the patch or window alone: most real issues
+                depend on code elsewhere in the repo, runtime behavior, or repo
+                conventions this context can't show. Answer yes ONLY when the patch,
+                window, or PR description positively contradicts the finding — it
+                calls something "missing" that the patch doesn't actually remove; it
+                rests on a factual claim the patch/window/description plainly shows
+                false; or it describes behavior the code clearly doesn't have. A
+                plausible, material finding that merely isn't provable here is NOT
+                refuted.
               criteria:
-                true: The diff or PR description positively contradicts the finding.
-                false: The finding is plausible, or merely unprovable from the diff.
+                true: The patch, file window, or PR description positively contradicts the finding.
+                false: The finding is plausible, or merely unprovable from the available context.
 
       - id: reconcile
         run: js
         code: |
           const findings = (ctx.flatten && ctx.flatten.value) || [];
-          // verify runs once per finding, in flatten order. The pack's policy:
-          // refute only when P(refuted) >= 0.8 — default hard to keep.
+          // verify runs once per finding, in flatten order (windows.value —
+          // verify's for_each source — is flatten.value with patch/window
+          // attached, same order). The pack's policy: refute only when
+          // P(refuted) >= 0.8 — default hard to keep.
           const REFUTE_AT = 0.8;
           const verdict = {};
           const answers = (ctx.verify && ctx.verify.items) || [];
@@ -397,22 +509,58 @@ workflows:
       event: "{{.review.event}}"                # the review team's verdict
       review: "{{.review.review}}"              # the drafted ReviewRecord JSON
     steps:
-      # 0. The diff, fetched through the connector and PASSED IN to triage.
-      #    The assessor used to shell out to `gh pr diff`, which needed a
-      #    checkout, a gh binary, and credentials the pack never declared —
-      #    reaching outside its own interface to read what a verb already
-      #    returns.
-      - id: diff
-        uses: github.pr_diff
-        options: { repo: "{{.inputs.repo}}", pr: "{{.inputs.pr}}" }
-      - id: diffcap
+      # 0. Every changed file (status + line counts) and as many patches as
+      #    fit a length budget, fetched through the connector and PASSED IN
+      #    to triage. 2.10 replaced the old `github.pr_diff` + 60 KB cap
+      #    here: `pr_files` already returns each file's patch, so there is no
+      #    reason to also fetch and cap a second, whole-PR representation of
+      #    the same change. The assessor used to shell out to `gh pr diff`
+      #    entirely, which needed a checkout, a gh binary, and credentials
+      #    the pack never declared — reaching outside its own interface to
+      #    read what a verb already returns.
+      - id: files
+        uses: github.pr_files
+        options: { repo: "{{.inputs.repo}}", pr: "{{.inputs.pr}}", all: true }
+      - id: budget
         run: js
         code: |
-          const MAX = 60000;
-          const d = (ctx.diff && ctx.diff.diff) || "";
-          if (d.length <= MAX) return { value: d };
-          return { value: d.slice(0, MAX) + "\n\n…[diff truncated at " + MAX +
-            " bytes for length — judge the visible portion]" };
+          // The file list (path/status/+/-) is cheap and always complete —
+          // every file the PR touches is named, regardless of PR size. Only
+          // the PATCHES are budgeted, since those are the expensive part of
+          // the prompt; files are walked in the order pr_files returned them
+          // (GitHub's own deterministic order), so which patches make the
+          // cut is deterministic for a given PR.
+          const MAX_PATCH_BYTES = 50000;
+          const files = (ctx.files && ctx.files.files) || [];
+          const lines = [];
+          let totalAdd = 0, totalDel = 0;
+          for (const f of files) {
+            lines.push("- " + f.path + " (" + f.status + ", +" + f.additions + "/-" + f.deletions + ")");
+            totalAdd += f.additions || 0;
+            totalDel += f.deletions || 0;
+          }
+          const withPatch = files.filter(function (f) { return !!f.patch; });
+          let used = 0, included = 0;
+          const parts = [];
+          for (const f of withPatch) {
+            const chunk = "--- " + f.path + " ---\n" + f.patch + "\n";
+            if (used + chunk.length > MAX_PATCH_BYTES) continue;
+            parts.push(chunk);
+            used += chunk.length;
+            included++;
+          }
+          let patches = parts.join("\n");
+          if (included < withPatch.length) {
+            patches += "\n\n…[" + (withPatch.length - included) + " more file patch(es) omitted for " +
+              "length — the file list above still names every one of them]";
+          }
+          return {
+            summary: lines.join("\n"),
+            patches: patches,
+            file_count: files.length,
+            total_additions: totalAdd,
+            total_deletions: totalDel,
+          };
 
       # 1. Triage: may an automated review post itself ("auto"), or does this
       #    genuinely need a human ("manual")? A decide: step — four typed
@@ -426,8 +574,12 @@ workflows:
           state: |
             Code-review request on {{.inputs.repo}}#{{.inputs.pr}} ("{{.inputs.title}}").
 
-            UNIFIED DIFF:
-            {{.diffcap.value}}
+            FILES CHANGED ({{.budget.file_count}} total, +{{.budget.total_additions}}/-{{.budget.total_deletions}} lines):
+            {{.budget.summary}}
+
+            PATCHES (as many as fit a length budget — the file list above names every
+            changed file regardless of whether its patch made the cut):
+            {{.budget.patches}}
           questions:
             decision:
               type: choice
