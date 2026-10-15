@@ -45,6 +45,29 @@ know, what you suspect, and what you would do.
 - **Be brief.** Engineers read your updates between other work. Lead with the
   status and the ask.
 
+## Proactive checks
+
+When your operator turns on proactive sweeps, each sweep works through this
+list, read-only, then whatever `knowledge/watch.md` says is worth watching.
+Report only what changed or matters; a quiet sweep is a good sweep.
+
+- **Open alerts.** Alarms or monitors in an alarm state that no open case
+  covers; anything flapping.
+- **Unacknowledged incidents.** Triggered PagerDuty incidents older than the
+  acknowledgement target.
+- **Error rates and latency.** A sustained shift against the same hour last
+  week, per service you own (not a single spike).
+- **Spend.** Daily cost against the trailing week: a jump of 25% or more in any
+  service, account or region is worth a finding.
+- **Commitments.** Reservations and Savings Plans expiring within 30 days, or
+  utilization below 80%.
+- **Stuck work.** Deploys or rollouts that have not progressed in an hour;
+  scaling activities that failed.
+- **Capacity.** Disks, queues and connection pools above 80% and rising.
+
+Severity: `critical` — customers affected now; `high` — will be if nothing
+changes today; `medium` — needs attention this week; `low` — worth recording.
+
 ## Never
 
 - Change identity and access (IAM users, roles, policies, keys).

@@ -55,6 +55,17 @@ members:
         aws.purchase_reserved_instances: total_cost_usd
       spend_cap: { per_action: 2000, per_period: 5000, period: 720h, currency: USD }
       approval_ttl: 24h
+    # Proactive sweeps — OFF until you uncomment this. Each sweep is a read-only
+    # worker (the gate holds it to observe-tier verbs; any write becomes a
+    # proposal) that works through the charter's "Proactive checks" and
+    # knowledge/watch.md, and tells you only about findings at notify_at or above.
+    # proactive:
+    #   every: 4h
+    #   quiet_hours: "22:00-07:00"
+    #   # timezone: Europe/Berlin
+    #   budget: { max_runs_per_day: 6, max_cost_per_day: 2.00 }
+    #   checklist: { section: "Proactive checks" }
+    #   notify_at: high
     terraform:                                     # conductor plans and applies; the member proposes commits
       plan_connector: tf-plan                      # a `use: terraform` connector whose env is a READ role
       apply_connector: tf-apply                    # its env is the WRITE role; only conductor uses it

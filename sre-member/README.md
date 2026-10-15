@@ -10,7 +10,7 @@ This pack ships the parts that are the same for every org:
 |---|---|
 | `charter.md` | the member's standing instructions — what it owns, how it acts, what it never does |
 | `runbooks/` | page triage → investigate → escalate; Terraform change → propose → conductor applies; env var change requests; the weekly spend & commitment review; scaling proposals |
-| `knowledge/README.md` | what to seed the member's knowledge with |
+| `knowledge/` | what to seed the member's knowledge with, and `watch.md`: what proactive sweeps watch beyond the checklist |
 | `conductor-pack.yaml` | three disarmed triggers that route work into the member: `page`, `chat_request`, `weekly` (spend review, then memory consolidation) |
 | `member.example.yaml` | a starting `members:` entry: verbs, autonomy tiers, spend cap, Terraform |
 
@@ -100,3 +100,25 @@ conductor member approve sre-acme p12
   a proposal.
 - **Consolidation** (`weekly`, second step): a worker distils the week's
   episodes into `knowledge/` as reviewable commits.
+- **Proactive checks** (opt in with `proactive:` on the member — commented out
+  in `member.example.yaml`): every few hours a read-only sweep works through the
+  charter's "Proactive checks" (alerts, unacked incidents, error-rate shifts,
+  spend jumps, expiring commitments, stuck deploys, capacity) and
+  `knowledge/watch.md`. The gate holds a sweep to observe-tier verbs — a write
+  becomes a proposal — and conductor tells you only about findings at
+  `notify_at` or above (deduplicated against open cases); a quiet sweep is one
+  ledger line. Budget and quiet hours are on the member. To get findings in
+  chat too, add a trigger on conductor's lifecycle event to YOUR config (a
+  pack cannot subscribe to `conductor.*` events):
+
+  ```yaml
+  triggers:
+    - on: conductor.member_notify
+      steps:
+        - uses: slack.post
+          if: "{{.member}} == sre-acme"
+          options: { channel: C0ALERTS, text: "{{.message}}" }
+  ```
+- **Helpers.** The member splits work across workers (`spawn --group`, then
+  `join`) and sends them follow-ups (`tell`); workers act on the same request's
+  trust as the member, never more.
