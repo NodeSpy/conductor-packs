@@ -1,6 +1,6 @@
 # A members: entry for an SRE member using this pack — copy it into your config
 # and bind it to YOUR environment. Names here are placeholders ("sre-acme",
-# connector names "pd", "aws", "tf", "slack"): use your own.
+# connector names "pd", "aws", "tf-plan", "tf-apply", "slack"): use your own.
 #
 # Requires the conductor release with members (not tagged yet — see README),
 # operators: with your SSH public key, and a `use: cli` runtime for workers.
@@ -32,11 +32,10 @@ members:
         - pd.resolve
         - pd.escalate
         - aws.*                                    # the aws-cost connector
-        - tf.init
-        - tf.plan
-        - tf.show
-        - tf.output
         - slack.post
+        # - git.push                               # once released: how the member pushes its Terraform branch
+        # No terraform verbs: conductor plans and applies (terraform: below).
+        # A verb that could reach the apply connector is a config error.
     autonomy:
       shadow: true                                 # start here; review the shadow proposals; then promote
       tiers:
@@ -47,17 +46,17 @@ members:
           - aws.reservation_*
           - aws.savings_plans*
           - aws.reserved_*
-          - tf.init
-          - tf.plan
-          - tf.show
-          - tf.output
         reversible: [pd.acknowledge, pd.add_note]
-        propose:    [pd.resolve, pd.escalate, slack.post, command.terraform]
+        propose:    [pd.resolve, pd.escalate, slack.post, terraform.apply]
         commit_money: [aws.purchase_*]
-        never:      [tf.destroy, tf.state, tf.import, command.aws]
-      promote: [pd.acknowledge, pd.add_note]       # takes effect once member sessions are jailed
+      promote: [pd.acknowledge, pd.add_note]       # takes effect once member sessions are sandboxed
       amounts:
         aws.purchase_savings_plan: total_commitment_usd
         aws.purchase_reserved_instances: total_cost_usd
       spend_cap: { per_action: 2000, per_period: 5000, period: 720h, currency: USD }
       approval_ttl: 24h
+    terraform:                                     # conductor plans and applies; the member proposes commits
+      plan_connector: tf-plan                      # a `use: terraform` connector whose env is a READ role
+      apply_connector: tf-apply                    # its env is the WRITE role; only conductor uses it
+      repos: { infra: git@github.com:acme/infra.git }
+      # allow_destroy: []                          # stateful destroys/replaces are refused unless named here

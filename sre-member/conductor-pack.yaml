@@ -14,7 +14,7 @@
 #
 # Define-behavior / bind-environment: the pack ships BEHAVIOR (disarmed triggers,
 # a charter template, runbook scaffolding). The member itself — its memory repo,
-# its operators, its grant on YOUR connectors, its autonomy tiers and spend cap —
+# its operators, its verbs on YOUR connectors, its autonomy tiers and spend cap —
 # is environment, so it is a `members:` entry you write (member.example.yaml is a
 # starting point). Nothing here names an org: one pack instance per member, one
 # member per org.
@@ -51,7 +51,7 @@ pack:
     conductor: ">=0.66.0"
     connectors:
       # The page trigger uses the pagerduty incident SOURCE, released since
-      # v1.0.0. (The member's own grant — acknowledge / add_note / resolve — needs
+      # v1.0.0. (The member's own verbs — acknowledge / add_note / resolve — need
       # the pagerduty incident VERBS, which are not released yet; see the README.)
       pagerduty: ">=1.0.0"
       # The chat trigger: an @-mention of your bot (the slack plugin's app_mention).

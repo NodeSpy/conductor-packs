@@ -1,31 +1,39 @@
-# Terraform: plan → approve → apply
+# Terraform: change → propose → approve → conductor applies
 
-Infrastructure changes are always plan first, apply a SAVED plan second, and the
-apply is always approved by an operator.
+You never run `terraform apply` and you hold no write role. You propose a
+**commit**; conductor plans it itself, your operator approves that exact plan,
+and conductor applies it.
 
 1. Work in your own working directory. Check out the infrastructure repo there
-   (or use the Terraform connector's working directory if your operator set
-   one up).
-2. `terraform init`, then `terraform plan -out=plan.tfplan` (or the
-   `terraform.plan` verb with `out: plan.tfplan`). Planning is read-only.
-3. **Read the plan.** `terraform show -no-color plan.tfplan`. Every resource
-   that is replaced or destroyed must be expected; if anything surprises you,
-   stop and report instead of proposing.
-4. Propose the apply of exactly that file, FROM THE DIRECTORY IT RUNS IN (the
-   root module — e.g. `envs/prod`):
+   (a repo your operator listed under the member's `terraform.repos`), on a
+   new branch.
+2. Make the change. Keep it to one purpose. `terraform fmt` and
+   `terraform validate` locally if you can.
+3. Commit it with a message that says what and why, and push the branch
+   (`conductor call git.push`; until that verb exists, ask your operator to
+   push it for you). Note the **full** commit SHA.
+4. Propose it, naming the root module it applies to:
 
-       cd envs/prod
-       conductor member propose-command --file plan.tfplan -- terraform apply plan.tfplan
+       conductor member propose-terraform --repo infra --commit <full sha> --dir envs/prod \
+           [--workspace prod] [--var-file envs/prod/prod.tfvars] --summary "why, in one line"
 
-   The directory is part of what is approved: the same apply from another
-   directory (another root module, another state) is a different action and
-   will be refused. Conductor records the SHA-256 of `envs/prod/plan.tfplan`
-   as the broker will read it. In your
-   message to the operator: the summary line (`N to add, M to change, K to
-   destroy`), why, the risk, and how to roll back.
-5. `conductor member wait <proposal>`. If approved, run exactly
-   `terraform apply plan.tfplan` from that same directory — the approval is a
-   single-use grant for that command, that directory and those bytes; any other
-   command, directory, or a changed plan file, is refused.
-6. Verify the change took effect, record the outcome in the case, and write
+   Repo, commit, directory, workspace, var files and targets are all part of
+   what is approved; none of them can change afterwards.
+5. Conductor checks the commit out in its own directory and plans it with a
+   read role. It tells you when the plan is ready; `conductor member
+   proposals` shows the full plan text. **Read it.** Every resource that is
+   replaced or destroyed must be expected. If anything surprises you, tell your
+   operator to deny it and say why.
+   - A plan that destroys or replaces a stateful resource (databases, buckets,
+     disks, keys…) is **refused** by conductor unless your operator explicitly
+     allowed that address. Do not try to work around it: report it, with the
+     reason the destroy is needed and how data is preserved.
+6. Tell your operator: the summary line (`+N ~M -K`, anything replaced or
+   destroyed), why, the risk, and how to roll back. They approve with a signed
+   `conductor member approve`, which covers that plan's hash and nothing else.
+7. `conductor member wait <proposal>` returns once it is applied, refused or
+   denied. If it failed because the plan went **stale** (the state changed
+   since planning), `conductor member replan <proposal>` plans the same commit
+   again as a new proposal — read the new plan before recommending it.
+8. Verify the change took effect, record the outcome in the case, and write
    anything learned to `knowledge/`.

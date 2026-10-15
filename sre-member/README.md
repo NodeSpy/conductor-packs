@@ -9,13 +9,13 @@ This pack ships the parts that are the same for every org:
 | file | what |
 |---|---|
 | `charter.md` | the member's standing instructions — what it owns, how it acts, what it never does |
-| `runbooks/` | page triage → investigate → escalate; Terraform plan → approve → apply; env var change requests; the weekly spend & commitment review; scaling proposals |
+| `runbooks/` | page triage → investigate → escalate; Terraform change → propose → conductor applies; env var change requests; the weekly spend & commitment review; scaling proposals |
 | `knowledge/README.md` | what to seed the member's knowledge with |
 | `conductor-pack.yaml` | three disarmed triggers that route work into the member: `page`, `chat_request`, `weekly` (spend review, then memory consolidation) |
-| `member.example.yaml` | a starting `members:` entry: grant, autonomy tiers, spend cap |
+| `member.example.yaml` | a starting `members:` entry: verbs, autonomy tiers, spend cap, Terraform |
 
 It names no org. Run one instance per member, one member per org: each has its
-own memory repo, ledger, home session, grant and operators, and nothing crosses
+own memory repo, ledger, home session, verbs and operators, and nothing crosses
 between them.
 
 ## Requirements
@@ -24,14 +24,15 @@ between them.
 |---|---|---|
 | conductor | the first release with members (NodeSpy/conductor#172) | **not tagged yet** — `v0.65.0` does not have them; the manifest's floor is `>=0.66.0`, to re-check when #172 ships |
 | `pagerduty` plugin — incident **source** (the `page` trigger) | `>=1.0.0` | released |
-| `pagerduty` plugin — incident **verbs** (acknowledge / add_note / resolve / escalate, in the member's grant) | the release after `v1.1.0` | **not tagged yet** |
-| `aws-cost` plugin (spend reads and the purchase verbs, in the member's grant) | its first release | **not tagged yet** |
+| `pagerduty` plugin — incident **verbs** (acknowledge / add_note / resolve / escalate, in the member's verbs) | the release after `v1.1.0` | **not tagged yet** |
+| `aws-cost` plugin (spend reads and purchases, in the member's verbs) | its first release | **not tagged yet** |
 | `slack` plugin — `app_mention` (the `chat_request` trigger) | `>=1.0.0` | released |
-| `terraform` plugin (plan / show, in the member's grant) | any | released |
+| `terraform` plugin (two connectors: conductor plans with one role and applies with the other) | any | released |
+| `git.push` (how the member pushes its Terraform branch) | — | **not released yet** — until then your operator pushes the branch |
 | a cron connector with a schedule named by `settings.review_schedule`, used by no other trigger | built in | — |
 
 The pack's own triggers need only the released parts. The unreleased verbs are
-used by the member's **grant**, which lives in your `members:` entry — leave
+used by the member's **verbs**, which live in your `members:` entry — leave
 those verbs out of `skill.verbs` until their releases exist.
 
 ## Install
@@ -40,7 +41,8 @@ those verbs out of `skill.verbs` until their releases exist.
 connectors:
   pd:    { use: pagerduty, listen: ":9098", signing_secret: ${PD_SIGNING_SECRET}, api_token: ${PD_TOKEN}, from: oncall-bot@example.com }
   aws:   { use: aws-cost, region: us-east-1 }
-  tf:    { use: terraform, workdir: ~/src/infra }
+  tf-plan:  { use: terraform, env: { AWS_PROFILE: infra-read } }     # conductor plans with this role
+  tf-apply: { use: terraform, env: { AWS_PROFILE: infra-deploy } }   # and applies with this one
   slack: { use: slack, app_token: ${SLACK_APP_TOKEN}, bot_token: ${SLACK_BOT_TOKEN} }
   timer: { use: cron, schedules: { sre-weekly: { cron: "0 9 * * 1" } } }
 
@@ -70,7 +72,7 @@ do, but nothing above observe executes. Review its shadow proposals
 (`conductor member proposals sre-acme --all`); when its judgment on an action
 class is consistently right, promote that class (`autonomy.promote`) and turn
 shadow off. Promotion of reversible actions takes effect only once member
-sessions run in conductor's agent jail.
+sessions run in conductor's agent sandbox.
 
 Every proposal is approved by you, signed with your SSH key:
 
@@ -83,10 +85,12 @@ conductor member approve sre-acme p12
 - **Page triage** (`page` → `runbooks/page-triage.md`): an urgent case and a
   worker immediately — acknowledge (if promoted), scope, find what changed,
   mitigate within autonomy, note, escalate per the charter, close out.
-- **Terraform** (`runbooks/terraform-change.md`): plan to a file, read it,
-  `conductor member propose-command --file plan.tfplan -- terraform apply
-  plan.tfplan`; your approval mints a single-use grant for that exact command
-  and those bytes.
+- **Terraform** (`runbooks/terraform-change.md`): the member commits and
+  pushes the change, then `conductor member propose-terraform --repo infra
+  --commit <sha> --dir envs/prod`. Conductor plans it with the read role and
+  shows you the plan; your signed approval covers that plan's hash, and
+  conductor applies exactly that plan with the write role. Plans that destroy
+  stateful resources are refused unless you allow the address.
 - **Env var changes** (`chat_request` → `runbooks/env-var-change.md`): the
   requester's trust, never more; investigate, then propose the exact change.
 - **Spend & commitments** (`weekly` → `runbooks/spend-review.md`):
