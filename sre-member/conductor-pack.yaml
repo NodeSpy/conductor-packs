@@ -16,23 +16,23 @@
 # a charter template, runbook scaffolding). The member itself — its memory repo,
 # its operators, its verbs on YOUR connectors, its autonomy tiers and spend cap —
 # is environment, so it is a `members:` entry you write (member.example.yaml is a
-# starting point). Nothing here names an org: one pack instance per member, one
-# member per org.
+# starting point). Nothing here names a company or a system: one pack instance
+# per member, and as many members as you define.
 #
-# Install (config `packs:` block), for a member named sre-acme:
+# Install (config `packs:` block), for a member named platform-sre:
 #   packs:
-#     sre-acme:
+#     platform-sre:
 #       source: github.com/NodeSpy/conductor-packs//sre-member
 #       version: "~> 1.0"
 #       connectors: { pagerduty: pd, chat: slack, schedule: timer }
 #       settings:
-#         member: sre-acme
+#         member: platform-sre
 #         review_schedule: sre-weekly        # a schedule on your cron connector
 #       triggers:
 #         "*": { enabled: true }
 #   members:
-#     sre-acme:
-#       charter_file: .conductor/packs/sre-acme/charter.md   # the vendored charter
+#     platform-sre:
+#       charter_file: .conductor/packs/platform-sre/charter.md   # the vendored charter
 #       …                                                    # see member.example.yaml
 #   Then: `conductor init`, `conductor pack plan`, `conductor validate`.
 

@@ -4,7 +4,7 @@ A first-line SRE as a conductor **member**: a persistent teammate you talk to in
 paseo, that receives pages and chat requests, keeps its own memory, delegates to
 background workers, and **proposes** every change for you to approve.
 
-This pack ships the parts that are the same for every org:
+This pack ships the parts that are the same for every SRE member:
 
 | file | what |
 |---|---|
@@ -14,9 +14,12 @@ This pack ships the parts that are the same for every org:
 | `conductor-pack.yaml` | three disarmed triggers that route work into the member: `page`, `chat_request`, `weekly` (spend review, then memory consolidation) |
 | `member.example.yaml` | a starting `members:` entry: verbs, autonomy tiers, spend cap, Terraform |
 
-It names no org. Run one instance per member, one member per org: each has its
-own memory repo, ledger, home session, verbs and operators, and nothing crosses
-between them.
+It names no company or system. Run one pack instance per member, and define as
+many members as you want, cut any way that suits you (a team, an environment,
+a service). Each member has its own memory repo, ledger, home session, verbs
+and operators, and nothing crosses between members unless you link them as
+peers — a link is a channel for data to cross between them, so only link
+members whose data may mix.
 
 ## Requirements
 
@@ -51,11 +54,11 @@ runtimes:
   claude-cli: { use: cli, tool: claude-code }
 
 packs:
-  sre-acme:
+  platform-sre:
     source: github.com/NodeSpy/conductor-packs//sre-member
     version: "~> 1.0"
     connectors: { pagerduty: pd, chat: slack, schedule: timer }
-    settings: { member: sre-acme, review_schedule: sre-weekly }
+    settings: { member: platform-sre, review_schedule: sre-weekly }
     triggers:
       "*": { enabled: true }
 
@@ -63,13 +66,13 @@ packs:
 ```
 
 Then `conductor init`, `conductor pack plan`, `conductor validate`, and talk to
-the member: it appears in paseo as `member sre-acme (home)`.
+the member: it appears in paseo as `member platform-sre (home)`.
 
 ## Calibrate, then promote
 
 A new member starts in **shadow mode**: it triages and writes up what it would
 do, but nothing above observe executes. Review its shadow proposals
-(`conductor member proposals sre-acme --all`); when its judgment on an action
+(`conductor member proposals platform-sre --all`); when its judgment on an action
 class is consistently right, promote that class (`autonomy.promote`) and turn
 shadow off. Promotion of reversible actions takes effect only once member
 sessions run in conductor's agent sandbox.
@@ -77,7 +80,7 @@ sessions run in conductor's agent sandbox.
 Every proposal is approved by you, signed with your SSH key:
 
 ```
-conductor member approve sre-acme p12
+conductor member approve platform-sre p12
 ```
 
 ## The workflows
@@ -116,7 +119,7 @@ conductor member approve sre-acme p12
     - on: conductor.member_notify
       steps:
         - uses: slack.post
-          if: "{{.member}} == sre-acme"
+          if: "{{.member}} == platform-sre"
           options: { channel: C0ALERTS, text: "{{.message}}" }
   ```
 - **Helpers.** The member splits work across workers (`spawn --group`, then

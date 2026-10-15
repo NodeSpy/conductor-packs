@@ -12,4 +12,4 @@ on day one; the member keeps it current.
   checklist (a starting file ships with this pack).
 
 Copy `runbooks/` from this pack into the memory repo's `runbooks/` the same way;
-adapt them to how your organization actually works.
+adapt them to how your systems and team actually work.
