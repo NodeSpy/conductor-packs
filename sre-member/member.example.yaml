@@ -1,0 +1,63 @@
+# A members: entry for an SRE member using this pack — copy it into your config
+# and bind it to YOUR environment. Names here are placeholders ("sre-acme",
+# connector names "pd", "aws", "tf", "slack"): use your own.
+#
+# Requires the conductor release with members (not tagged yet — see README),
+# operators: with your SSH public key, and a `use: cli` runtime for workers.
+
+operators:
+  you:
+    ssh_key: "ssh-ed25519 AAAA… you@laptop"     # approvals are SSH-signed with this key
+    aliases: ["slack:U0000000"]                   # your chat id, so your chat requests count as yours
+
+members:
+  sre-acme:
+    description: "first-line SRE for acme"
+    charter_file: .conductor/packs/sre-acme/charter.md   # the vendored pack's charter
+    seed_dir: .conductor/packs/sre-acme                  # first start: copy knowledge/ + runbooks/ into memory
+    escalation: |
+      Escalate to the operator when: a sev1 is not mitigated within 15 minutes;
+      any data loss is suspected; you are below 70% confident in the cause.
+    home:
+      rotate: { max_age: 24h, max_turns: 100 }
+    worker:
+      runtime: claude-cli                          # a `use: cli` runtime
+      timeout: 2h
+    skill:
+      verbs:
+        - pd.get_incident
+        - pd.list_incidents
+        - pd.acknowledge
+        - pd.add_note
+        - pd.resolve
+        - pd.escalate
+        - aws.*                                    # the aws-cost connector
+        - tf.init
+        - tf.plan
+        - tf.show
+        - tf.output
+        - slack.post
+    autonomy:
+      shadow: true                                 # start here; review the shadow proposals; then promote
+      tiers:
+        observe:
+          - pd.get_incident
+          - pd.list_incidents
+          - aws.cost_*
+          - aws.reservation_*
+          - aws.savings_plans*
+          - aws.reserved_*
+          - tf.init
+          - tf.plan
+          - tf.show
+          - tf.output
+        reversible: [pd.acknowledge, pd.add_note]
+        propose:    [pd.resolve, pd.escalate, slack.post, command.terraform]
+        commit_money: [aws.purchase_*]
+        never:      [tf.destroy, tf.state, tf.import, command.aws]
+      promote: [pd.acknowledge, pd.add_note]       # takes effect once member sessions are jailed
+      amounts:
+        aws.purchase_savings_plan: total_commitment_usd
+        aws.purchase_reserved_instances: total_cost_usd
+      spend_cap: { per_action: 2000, per_period: 5000, period: 720h, currency: USD }
+      approval_ttl: 24h

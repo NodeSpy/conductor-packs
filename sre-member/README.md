@@ -1,0 +1,98 @@
+# sre-member
+
+A first-line SRE as a conductor **member**: a persistent teammate you talk to in
+paseo, that receives pages and chat requests, keeps its own memory, delegates to
+background workers, and **proposes** every change for you to approve.
+
+This pack ships the parts that are the same for every org:
+
+| file | what |
+|---|---|
+| `charter.md` | the member's standing instructions — what it owns, how it acts, what it never does |
+| `runbooks/` | page triage → investigate → escalate; Terraform plan → approve → apply; env var change requests; the weekly spend & commitment review; scaling proposals |
+| `knowledge/README.md` | what to seed the member's knowledge with |
+| `conductor-pack.yaml` | three disarmed triggers that route work into the member: `page`, `chat_request`, `weekly` (spend review, then memory consolidation) |
+| `member.example.yaml` | a starting `members:` entry: grant, autonomy tiers, spend cap |
+
+It names no org. Run one instance per member, one member per org: each has its
+own memory repo, ledger, home session, grant and operators, and nothing crosses
+between them.
+
+## Requirements
+
+| what | version | status |
+|---|---|---|
+| conductor | the first release with members (NodeSpy/conductor#172) | **not tagged yet** — `v0.65.0` does not have them; the manifest's floor is `>=0.66.0`, to re-check when #172 ships |
+| `pagerduty` plugin — incident **source** (the `page` trigger) | `>=1.0.0` | released |
+| `pagerduty` plugin — incident **verbs** (acknowledge / add_note / resolve / escalate, in the member's grant) | the release after `v1.1.0` | **not tagged yet** |
+| `aws-cost` plugin (spend reads and the purchase verbs, in the member's grant) | its first release | **not tagged yet** |
+| `slack` plugin — `app_mention` (the `chat_request` trigger) | `>=1.0.0` | released |
+| `terraform` plugin (plan / show, in the member's grant) | any | released |
+| a cron connector with a schedule named by `settings.review_schedule`, used by no other trigger | built in | — |
+
+The pack's own triggers need only the released parts. The unreleased verbs are
+used by the member's **grant**, which lives in your `members:` entry — leave
+those verbs out of `skill.verbs` until their releases exist.
+
+## Install
+
+```yaml
+connectors:
+  pd:    { use: pagerduty, listen: ":9098", signing_secret: ${PD_SIGNING_SECRET}, api_token: ${PD_TOKEN}, from: oncall-bot@example.com }
+  aws:   { use: aws-cost, region: us-east-1 }
+  tf:    { use: terraform, workdir: ~/src/infra }
+  slack: { use: slack, app_token: ${SLACK_APP_TOKEN}, bot_token: ${SLACK_BOT_TOKEN} }
+  timer: { use: cron, schedules: { sre-weekly: { cron: "0 9 * * 1" } } }
+
+runtimes:
+  paseo:      { use: paseo, default: true }
+  claude-cli: { use: cli, tool: claude-code }
+
+packs:
+  sre-acme:
+    source: github.com/NodeSpy/conductor-packs//sre-member
+    version: "~> 1.0"
+    connectors: { pagerduty: pd, chat: slack, schedule: timer }
+    settings: { member: sre-acme, review_schedule: sre-weekly }
+    triggers:
+      "*": { enabled: true }
+
+# operators: + members: — start from member.example.yaml
+```
+
+Then `conductor init`, `conductor pack plan`, `conductor validate`, and talk to
+the member: it appears in paseo as `member sre-acme (home)`.
+
+## Calibrate, then promote
+
+A new member starts in **shadow mode**: it triages and writes up what it would
+do, but nothing above observe executes. Review its shadow proposals
+(`conductor member proposals sre-acme --all`); when its judgment on an action
+class is consistently right, promote that class (`autonomy.promote`) and turn
+shadow off. Promotion of reversible actions takes effect only once member
+sessions run in conductor's agent jail.
+
+Every proposal is approved by you, signed with your SSH key:
+
+```
+conductor member approve sre-acme p12
+```
+
+## The workflows
+
+- **Page triage** (`page` → `runbooks/page-triage.md`): an urgent case and a
+  worker immediately — acknowledge (if promoted), scope, find what changed,
+  mitigate within autonomy, note, escalate per the charter, close out.
+- **Terraform** (`runbooks/terraform-change.md`): plan to a file, read it,
+  `conductor member propose-command --file plan.tfplan -- terraform apply
+  plan.tfplan`; your approval mints a single-use grant for that exact command
+  and those bytes.
+- **Env var changes** (`chat_request` → `runbooks/env-var-change.md`): the
+  requester's trust, never more; investigate, then propose the exact change.
+- **Spend & commitments** (`weekly` → `runbooks/spend-review.md`):
+  spend, utilization, coverage, recommendations; a purchase proposal with its
+  verified total under the hard spend cap.
+- **Scaling** (`runbooks/scaling-proposal.md`): a week of data, a sized change,
+  a proposal.
+- **Consolidation** (`weekly`, second step): a worker distils the week's
+  episodes into `knowledge/` as reviewable commits.
