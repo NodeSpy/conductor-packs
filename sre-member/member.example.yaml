@@ -71,3 +71,72 @@ members:
       apply_connector: tf-apply                    # its env is the WRITE role; only conductor uses it
       repos: { infra: git@git.example.com:platform/infra.git }
       # allow_destroy: []                          # stateful destroys/replaces are refused unless named here
+
+# ---------------------------------------------------------------------------
+# A TEAM — OFF until you uncomment it. Teams are yours to cut (by system,
+# function, environment); conductor has no org. The team's settings are
+# CEILINGS its members inherit and can only narrow (a member past its team's is
+# a load error naming both values). Teammates may `conductor member ask` each
+# other (data only); the team shares a knowledge repo members PROPOSE
+# promotions into; and a trigger can route to the team instead of one member.
+#
+# Here: a lead that triages, and two members that work the cases. Each member
+# block is the platform-sre entry above with its own name, description, scope
+# and memory — copy what you need. The members inherit what they leave unset.
+#
+# teams:
+#   platform:
+#     description: "SRE for the platform services"
+#     operators: [you]                         # who approves for the team (members' operators fit inside)
+#     autonomy:
+#       ceiling: reversible                    # or observe: no member promotes anything
+#       shadow: true                           # every member calibrates first
+#     budget:
+#       spend_cap: { per_action: 2000, per_period: 5000, period: 720h, currency: USD }
+#       proactive: { max_runs_per_day: 8, max_cost_per_day: 3.00 }   # one pool for all members' sweeps
+#     isolation: { handoff_workers: false }    # cli workers only; sandbox: required once the agent sandbox is on
+#     knowledge: { promotion: proposal }       # shared runbooks/knowledge; an operator approves each promotion
+#     routing:
+#       rules:                                 # deterministic, first match wins, no model
+#         - name: data-stores
+#           match: { source: "pd.*", "pagerduty.service": "db-*" }   # any event field, globs
+#           to: platform-data
+#         - name: cost
+#           match: { title: "*spend*" }
+#           to: platform-sre
+#       lead: platform-lead                    # anything else: the lead triages (read-only) and assigns
+#       fallback: platform-sre                 # no rule, no assignment within timeout: → here
+#       # timeout: 10m
+#
+# members:
+#   platform-lead:
+#     team: platform
+#     description: "triage lead for the platform team: routes work, works little itself"
+#     scope: "Decide who handles a routed event; keep runbooks/triage.md current."
+#     charter_file: .conductor/packs/platform-sre/charter.md
+#     worker: { runtime: claude-cli }
+#     skill: { verbs: [pd.get_incident, pd.list_incidents] }        # reads only: triage
+#     autonomy: { tiers: { observe: [pd.get_incident, pd.list_incidents] } }
+#   platform-sre:
+#     team: platform
+#     description: "first-line SRE for the platform services"
+#     scope: "Compute, deploys, networking, spend."
+#     # …the platform-sre entry above, minus what the team sets
+#   platform-data:
+#     team: platform
+#     description: "SRE for the platform's data stores"
+#     scope: "Databases, caches, queues, backups."
+#     charter_file: .conductor/packs/platform-sre/charter.md
+#     worker: { runtime: claude-cli }
+#     skill: { verbs: [pd.get_incident, pd.acknowledge, pd.add_note, aws.*] }
+#     autonomy:
+#       tiers: { observe: [pd.get_incident, aws.cost_*], reversible: [pd.acknowledge, pd.add_note] }
+#       spend_cap: { per_action: 500, per_period: 1000, period: 720h }   # narrower than the team: fine
+#
+# Route to the team from a trigger in YOUR config (the pack's own triggers name
+# one member — settings.member):
+#
+# triggers:
+#   - on: pd.incident
+#     steps:
+#       - member: { team: platform, title: "page: {{.title}}", text: "{{.url}}", urgent: true }

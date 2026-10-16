@@ -122,6 +122,13 @@ conductor member approve platform-sre p12
           if: "{{.member}} == platform-sre"
           options: { channel: C0ALERTS, text: "{{.message}}" }
   ```
+- **A team** (commented out at the end of `member.example.yaml`): a lead and two
+  members that share ceilings (operators, autonomy, budgets with one proactive
+  pool, isolation), peer with each other, and share a knowledge repo members
+  propose promotions into. Route work with `member: { team: platform, … }` in
+  your own trigger: a rule picks the member, else the lead triages read-only
+  and runs `conductor member assign`, else the fallback takes it. The
+  assignee works the original request on the original requester's trust.
 - **Helpers.** The member splits work across workers (`spawn --group`, then
   `join`) and sends them follow-ups (`tell`); workers act on the same request's
   trust as the member, never more.

@@ -83,6 +83,12 @@ triggers:
             Triage per runbooks/page-triage.md.
           urgent: true
 
+  # To route pages to a TEAM of members instead of one (its rules, its lead's
+  # triage or its fallback pick the member — still the original requester's
+  # request at that member's gate), write the trigger in your own config with
+  # `member: { team: <team>, … }` — see the commented team in
+  # member.example.yaml. This pack's triggers name settings.member.
+  #
   # A chat request: a case whose REQUESTER is the person who asked. The member's
   # gate then runs everything for that case on that person's trust — a third
   # party's request can only ever become a proposal you approve.
