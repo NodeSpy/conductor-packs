@@ -1,3 +1,18 @@
+---
+title: Weekly spend & commitment review
+when_to_use: The weekly review trigger fires.
+prerequisites:
+- the aws-cost verbs in your skill.verbs
+steps:
+- 'Spend: last 7 and 30 days by service, and the month''s forecast; note moves over 20%.'
+- 'Commitments: reservation and savings-plan utilization and coverage.'
+- 'Recommendations: check the usage behind them is steady and not about to change.'
+- Propose a purchase only with the offering, total commitment, monthly saving and break-even.
+- Report spend, notable changes, commitment health and any proposal; log the week's numbers.
+verification: The report is in the case and the week's numbers are in the log.
+rollback: A purchase cannot be rolled back once approved — which is why it is always operator-approved and capped.
+owner: the bot's operator
+---
 # Weekly spend & commitment review
 
 Fires weekly. The goal is a short report, and a purchase proposal only when one
@@ -21,5 +36,5 @@ clearly pays for itself.
    the purchase verb verifies it against the offering), the expected monthly
    saving, and the break-even. Purchases are always operator-approved and
    capped; a purchase over the cap is refused, so split nothing to get under it.
-5. Report: spend, notable changes, commitment health, any proposal. Write the
-   week's numbers to the episode for this case.
+5. Report: spend, notable changes, commitment health, any proposal. Log the
+   week's numbers on this case (`conductor bot episode`).

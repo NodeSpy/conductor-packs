@@ -14,7 +14,9 @@ bots:
   platform-sre:
     description: "first-line SRE for the platform services"
     charter_file: .conductor/packs/platform-sre/charter.md   # the vendored pack's charter
-    seed_dir: .conductor/packs/platform-sre                  # first start: copy knowledge/ + runbooks/ into memory
+    seed_dir: .conductor/packs/platform-sre                  # first start: copy the pack's typed runbooks/ + watch/ into memory
+    collections:                                             # a custom document kind, shipped by the pack
+      postmortems: { from: .conductor/packs/platform-sre/collections/postmortems.yaml }
     escalation: |
       Escalate to the operator when: a sev1 is not mitigated within 15 minutes;
       any data loss is suspected; you are below 70% confident in the cause.
@@ -58,7 +60,7 @@ bots:
     # Proactive sweeps — OFF until you uncomment this. Each sweep is a read-only
     # worker (the gate holds it to observe-tier verbs; any write becomes a
     # proposal) that works through the charter's "Proactive checks" and
-    # knowledge/watch.md, and tells you only about findings at notify_at or above.
+    # the watch/ documents, and tells you only about findings at notify_at or above.
     # proactive:
     #   every: 4h
     #   quiet_hours: "22:00-07:00"

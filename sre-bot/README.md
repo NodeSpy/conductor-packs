@@ -9,10 +9,18 @@ This pack ships the parts that are the same for every SRE bot:
 | file | what |
 |---|---|
 | `charter.md` | the bot's standing instructions — what it owns, how it acts, what it never does |
-| `runbooks/` | page triage → investigate → escalate; Terraform change → propose → conductor applies; env var change requests; the weekly spend & commitment review; scaling proposals |
-| `knowledge/` | what to seed the bot's knowledge with, and `watch.md`: what proactive sweeps watch beyond the checklist |
+| `runbooks/` | typed **runbook** documents (frontmatter: title, when_to_use, prerequisites, steps, verification, rollback, owner): page triage → investigate → escalate; Terraform change → propose → conductor applies; env var change requests; the weekly spend & commitment review; scaling proposals |
+| `watch/` | typed **watch** documents (what, signal, threshold, why): what proactive sweeps watch beyond the checklist — one example to replace |
+| `collections/postmortems.yaml` | a **`postmortems` collection** (incident reviews: title, incident, severity, date, impact, root_cause, action_items) a bot or team uses with `collections: { postmortems: { from: … } }` |
 | `conductor-pack.yaml` | three disarmed triggers that route work into the bot: `page`, `chat_request`, `weekly` (spend review, then memory consolidation) |
 | `bot.example.yaml` | a starting `bots:` entry: verbs, autonomy tiers, spend cap, Terraform |
+
+**Seeding.** `seed_dir` copies the pack's typed documents (`runbooks/`, `watch/`)
+into a new memory repo; conductor copies only valid documents of a kind and
+reports anything else. Add your own `knowledge/` documents (frontmatter: title,
+applies_to, evidence, confidence) for what a new SRE needs on day one — an
+infra map, per-service notes, access (no secrets), escalation — or let the bot
+write them as it learns (`conductor bot kinds` shows every schema).
 
 It names no company or system. Run one pack instance per bot, and define as
 many bots as you want, cut any way that suits you (a team, an environment,
@@ -102,12 +110,12 @@ conductor bot approve platform-sre p12
 - **Scaling** (`runbooks/scaling-proposal.md`): a week of data, a sized change,
   a proposal.
 - **Consolidation** (`weekly`, second step): a worker distils the week's
-  episodes into `knowledge/` as reviewable commits.
+  log into typed `knowledge/` documents as reviewable commits.
 - **Proactive checks** (opt in with `proactive:` on the bot — commented out
   in `bot.example.yaml`): every few hours a read-only sweep works through the
   charter's "Proactive checks" (alerts, unacked incidents, error-rate shifts,
   spend jumps, expiring commitments, stuck deploys, capacity) and
-  `knowledge/watch.md`. The gate holds a sweep to observe-tier verbs — a write
+  the `watch/` documents. The gate holds a sweep to observe-tier verbs — a write
   becomes a proposal — and conductor tells you only about findings at
   `notify_at` or above (deduplicated against open cases); a quiet sweep is one
   ledger line. Budget and quiet hours are on the bot. To get findings in

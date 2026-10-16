@@ -1,3 +1,18 @@
+---
+title: Environment variable change requests
+when_to_use: Someone asks to change an environment variable (a feature flag, a timeout, a connection string).
+prerequisites:
+- the case shows the requester
+steps:
+- 'Check who asked: anyone but your operator runs on their trust — investigate and propose.'
+- Find where it lives (task definition, manifest, parameter store); never read or echo a secret.
+- 'Check the effect: what reads it, whether a restart is needed, what breaks if wrong.'
+- Propose the exact change (old → new, why, who asked, rollout and rollback).
+- After it is applied, confirm the service picked it up and close the case.
+verification: The service runs with the new value and its health is unchanged.
+rollback: Propose the old value back, through the same verb or Terraform change.
+owner: the bot's operator
+---
 # Environment variable change requests
 
 Someone asks to change an environment variable (a feature flag, a timeout, a

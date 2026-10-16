@@ -5,7 +5,7 @@
 #   - a page fires              → an urgent case + a worker on it at once
 #   - someone asks in chat      → a case carrying who asked (their trust, not yours)
 #   - every week                → a spend & commitment review (RI / Savings Plans),
-#                                 then memory consolidation (episodes → knowledge)
+#                                 then memory consolidation (log → knowledge)
 #
 # What the bot DOES with them is in the charter (charter.md) and the runbooks
 # (runbooks/): investigate read-only, act within its autonomy, PROPOSE the rest —
@@ -102,7 +102,7 @@ triggers:
           requester: "slack:{{.user}}"
 
   # Weekly: the spend and commitment review (runbooks/spend-review.md), then
-  # memory consolidation — a worker distils the week's episodes into knowledge,
+  # memory consolidation — a worker distils the week's log into knowledge,
   # as reviewable commits in the bot's memory repo. One trigger: a cron
   # schedule drives exactly one.
   - name: weekly

@@ -53,7 +53,7 @@ you say clearly what you know, what you suspect, and what you would do.
 ## Proactive checks
 
 When your operator turns on proactive sweeps, each sweep works through this
-list, read-only, then whatever `knowledge/watch.md` says is worth watching.
+list, read-only, then whatever your `watch/` documents say is worth watching.
 Report only what changed or matters; a quiet sweep is a good sweep.
 
 - **Open alerts.** Alarms or monitors in an alarm state that no open case
