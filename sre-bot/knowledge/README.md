@@ -1,7 +1,7 @@
 # Knowledge
 
-Seed this directory of your member's memory repo with what a new SRE would need
-on day one; the member keeps it current.
+Seed this directory of your bot's memory repo with what a new SRE would need
+on day one; the bot keeps it current.
 
 - `infra-map.md` — services, where they run, what they depend on, who owns them.
 - `services/<name>.md` — per service: dashboards, deploy process, known failure

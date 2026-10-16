@@ -1,80 +1,80 @@
-# sre-member — a distributable conductor pack.
+# sre-bot — a distributable conductor pack.
 #
-# A first-line SRE as a conductor MEMBER (conductor wiki: Members): the charter,
+# A first-line SRE as a conductor BOT (conductor wiki: Bots): the charter,
 # the runbooks it works from, and the triggers that route work into it —
 #   - a page fires              → an urgent case + a worker on it at once
 #   - someone asks in chat      → a case carrying who asked (their trust, not yours)
 #   - every week                → a spend & commitment review (RI / Savings Plans),
 #                                 then memory consolidation (episodes → knowledge)
 #
-# What the member DOES with them is in the charter (charter.md) and the runbooks
+# What the bot DOES with them is in the charter (charter.md) and the runbooks
 # (runbooks/): investigate read-only, act within its autonomy, PROPOSE the rest —
 # Terraform applies, env var changes, scaling changes, purchases — for you to
-# approve with a signed `conductor member approve`.
+# approve with a signed `conductor bot approve`.
 #
 # Define-behavior / bind-environment: the pack ships BEHAVIOR (disarmed triggers,
-# a charter template, runbook scaffolding). The member itself — its memory repo,
+# a charter template, runbook scaffolding). The bot itself — its memory repo,
 # its operators, its verbs on YOUR connectors, its autonomy tiers and spend cap —
-# is environment, so it is a `members:` entry you write (member.example.yaml is a
+# is environment, so it is a `bots:` entry you write (bot.example.yaml is a
 # starting point). Nothing here names a company or a system: one pack instance
-# per member, and as many members as you define.
+# per bot, and as many bots as you define.
 #
-# Install (config `packs:` block), for a member named platform-sre:
+# Install (config `packs:` block), for a bot named platform-sre:
 #   packs:
 #     platform-sre:
-#       source: github.com/NodeSpy/conductor-packs//sre-member
+#       source: github.com/NodeSpy/conductor-packs//sre-bot
 #       version: "~> 1.0"
 #       connectors: { pagerduty: pd, chat: slack, schedule: timer }
 #       settings:
-#         member: platform-sre
+#         bot: platform-sre
 #         review_schedule: sre-weekly        # a schedule on your cron connector
 #       triggers:
 #         "*": { enabled: true }
-#   members:
+#   bots:
 #     platform-sre:
 #       charter_file: .conductor/packs/platform-sre/charter.md   # the vendored charter
-#       …                                                    # see member.example.yaml
+#       …                                                    # see bot.example.yaml
 #   Then: `conductor init`, `conductor pack plan`, `conductor validate`.
 
 pack:
-  name: sre-member
+  name: sre-bot
   version: 1.0.0
-  description: A first-line SRE member — charter, runbooks, and the triggers that route pages, chat requests and weekly reviews into it. Proposes Terraform applies, env var and scaling changes, and RI / Savings Plans purchases for operator approval.
-  tags: [sre, oncall, members, pagerduty, aws, terraform]
+  description: A first-line SRE bot — charter, runbooks, and the triggers that route pages, chat requests and weekly reviews into it. Proposes Terraform applies, env var and scaling changes, and RI / Savings Plans purchases for operator approval.
+  tags: [sre, oncall, bots, pagerduty, aws, terraform]
   homepage: https://github.com/NodeSpy/conductor-packs
   license: Apache-2.0
   requires:
-    # The `member:` step and the members: section ship in the first conductor
-    # release that contains members (NodeSpy/conductor#172). That release is NOT
+    # The `bot:` step and the bots: section ship in the first conductor
+    # release that contains bots (NodeSpy/conductor#172). That release is NOT
     # TAGGED YET — the newest tag is v0.65.0, which does not have them, so the
     # earliest this can be is v0.66.0. Re-check this floor when #172 is released.
     conductor: ">=0.66.0"
     connectors:
       # The page trigger uses the pagerduty incident SOURCE, released since
-      # v1.0.0. (The member's own verbs — acknowledge / add_note / resolve — need
+      # v1.0.0. (The bot's own verbs — acknowledge / add_note / resolve — need
       # the pagerduty incident VERBS, which are not released yet; see the README.)
       pagerduty: ">=1.0.0"
-      # The chat trigger: an @-mention of your bot (the slack plugin's app_mention).
+      # The chat trigger: an @-mention of your Slack app (the slack plugin's app_mention).
       chat: ">=1.0.0"
       # Your cron connector (built in): the weekly review and consolidation fire
       # on its schedule named by settings.review_schedule.
       schedule: "*"
 
 settings:
-  member:          { type: string, default: sre, desc: "the members: entry these triggers route into" }
+  bot:          { type: string, default: sre, desc: "the bots: entry these triggers route into" }
   review_schedule: { type: string, default: sre-weekly, desc: "the schedule (on your cron connector) the weekly review fires on — give it to this trigger alone" }
 
 # Every trigger ships DISARMED. Arming one is the consent.
 triggers:
   # A page: an URGENT case, and a worker started on it immediately — it never
-  # waits behind a conversation you are having with the member. The alert text
-  # reaches the member as DATA (fenced), never as instructions.
+  # waits behind a conversation you are having with the bot. The alert text
+  # reaches the bot as DATA (fenced), never as instructions.
   - name: page
     on: pagerduty.incident
     filter: { event_types: [incident.triggered, incident.escalated] }   # override per instance with `on:`
     steps:
-      - member:
-          name: "${settings.member}"
+      - bot:
+          name: "${settings.bot}"
           title: "page: {{.title}}"
           text: |
             PagerDuty incident {{index . "pagerduty.id"}} (#{{index . "pagerduty.number"}}) on service {{index . "pagerduty.service"}}
@@ -83,33 +83,33 @@ triggers:
             Triage per runbooks/page-triage.md.
           urgent: true
 
-  # To route pages to a TEAM of members instead of one (its rules, its lead's
-  # triage or its fallback pick the member — still the original requester's
-  # request at that member's gate), write the trigger in your own config with
-  # `member: { team: <team>, … }` — see the commented team in
-  # member.example.yaml. This pack's triggers name settings.member.
+  # To route pages to a TEAM of bots instead of one (its rules, its lead's
+  # triage or its fallback pick the bot — still the original requester's
+  # request at that bot's gate), write the trigger in your own config with
+  # `bot: { team: <team>, … }` — see the commented team in
+  # bot.example.yaml. This pack's triggers name settings.bot.
   #
-  # A chat request: a case whose REQUESTER is the person who asked. The member's
+  # A chat request: a case whose REQUESTER is the person who asked. The bot's
   # gate then runs everything for that case on that person's trust — a third
   # party's request can only ever become a proposal you approve.
   - name: chat_request
     on: chat.app_mention
     steps:
-      - member:
-          name: "${settings.member}"
+      - bot:
+          name: "${settings.bot}"
           title: "chat request from {{.user}}"
           text: "{{.text}}"
           requester: "slack:{{.user}}"
 
   # Weekly: the spend and commitment review (runbooks/spend-review.md), then
   # memory consolidation — a worker distils the week's episodes into knowledge,
-  # as reviewable commits in the member's memory repo. One trigger: a cron
+  # as reviewable commits in the bot's memory repo. One trigger: a cron
   # schedule drives exactly one.
   - name: weekly
     on: "schedule.${settings.review_schedule}"
     steps:
-      - member:
-          name: "${settings.member}"
+      - bot:
+          name: "${settings.bot}"
           title: "weekly spend & commitment review"
           text: "Weekly review: last week's spend against reservations and Savings Plans, utilization and coverage, and whether a purchase is warranted. Follow runbooks/spend-review.md; propose any purchase within the spend cap."
-      - member: { name: "${settings.member}", action: consolidate }
+      - bot: { name: "${settings.bot}", action: consolidate }

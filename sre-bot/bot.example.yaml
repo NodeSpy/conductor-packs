@@ -1,8 +1,8 @@
-# A members: entry for an SRE member using this pack — copy it into your config
+# A bots: entry for an SRE bot using this pack — copy it into your config
 # and bind it to YOUR environment. Names here are placeholders ("platform-sre",
 # connector names "pd", "aws", "tf-plan", "tf-apply", "slack"): use your own.
 #
-# Requires the conductor release with members (not tagged yet — see README),
+# Requires the conductor release with bots (not tagged yet — see README),
 # operators: with your SSH public key, and a `use: cli` runtime for workers.
 
 operators:
@@ -10,7 +10,7 @@ operators:
     ssh_key: "ssh-ed25519 AAAA… you@laptop"     # approvals are SSH-signed with this key
     aliases: ["slack:U0000000"]                   # your chat id, so your chat requests count as yours
 
-members:
+bots:
   platform-sre:
     description: "first-line SRE for the platform services"
     charter_file: .conductor/packs/platform-sre/charter.md   # the vendored pack's charter
@@ -33,7 +33,7 @@ members:
         - pd.escalate
         - aws.*                                    # the aws-cost connector
         - slack.post
-        # - git.push                               # once released: how the member pushes its Terraform branch
+        # - git.push                               # once released: how the bot pushes its Terraform branch
         # No terraform verbs: conductor plans and applies (terraform: below).
         # A verb that could reach the apply connector is a config error.
     autonomy:
@@ -49,7 +49,7 @@ members:
         reversible: [pd.acknowledge, pd.add_note]
         propose:    [pd.resolve, pd.escalate, slack.post, terraform.apply]
         commit_money: [aws.purchase_*]
-      promote: [pd.acknowledge, pd.add_note]       # takes effect once member sessions are sandboxed
+      promote: [pd.acknowledge, pd.add_note]       # takes effect once bot sessions are sandboxed
       amounts:
         aws.purchase_savings_plan: total_commitment_usd
         aws.purchase_reserved_instances: total_cost_usd
@@ -66,7 +66,7 @@ members:
     #   budget: { max_runs_per_day: 6, max_cost_per_day: 2.00 }
     #   checklist: { section: "Proactive checks" }
     #   notify_at: high
-    terraform:                                     # conductor plans and applies; the member proposes commits
+    terraform:                                     # conductor plans and applies; the bot proposes commits
       plan_connector: tf-plan                      # a `use: terraform` connector whose env is a READ role
       apply_connector: tf-apply                    # its env is the WRITE role; only conductor uses it
       repos: { infra: git@git.example.com:platform/infra.git }
@@ -75,25 +75,30 @@ members:
 # ---------------------------------------------------------------------------
 # A TEAM — OFF until you uncomment it. Teams are yours to cut (by system,
 # function, environment); conductor has no org. The team's settings are
-# CEILINGS its members inherit and can only narrow (a member past its team's is
-# a load error naming both values). Teammates may `conductor member ask` each
-# other (data only); the team shares a knowledge repo members PROPOSE
-# promotions into; and a trigger can route to the team instead of one member.
+# CEILINGS its bots inherit and can only narrow (a bot past its team's is
+# a load error naming both values). Teammates may `conductor bot ask` each
+# other (data only) and `conductor bot delegate` work to each other (worked
+# under the recipient's own authority, at the original request's trust); the
+# team shares a knowledge repo bots PROPOSE promotions into (and you can edit
+# directly: `conductor bot knowledge …`); and a trigger can route to the team
+# instead of one bot.
 #
-# Here: a lead that triages, and two members that work the cases. Each member
+# Here: a lead that triages, and two bots that work the cases. Each bot
 # block is the platform-sre entry above with its own name, description, scope
-# and memory — copy what you need. The members inherit what they leave unset.
+# and memory — copy what you need. The bots inherit what they leave unset.
 #
 # teams:
 #   platform:
 #     description: "SRE for the platform services"
-#     operators: [you]                         # who approves for the team (members' operators fit inside)
+#     # folder: …                              # display only (`conductor bot ls`), your choice; no behavior
+#     # delegation: { max_depth: 3 }           # most hops a delegation chain may take (default 3)
+#     operators: [you]                         # who approves for the team (bots' operators fit inside)
 #     autonomy:
-#       ceiling: reversible                    # or observe: no member promotes anything
-#       shadow: true                           # every member calibrates first
+#       ceiling: reversible                    # or observe: no bot promotes anything
+#       shadow: true                           # every bot calibrates first
 #     budget:
 #       spend_cap: { per_action: 2000, per_period: 5000, period: 720h, currency: USD }
-#       proactive: { max_runs_per_day: 8, max_cost_per_day: 3.00 }   # one pool for all members' sweeps
+#       proactive: { max_runs_per_day: 8, max_cost_per_day: 3.00 }   # one pool for all bots' sweeps
 #     isolation: { handoff_workers: false }    # cli workers only; sandbox: required once the agent sandbox is on
 #     knowledge: { promotion: proposal }       # shared runbooks/knowledge; an operator approves each promotion
 #     routing:
@@ -108,7 +113,7 @@ members:
 #       fallback: platform-sre                 # no rule, no assignment within timeout: → here
 #       # timeout: 10m
 #
-# members:
+# bots:
 #   platform-lead:
 #     team: platform
 #     description: "triage lead for the platform team: routes work, works little itself"
@@ -134,9 +139,9 @@ members:
 #       spend_cap: { per_action: 500, per_period: 1000, period: 720h }   # narrower than the team: fine
 #
 # Route to the team from a trigger in YOUR config (the pack's own triggers name
-# one member — settings.member):
+# one bot — settings.bot):
 #
 # triggers:
 #   - on: pd.incident
 #     steps:
-#       - member: { team: platform, title: "page: {{.title}}", text: "{{.url}}", urgent: true }
+#       - bot: { team: platform, title: "page: {{.title}}", text: "{{.url}}", urgent: true }

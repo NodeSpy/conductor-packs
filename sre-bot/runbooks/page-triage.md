@@ -16,10 +16,10 @@ it. The worker follows this; the home session tracks it.
 4. **Mitigate within autonomy.** A rollback, a restart, a scale-up — only if
    your tiers allow it; otherwise propose the exact action with the evidence.
 5. **Note as you go.** `pagerduty.add_note` (if allowed) and
-   `conductor member case note <case>` — short, timestamped facts.
+   `conductor bot case note <case>` — short, timestamped facts.
 6. **Escalate** per your charter's escalation policy: severity, time without
    mitigation, or low confidence. Escalation carries the investigation so far:
    what you know, what you ruled out, what you would try next.
 7. **Close out.** When resolved, report via `step.done` with the cause, what
    was done, and follow-ups. If you learned something about the system, write
-   it to `knowledge/` with `conductor member remember`.
+   it to `knowledge/` with `conductor bot remember`.
