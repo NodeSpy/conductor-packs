@@ -18,7 +18,7 @@ is a widening you grant yourself.
 | `collections/postmortems.yaml` | a **`postmortems` collection** (incident reviews) the template's bots use |
 | `bot.example.yaml` | a commented config: the pack instance, a bot from the template, its grants and the parts that stay yours |
 
-**A template only requests.** It cannot set your operators, team, folder,
+**A template only requests.** It cannot set your operators, team,
 connector bindings, secrets, autonomy, sandbox or egress. A newer version of
 this pack never overwrites a bot's memory: charter and runbook changes arrive
 as one proposal — a diff against the memory as the bot evolved it — that you

@@ -22,7 +22,7 @@
 #   conductor init
 #   conductor bot new platform-sre --from sre/sre        # --write when the diff looks right
 #
-# Your operators, team, folder, connector bindings, autonomy (promotion,
+# Your operators, team, connector bindings, autonomy (promotion,
 # spend cap), Terraform repos and roles stay yours: a template cannot set
 # them. A newer version of this pack never overwrites the bot's memory — its
 # charter and runbook changes arrive as a proposal for you to approve.
