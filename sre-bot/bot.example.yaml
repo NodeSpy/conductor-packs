@@ -1,0 +1,88 @@
+# An SRE bot from this pack's template — copy what you need into your config
+# and bind it to YOUR environment. Names here are placeholders ("platform-sre",
+# connector names "pd", "aws", "slack", "timer", "tf-plan", "tf-apply"): use your own.
+#
+# Or let conductor write the bot for you, on a copy of your config, shown as a diff:
+#   conductor init
+#   conductor bot new platform-sre --from sre/sre          # add --write when the diff looks right
+#
+# Requires the conductor release with bots and bot templates (not tagged yet —
+# see README), operators: with your SSH public key, and a `use: cli` runtime
+# for workers.
+
+operators:
+  you:
+    ssh_key: "ssh-ed25519 AAAA… you@laptop"     # approvals are SSH-signed with this key
+    aliases: ["slack:U0000000"]                   # your chat id, so your chat requests count as yours
+
+packs:
+  sre: { use: conductor-packs/sre-bot, version: "~> 2.0" }   # one instance serves every bot from the template
+
+bots:
+  platform-sre:
+    use: sre/sre                                   # the template: charter, seed memory, collections, requests
+    connectors: { pagerduty: pd, aws: aws, chat: slack, schedule: timer }   # bind its inputs
+    # What you allow of what it requests. `conductor bot new` writes the
+    # read-only ones; each line above observe is a WIDENING you add (validate
+    # and the diff name it). A tier looser than the template allows is cut to
+    # the template's maximum.
+    grant:
+      pagerduty.get_incident: observe
+      pagerduty.list_incidents: observe
+      aws.cost_*: observe
+      aws.reservation_*: observe
+      aws.savings_plans*: observe
+      aws.reserved_*: observe
+      # pagerduty.acknowledge: reversible      # widenings — grant them once its practice-mode record earns it
+      # pagerduty.add_note: reversible
+      # pagerduty.resolve: propose
+      # aws.purchase_savings_plan: commit_money
+    escalation: |
+      Escalate to the operator when: a sev1 is not mitigated within 15 minutes;
+      any data loss is suspected; you are below 70% confident in the cause.
+    home:
+      rotate: { max_age: 24h, max_turns: 100 }
+    worker:
+      runtime: claude-cli                          # a `use: cli` runtime
+      timeout: 2h
+    autonomy:
+      # shadow: false                              # practice mode is the default; turning it off is a widening
+      # promote: [pd.acknowledge]                  # takes effect once bot sessions are sandboxed
+      spend_cap: { per_action: 2000, per_period: 5000, period: 720h, currency: USD }   # needed before any commit_money grant
+      approval_ttl: 24h
+    # proactive: {}                                # the template's suggested checks (every 4h, quiet 22:00-07:00, notify at high)
+    # proactive: { budget: { max_runs_per_day: 6 } }   # …with a budget, which is always yours
+    terraform:                                     # conductor plans and applies; the bot proposes commits
+      plan_connector: tf-plan                      # a `use: terraform` connector whose env is a READ role
+      apply_connector: tf-apply                    # its env is the WRITE role; only conductor uses it
+      repos: { infra: git@git.example.com:platform/infra.git }
+      # allow_destroy: []                          # stateful destroys/replaces are refused unless named here
+
+# Two more bots from the same template — one pack instance, one version for all
+# three; each its own memory, ledger, verbs and grants:
+#
+#   platform-data:
+#     use: sre/sre
+#     description: "SRE for the platform's data stores"   # yours wins over the template's
+#     scope: "Databases, caches, queues, backups."
+#     grant: { pagerduty.get_incident: observe, pagerduty.list_incidents: observe }
+#   billing-sre:
+#     use: sre/sre
+#     grant: { aws.cost_*: observe, aws.reservation_*: observe }
+
+# A TEAM — OFF until you uncomment it. Its settings are CEILINGS its bots
+# inherit and can only narrow; they apply to template bots like any other.
+#
+# teams:
+#   platform:
+#     operators: [you]
+#     autonomy: { ceiling: reversible, shadow: true }
+#     budget: { spend_cap: { per_action: 2000, per_period: 5000, period: 720h } }
+#     knowledge: { promotion: proposal }
+#     routing:
+#       rules:
+#         - { name: data-stores, match: { source: "pd.*", "pagerduty.service": "db-*" }, to: platform-data }
+#       fallback: platform-sre
+# bots:
+#   platform-sre:  { team: platform, … }   # a team bot is filed under its team, not the pack
+#   platform-data: { team: platform, … }
