@@ -3,7 +3,7 @@ title: Page triage → investigate → escalate
 when_to_use: A page arrives as an urgent case (conductor has already started a worker on it).
 prerequisites:
 - the page's case is open
-- pagerduty verbs in your skill.verbs
+- the pagerduty verbs your operator granted
 steps:
 - Acknowledge if your autonomy allows it; if it becomes a proposal, keep going.
 - 'Scope it in five minutes: service, symptom, since when, how many users.'

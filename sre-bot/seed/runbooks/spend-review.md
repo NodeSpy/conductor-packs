@@ -2,7 +2,7 @@
 title: Weekly spend & commitment review
 when_to_use: The weekly review trigger fires.
 prerequisites:
-- the aws-cost verbs in your skill.verbs
+- the aws-cost verbs your operator granted
 steps:
 - 'Spend: last 7 and 30 days by service, and the month''s forecast; note moves over 20%.'
 - 'Commitments: reservation and savings-plan utilization and coverage.'
