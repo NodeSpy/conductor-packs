@@ -4,7 +4,8 @@
 # so they don't sit waiting on a human —
 #   - failing checks   → find the cause and push a fix (+ auto re-run on a flake)
 #   - merge conflict    → resolve against the base and push
-#   - changes requested → address the feedback, push, and re-request review
+#   - changes requested → address all feedback still waiting on you, push,
+#                          resolve the threads it addressed, re-request review
 #   - new comment       → make the change or answer the question
 # Pair it with the ci-unsticker pack (hung-CI recovery) and pr-review-team
 # (multi-lens review + hand-off) for the full autopilot.
@@ -18,7 +19,7 @@
 #   packs:
 #     autopilot:
 #       source: github.com/NodeSpy/conductor-packs//pr-autopilot
-#       version: "~> 1.0"
+#       version: "~> 1.4"
 #       # heavy fleet resolves against whatever your runtime offers; pin if you like:
 #       #   models: { heavy: ["claude-opus-*"] }
 #       triggers:
@@ -59,7 +60,7 @@
 
 pack:
   name: pr-autopilot
-  version: 1.3.0
+  version: 1.4.0
   description: Autopilot for routine PR events — fix red CI, resolve conflicts, address requested changes, answer comments. One agent per event, scoped to your repos.
   tags: [github, ci, automation, agents, maintenance]
   homepage: https://github.com/NodeSpy/conductor-packs
@@ -77,7 +78,11 @@ pack:
     # {{.me.login}}, and `if: true` reading as true. Older conductors refuse
     # the hooks at load, so a box on an older release keeps v1.1.x.
     conductor: ">=0.60.0"
-    connectors: [github]
+    # github 2.1.0: changes_requested carries every review still waiting on
+    # you (review_comments with ids, outstanding_reviews, feedback_cursor),
+    # github.resolve_threads, and rerequest_review's all_outstanding. An
+    # older plugin refuses this pack's steps at load.
+    connectors: { github: ">=2.1.0" }
 
 # The worker model as a fleet — conductor resolves it against your runtime's
 # roster best-first, so the pack ships no provider-specific ids. Override with
@@ -106,6 +111,7 @@ settings:
   status_failed:    { type: string, default: "gave up: {{.run.reason}}", desc: "failure description (on the PR's current head)" }
   status_stopped:   { type: string, default: "stopped — {{.run.reason}}", desc: "success description when the PR merged/closed under the run (on the commit the run started on)" }
   stop_unreact:     { type: boolean, default: true, desc: "when the PR merged/closed under the run, take the 👀 back off the review/comment" }
+  resolve_threads:  { type: boolean, default: true, desc: "after a changes_requested run, resolve the review threads its agent reports its pushed change addressed (never ones it only replied to or disagreed with, nor ones with newer feedback)" }
 
 x-templates:
   # One worker shape for every behavior: a strong model in its own worktree,
@@ -220,14 +226,33 @@ triggers:
     steps:
       - id: address
         <<: *fixer
-        guidance: "A reviewer requested changes. Address the feedback concretely and push; don't argue in code. If something can't be done, that's a reason to leave a brief reply, not to guess."
+        guidance: "Reviewers left feedback on this PR. review_comments and outstanding_reviews hold ALL of it that is still waiting on you, not only the review that fired this run; an earlier run may already have handled some, so check the PR's current code before changing anything. Address the feedback concretely and push; don't argue in code. If something can't be done, that's a reason to leave a brief reply, not to guess. When you finish, report addressed_comments: the id of every review comment (review_comments[].id) whose point your pushed change fully addresses. Leave out any you only replied to, disagreed with, or did not change code for: those threads stay open for the reviewer."
+        # How the agent reports what it addressed: its structured result
+        # (delivered with step.done, or as its final reply where step.done
+        # is unavailable). Every field is optional, so a run with nothing
+        # to report still validates.
+        output_schema:
+          type: object
+          properties:
+            addressed_comments: { type: array, items: { type: integer }, description: "ids of review comments your pushed change fully addresses" }
+            summary: { type: string, description: "what you changed, in a sentence or two" }
+      - id: resolve
+        # Resolve exactly the threads the agent reported addressed, and only
+        # those still without newer feedback from someone else (seen_through:
+        # the latest submission this run was given). Off with
+        # settings.resolve_threads: false.
+        if: "${settings.resolve_threads}"
+        uses: github.resolve_threads
+        options: { repo: "{{.repo}}", pr: "{{.pr}}", comments: "{{.address.addressed_comments}}", seen_through: "{{.feedback_cursor}}" }
       - id: rerequest
-        # Ping the reviewer back once the changes are pushed. only_outstanding
+        # Ping the reviewers back once the changes are pushed. only_outstanding
         # (the default, spelled out) pings them only while their latest review
         # still requests changes on an older commit — not if they've approved
-        # since, nothing new landed, or the PR closed.
+        # since, nothing new landed, or the PR closed. all_outstanding adds
+        # every OTHER reviewer in that state: the event's reviewer may only
+        # have commented while someone else's changes-request blocks the merge.
         uses: github.rerequest_review
-        options: { repo: "{{.repo}}", pr: "{{.pr}}", reviewers: ["{{.author}}"], only_outstanding: true }
+        options: { repo: "{{.repo}}", pr: "{{.pr}}", reviewers: ["{{.author}}"], only_outstanding: true, all_outstanding: true }
 
   - name: on_new_comment
     on: github.new_comment
