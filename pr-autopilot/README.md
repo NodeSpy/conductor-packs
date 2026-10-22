@@ -7,7 +7,7 @@ to the repos you arm:
 |---|---|---|
 | `on_failing_checks` | CI concluded failing | finds why and pushes a fix (re-runs once first: most red CI is a flake) |
 | `on_merge_conflict` | the PR conflicts with its base | resolves the conflict and pushes |
-| `on_changes_requested` | a review requested changes (or sweep: unresolved threads) | addresses the feedback, pushes, re-requests the reviewer |
+| `on_changes_requested` | a review requested changes (or sweep: feedback still waiting on you) | addresses ALL review feedback still waiting on you, pushes, resolves the threads its change addressed, re-requests every reviewer with changes outstanding |
 | `on_new_comment` | a comment, or a review no changes-requested trigger takes | makes the change or answers the question |
 
 Install and arm it in your config's `packs:` block. The example is in the
@@ -81,10 +81,35 @@ packs:
 | `status_failed` | `gave up: {{.run.reason}}` |
 | `status_stopped` | `stopped — {{.run.reason}}` |
 | `stop_unreact` | `true`: on a stop, remove the 👀 |
+| `resolve_threads` | `true`: after a changes-requested run, resolve the threads its agent reports addressed (see below) |
 
 Contexts and descriptions are templates rendered per run. `{{.run.reason}}`
 is a short public-safe phrase ("the agent couldn't be started", "timed out",
 "the change was never pushed", …), never the error text.
+
+### Changes requested: what a run covers, resolves, and re-requests
+
+A `changes_requested` run is handed every piece of review feedback on the PR
+that is still waiting on you, not only the review that fired it: unresolved
+threads whose latest comments aren't yours, and changes-requests made on the
+current head. Two reviews a moment apart, or one that lands while a run is
+working, end up in one run (the github connector docs define "waiting on you").
+
+The agent reports the comments its pushed change fully addresses
+(`addressed_comments`, part of its result). The `resolve` step then resolves
+exactly those threads, and leaves a thread open when:
+
+- the agent only replied, disagreed, or changed no code for it (not reported);
+- someone other than you commented in it after the feedback the run was given.
+
+`resolve_threads: false` turns the step off; threads are then left for you or
+the reviewer to resolve.
+
+The `rerequest` step pings back the event's reviewer and every other reviewer
+whose latest review still requests changes on an older commit, so a run fired
+by one reviewer's comment doesn't leave another's changes-request blocking the
+merge. Bots, the PR's author, approvers and reviewers already requested are
+never pinged.
 
 ### The same hooks on your own triggers
 
@@ -124,6 +149,17 @@ the run. Conductor never reads a status it posted back as CI, so a `failure`
 row can't trigger the next fix.
 
 ## Upgrading
+
+v1.4.0 needs the **github connector plugin ≥ 2.1.0** (`requires.connectors`):
+the release whose `changes_requested` carries all waiting feedback
+(`review_comments` ids, `outstanding_reviews`, `feedback_cursor`) and that adds
+`github.resolve_threads` and `rerequest_review`'s `all_outstanding`. Update the
+plugin first, then the pack; an older plugin refuses v1.4.0's steps at
+`conductor validate`. Conductor's own requirement is unchanged (≥ 0.60.0).
+
+With plugin 2.1.0, the first sweep fires `on_changes_requested` once on each of
+your PRs that has feedback waiting on you by the rules above (its cursor starts
+fresh), including threads fixed in code but never replied to or resolved.
 
 v1.3.0 needs **conductor ≥ 0.60.0** (`requires.conductor`), the release that
 adds run facts, the fail-hook guarantees, `at: stop`, `github.react` (with
