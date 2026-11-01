@@ -1,78 +1,38 @@
 # pr-review-team
 
 A distributable [conductor](https://github.com/NodeSpy/conductor) **pack**:
-multi-lens pull-request review with an optional human hand-off.
+multi-lens pull-request review with an optional human hand-off, and a
+calibration loop that teaches the reviewer from what happened after its
+reviews.
 
 On a review request it runs a panel of lens reviewers in parallel
 (Architecture, Complexity, Performance, Refactoring, Security, Test quality),
 refute-verifies every finding to drop the ones that are positively wrong,
 reconciles the survivors deterministically into a single review (one comment per
 file:line, blocking-first), then **either auto-posts** the review or **hands the
-draft to a human** to approve, edit, or discard.
+draft to a human** to approve, edit, or discard. With `auto: true` it always
+posts.
 
 ```
 review_requested ─▶ assess ─▶ review-team (always) ─▶ post      (auto)
-                                                    └▶ hand-off  (manual)
+                                                    └▶ hand-off  (manual; never with auto: true)
 ```
 
 The multi-lens review always runs, so the manual branch has a real drafted
 review to hand off — the human edits/approves it instead of reviewing from
 scratch.
 
-## 2.10.0 — whole-PR reviews
+## Install
 
-Earlier versions inlined a single, 60 KB-capped unified diff into every
-prompt — a lens reviewer, `verify`, and `assess` all read the same truncated
-text. 2.10.0 (conductor issue #154 §6) replaces that with real, uncapped
-access to the PR, sized to what each step actually needs:
-
-- **The lens reviewers get a real PR checkout.** `review-team/review` now
-  runs with `checkout: checkout-pr` (conductor's own PR worktree) instead of
-  `checkout: none` plus an inlined diff. The prompt carries the PR metadata
-  and the **complete** file list (every changed file's status and line
-  counts, from `github.pr_files` with `all: true` — no 300-file diff cap, no
-  60 KB text cap) and tells the reviewer the full change is `git diff
-  origin/<base>...HEAD` in its own checkout, and that it may read any file
-  for context. The step carries `output_schema`, which makes it a review
-  step: in the jail its `gh` and `git` are read-only (no push, no gh writes),
-  and it is granted no write verbs.
-- **`verify` judges each finding against bounded, per-finding context**
-  instead of the whole PR's diff: the flagged file's own patch (looked up
-  from `github.pr_files`) and a window of that file **at the PR head**,
-  centered on the flagged line (±30 lines, hard-capped at 8000 bytes). This
-  is bounded per finding regardless of the PR's overall size. conductor's
-  template layer has no function to slice a file by line number (see
-  `internal/flow/template.go`), so the window is computed in the pack's own
-  `run: js` step (`windows`) — the same mechanism the old diff cap already
-  used — rather than inventing a new template function.
-- **`assess` sees every changed file** (path, status, additions/deletions)
-  plus as many file patches as fit a 50 KB budget, chosen in `pr_files`'
-  own deterministic order; the file list itself is never truncated, only the
-  patches bundled alongside it.
-- `review-team`'s public `diff:` output (the old capped-diff artifact) is
-  **removed** — nothing inside the pack renders a capped copy of the diff
-  anymore. A caller that wants the raw diff should call `github.pr_diff`
-  itself.
-- Bumped `requires.conductor` to `>=0.57.0`, the release that shipped the
-  agent workspace jail (#154) and `github.pr_files[].patch`.
-
-One tradeoff worth knowing: each lens reviewer now provisions its own PR
-worktree, so a review with the default six lenses does six parallel
-checkouts instead of one diff fetch. That is the cost of giving every lens
-its own uncapped, read-only view of the tree.
-
-## Install (drop-in)
-
-Bind your github connector and arm the trigger — that's it. The pack brings its
-own review-team/assess/hand-off steps, so you don't define any agents:
+Bind your github connector and arm the trigger. The pack brings its own
+review-team/assess/hand-off steps, so you don't define any agents:
 
 ```yaml
 packs:
   review:
     source: github.com/NodeSpy/conductor-packs//pr-review-team   # or a local path
-    version: "=2.0.0"                              # exact pin; a bare "2.0.0" floats to the newest >=2.0.0 tag
-    preset: claude                                 # or codex; omit for your default runtime
-    connectors: { github: gh }                    # bind the pack's github -> your connector
+    version: "~> 3.0"
+    # settings: { auto: true }                   # never hand off; always post
     triggers:
       on_review_request:
         enabled: true                              # arm it
@@ -83,72 +43,274 @@ Then:
 
 ```
 conductor init            # fetch + lock + vendor the pack
-conductor pack plan       # preview what it adds (agents, skill grants, armed triggers)
+conductor pack plan       # preview what it adds (agents, code steps, armed triggers)
 conductor validate
 ```
 
-The only thing you *must* bind is the `github` connector — it carries your
-credentials, so the pack can't ship it.
+The github connector auto-binds when it is your only one; with several, bind
+it: `connectors: { github: <your-connector> }`. The pack carries no
+connectors and no secrets — posting uses your connector's own write identity.
 
 ## What it needs (`requires:`)
 
-- **`conductor: >=0.57.0`** — the release with the agent workspace jail
-  (#154) and `github.pr_files[].patch`, which the lens
-  reviewers, `verify`, and `assess` all rely on (see "2.10.0 — whole-PR
-  reviews" above). It supersedes the older floors this pack also needs:
-  0.54.0 for `decide:` steps (`assess` and `verify`), and 0.33.0 for the
-  reactive hand-off surface the handoff step uses.
-- **A `github` connector**, bound in the `packs:` block. That's the only bind.
-- The reviewer / assessor / hand-off behavior ships as steps with working
-  defaults (see Tuning). Override one by qualified reference — `steps: {
-  review-team/review: { model: my-fleet } }` — only if you want to change it.
+- **`conductor: >=0.69.0`** — memory scope keys with `${repo}` inside them
+  (`standard:${repo}`) and a step's `memory: { extra_scopes: [...] }`, which
+  the lens panel's per-repo layering uses. It covers the older floors too:
+  0.57.0 for whole-PR review (the agent workspace jail and
+  `github.pr_files[].patch`), 0.54.0 for `decide:` steps, 0.33.0 for the
+  reactive hand-off.
+- **A `github` connector.** The only bind.
+- **`memory`** — conductor's built-in memory (declared, binds to itself). The
+  review works without a top-level `memory:` section — it then reads no
+  memory — and the calibration triggers stop with a message asking for one.
+
+## Settings
+
+Every setting is optional. Set them under `packs.<instance>.settings`.
+
+| Setting | Default | What it does |
+|---|---|---|
+| `auto` | `false` | `true`: never hand off. Every review posts with the team's verdict (`APPROVE` or `REQUEST_CHANGES`); `assess` doesn't run; emphasis entries only sharpen the review. `false`: `assess` may route a PR to a human hand-off, and a PR matching an emphasis entry leans to that hand-off. |
+| `state_dir` | `""` | conductor's state directory, for the calibration triggers. Empty: `$XDG_STATE_HOME/conductor`, else `~/.local/state/conductor`. Set it if your daemon runs with another state directory — code steps don't inherit `XDG_STATE_HOME`. |
+| `audit_log` | `""` | The audit log calibration reads reviews from. Empty: `<state_dir>/audit.jsonl` (its rotated `.1` is read too). Set it if your config moves `store.audit_log`. |
+| `git_base` | `https://github.com` | Where calibration clones reviewed repos from (`<git_base>/<owner>/<repo>.git`). https clones authenticate through the `gh` CLI's login. |
+| `calibration_window_days` | `14` | How long after a reviewed PR merges a later commit that changes its lines counts as a follow-up. |
+| `calibration_bootstrap_days` | `30` | How far back the first calibration run looks. |
+| `calibration_unmerged_days` | `30` | Stop waiting for a reviewed PR to merge after this many days. |
+| `calibration_discard_days` | `7` | A hand-off draft nobody posted within this many days counts as discarded. |
+| `calibration_min_lines` | `3` | A later commit is a follow-up only if it changes or removes at least this many lines the reviewed PR added. |
+| `calibration_team_pages` | `15` | Pages (100 comments each) of teammates' review comments read per repo per calibration run. |
+| `backfill_max_pages` | `300` | Pages of review comments read per repo by `review-backfill`. |
+| `backfill_min_chars` | `40` | `review-backfill` ignores comments shorter than this. |
+| `backfill_reviewer_since` | `""` | `review-backfill`: your own comments from this date (`YYYY-MM-DD`) on may have been posted by this pack under your account, so they aren't counted as yours. Empty: the date of the first review this pack posted, from the audit log. |
+
+Settings are substituted as text, so `auto: true` and `auto: "true"` are the
+same.
+
+## Auto mode
+
+`auto: false` (the default) is the 2.x behavior: `assess` decides whether a
+PR may post itself or needs a human, and a PR with real comments that needs a
+human gets the hand-off. A clean review (no comments) posts either way.
+
+`auto: true` skips `assess` and the hand-off entirely. The gate always posts,
+and the verdict the team reconciled stands — an `APPROVE` included. Use it
+where nobody is watching for hand-offs, or once calibration has earned the
+reviewer your trust.
+
+## Memory: how the reviewer learns
+
+The lens reviewers read conductor's shared memory, layered per repo. Each
+review recalls, newest first and up to 100 entries across all of them:
+
+| Scope | What lives there |
+|---|---|
+| `global` (the shared set) | The reviewer-wide standard — rules that apply in every repo. |
+| `<owner/repo>` | Facts about this repo the diff can't show: how it is built, deployed, operated, used. |
+| `standard:<owner/repo>` | This repo's additions to the review standard. |
+| `emphasis:<owner/repo>` | "Look hard at X" rules: kinds of change in this repo that past reviews got wrong. |
+
+Entries written by calibration are tagged with their layer (`standard`,
+`emphasis`, `fact`), and the lens prompt explains the tags: `standard` notes
+weigh like the repo's own CLAUDE.md/AGENTS.md/CONTRIBUTING, `emphasis` notes
+mark areas to look at hard, everything else is context.
+
+`emphasis:<repo>` also feeds `assess`: with `auto: false`, a PR that matches
+an emphasis rule leans to the hand-off. With `auto: true` the rules only add
+review emphasis.
+
+You can write entries by hand too — with the `dir:` backend each one is a
+Markdown file in your memory directory, and the `scope:` line picks its
+layer. To change how many entries a review reads, override the step:
+`steps: { review-team/review: { memory: { limit: 40, extra_scopes: ["standard:${repo}", "emphasis:${repo}"] } } }`.
+
+## Calibration
+
+Two triggers turn what happened after past reviews into memory entries. Both
+ship **disarmed**, and their script steps ship **confined**: a pack's code
+steps run in a jail with no network and no view of conductor's state, and
+these need both. Arming them is your call.
+
+### review-calibration
+
+Reads what is new since its last run:
+
+- **reviews this pack posted** — from the audit log, so the repos it covers
+  are exactly the repos it reviewed; nothing is configured per repo;
+- **follow-up commits** — commits that changed or removed lines a reviewed PR
+  added, within `calibration_window_days` of its merge, read from a partial
+  clone it keeps under `<state_dir>/pr-review-team/clones/`;
+- **hand-off outcomes** — each draft it handed to a human compared with what
+  was actually posted: as-is, edited (dropped / added / reworded comments, a
+  changed verdict), or discarded;
+- **teammates' review comments** on those repos (bots, replies, and the
+  reviewer's own account — from `gh api user` — excluded).
+
+An agent reads all of that inline — no network, no files, no memory access —
+and proposes entries, each with a `kind` (`fact`, `standard`, `emphasis`,
+`global`, or `none` for a candidate it dropped), a repo, and the PRs it rests
+on. A deterministic step then checks every proposal before anything is
+written:
+
+- the scope comes from the kind and repo — `fact` → `<repo>`, `standard` →
+  `standard:<repo>`, `emphasis` → `emphasis:<repo>`, `global` → the shared
+  set — never from the agent;
+- the repo must be one this run collected evidence for, and the evidence must
+  cite PRs in this run's repos (a per-repo entry must cite its own repo);
+- a proposal may replace an existing entry only in the scope it writes.
+
+Anything else is rejected and logged. The pack's own `write` step makes the
+writes (`ctx.memory.remember`); the run's section is appended to
+`<state_dir>/pr-review-team/calibration-log.md`. The run's position only
+advances once the writes land, so a failed run re-reads the same window.
+
+### review-backfill
+
+A one-time seed from a window of past human review comments on repos you
+name: one agent per month extracts what reviewers look out for, one agent
+merges the patterns into entries, and the same checked write path writes
+them.
+
+```
+conductor run review/review-backfill --input repos=your-org/app,your-org/api --input days=365
+```
+
+### Arming calibration
+
+```yaml
+packs:
+  review:
+    # …
+    steps:
+      # The script steps need the network (gh, git) and the state directory.
+      review-calibration/collect: { trust: full }
+      review-calibration/record:  { trust: full }
+      review-backfill/collect:    { trust: full }   # only if you use backfill
+      review-backfill/record:     { trust: full }
+    triggers:
+      review-calibration: { enabled: true }
+      review-backfill:    { enabled: true }
+```
+
+The script steps call the `gh` CLI (logged in as the account the reviews post
+as) and `git`. Without the grant, `collect` stops with a message naming it.
+Then `conductor run review/review-calibration` runs it now (use your instance
+name in place of `review`).
+
+To run it on a schedule, declare a schedule on your cron connector and fire
+the trigger from your own config (a pack can't own a schedule):
+
+```yaml
+connectors:
+  timer:
+    use: cron
+    schedules:
+      review_calibration: { cron: "23 8 * * 1" }   # Mondays 08:23
+
+triggers:
+  - name: weekly-review-calibration
+    on: timer.review_calibration
+    steps:
+      - uses: conductor.run
+        options: { name: review/review-calibration }
+```
+
+Everything calibration keeps is under `<state_dir>/pr-review-team/`: its
+position (`calibration.json`), clones, and the log. Delete a memory entry to
+undo it.
+
+## Sharing what it learned
+
+Memory stays on the box that wrote it. To give teammates the same reviewer,
+export the scopes into a pack and have them install it next to this one —
+its entries are recalled read-only, merged with their own:
+
+```sh
+conductor memory export \
+  --scope global --scope your-org/app --scope standard:your-org/app --scope emphasis:your-org/app \
+  --out ../review-training --name review-training
+```
+
+Commit `../review-training` to a repo (a private one is fine — give the pack
+source an `auth:` credential) and install it:
+
+```yaml
+packs:
+  training:
+    source: github.com/your-org/review-training
+```
+
+Its manifest is just pack metadata plus `memory: { entries: memory }`.
+Re-export and push to update it.
+
+## Upgrading from 2.x
+
+3.0.0 is a major version: a `~> 2.x` pin won't pick it up.
+
+- **Needs conductor >= 0.69.0.**
+- **Routing is now emphasis.** `assess` reads `emphasis:<repo>` itself. If you
+  override `review-flow/assess`'s `decide.state` to inject routing rules,
+  delete that override; it also references the `diffcap` step 2.10 removed.
+  Move routing entries to the new scope — with the `dir:` backend, change
+  each file's `scope: routing:<repo>` line to `scope: emphasis:<repo>`.
+- **The lens panel reads memory by default** (limit 100, the per-repo layers
+  above). A `review-team/review: { memory: … }` override is no longer needed;
+  if you keep one, include the `extra_scopes`.
+- **Calibration moved into the pack.** If you run your own calibration or
+  backfill triggers, the pack's `review-calibration` and `review-backfill`
+  replace them; arm those and remove yours. The pack keeps its own position
+  file, so its first run looks back `calibration_bootstrap_days`.
+
+## 2.10.0 — whole-PR reviews
+
+- **The lens reviewers get a real PR checkout** (`checkout: checkout-pr`)
+  instead of an inlined, 60 KB-capped diff. The prompt carries the PR
+  metadata and the complete file list, and tells the reviewer the full change
+  is `git diff origin/<base>...HEAD`. The step carries `output_schema`, so in
+  the jail its `gh` and `git` are read-only and it has no write verbs.
+- **`verify` judges each finding against bounded, per-finding context**: the
+  flagged file's own patch and a window of that file at the PR head (±30
+  lines, capped at 8000 bytes), computed in the pack's `windows` js step.
+- **`assess` sees every changed file** plus as many patches as fit a 50 KB
+  budget, in `pr_files`' own order.
+- `review-team`'s `diff:` output was removed; call `github.pr_diff` if you
+  need the raw diff.
+
+Each lens reviewer provisions its own PR worktree, so the default six lenses
+make six checkouts.
 
 ## Tuning
 
-- **Models** — pick a bundled `preset:` (`claude` or `codex`), or set the
-  typed settings directly without touching the pack:
-
-  ```yaml
-  settings: { heavy_model: <your reviewer model>, light_model: <your other model> }
-  ```
-
-  `heavy_model` drives the lens panel (the strongest pass); `light_model`
-  drives triage, refute-verify, and the hand-off agent. Both default to `"*"`
-  (any model your runtime offers) when no preset or setting is given.
-- **Triage and refute-verify are `decide:` steps** — typed yes/no and choice
-  questions answered with probabilities, not agent runs. Any runtime in the
-  light tier answers them (an agent runtime through conductor's adapter, in one
-  restricted session). To have a decision runtime such as Jev answer first, add
+- **Models** — two fleets: `heavy` (the lens panel, calibration) and `light`
+  (triage, refute-verify, the hand-off agent, backfill extraction). They
+  resolve against whatever your runtimes offer; pin one with
+  `models: { heavy: ["claude-opus-*"], light: ["claude-sonnet-*"] }`.
+- **Triage and refute-verify are `decide:` steps** — typed questions answered
+  with probabilities. To have a decision runtime such as Jev answer first, add
   its models to the tier — `models: { light: ["jev-*", "claude-sonnet-*"] }` —
   with the runtime configured ([jev runtime](https://github.com/NodeSpy/conductor-plugins/blob/main/docs/runtimes/jev.md)).
   `verify` refutes a finding only when P(refuted) ≥ 0.8. Record every decision
-  for calibration with `decide: { observe: <your SQL store> }` on the pack
-  instance ([Decide steps](https://github.com/NodeSpy/conductor/blob/main/docs/wiki/Decide-Steps.md)).
-- **Step overrides** — override any exported step by its qualified reference
-  in the `packs:` block, e.g. `steps: { review-flow/handoff: { model: ... } }`.
-  See `exports:` in the manifest for the full list of overridable steps.
-- **Lenses** — the six review lenses are the `review-team` workflow's `lenses`
-  input default; override that input to review through a subset.
-- **Clean reviews auto-post** — when the team finds nothing (an APPROVE with no
-  comments), it posts the approval and skips the hand-off. A human is only pulled
-  in when there's something to weigh in on (a manual-flagged PR *with* comments).
-- **Large PRs** — nothing is capped by file count or diff size anymore (2.10):
-  the lens reviewers work from a real checkout, `verify` reads a bounded
-  per-finding patch + file window, and `assess` reads every file's line
-  counts plus a byte-budgeted slice of patches. See "2.10.0 — whole-PR
-  reviews" above for the exact bounds.
-
-**No secrets.** Posting uses your github connector's own write identity, so the
-pack requires no broker secret.
+  with `decide: { observe: <your SQL store> }` on the pack instance
+  ([Decide steps](https://github.com/NodeSpy/conductor/blob/main/docs/wiki/Decide-Steps.md)).
+- **Step overrides** — override an exported step by its qualified reference,
+  e.g. `steps: { review-flow/handoff: { model: ... } }`. See `exports:` in the
+  manifest.
+- **Lenses** — the six lenses are the `review-team` workflow's `lenses` input
+  default; override that input to review through a subset or add your own.
 
 ## Consent is load-bearing
 
-The `on_review_request` trigger ships **disarmed**. It does nothing until you set
-`enabled: true` **and** name `repos:` — and a github trigger is **rejected at
-load** if armed without repos, so it can never silently review every repo your
-connector can reach. The repo list is the consent.
+Every trigger ships **disarmed**. `on_review_request` does nothing until you
+set `enabled: true` **and** name `repos:` — a github trigger is rejected at
+load if armed without repos. The calibration triggers do nothing until you
+arm them and grant their script steps.
 
 ## Authoring
 
-This is a single `conductor-pack.yaml` manifest. Validate changes with
-`conductor pack lint .` before publishing.
+`conductor-pack.yaml` is the manifest; `scripts/calibration.py` is the
+calibration triggers' deterministic half. Before publishing:
+
+```
+conductor pack lint .
+python3 -m unittest discover -s tests      # needs node and PyYAML
+```

@@ -4,17 +4,21 @@
 # runs a panel of lens reviewers in parallel, refute-verifies every finding,
 # reconciles them deterministically into one ReviewRecord, then either
 # auto-posts the review or hands the DRAFT to a human to approve/edit/post.
+# With `settings: { auto: true }` it never hands off: every review posts.
 #
 # The hand-off is REACTIVE: while it waits for you it watches the PR and bails
 # if the reason went away (merged/closed upstream, or approved elsewhere),
 # re-reviews from scratch when new commits are pushed, and an idle_timeout
 # reclaims a hand-off nobody closed — so stale drafts and lingering workspaces
-# don't pile up. Needs conductor >= 0.57.0 (the release that added the agent
-# workspace jail and `github.pr_files` patches — see `requires:` below for
-# what that buys the pack).
+# don't pile up.
+#
+# The reviewer LEARNS through memory: the lens panel reads reviewer-wide
+# entries plus this repo's facts, standard and emphasis entries, and two
+# disarmed triggers (review-calibration, review-backfill) write those entries
+# from what happened after past reviews. See the README.
 #
 # Define-behavior / bind-environment: this pack ships only BEHAVIOR (workflows
-# and a disarmed trigger). It carries NO connectors and NO secrets — you bind
+# and disarmed triggers). It carries NO connectors and NO secrets — you bind
 # your github connector in the `packs:` block. Posting uses that connector's
 # own write identity, so no broker secret is required.
 #
@@ -22,10 +26,11 @@
 #   packs:
 #     review:
 #       source: github.com/NodeSpy/conductor-packs//pr-review-team   # or a local path
-#       version: "~> 2.10"
+#       version: "~> 3.0"
 #       # No preset/connectors needed: the sole github connector auto-binds, and the
 #       # heavy/light fleets resolve against whatever your runtime offers. Pin a tier
 #       # only if you want to: models: { heavy: ["claude-opus-*"], light: ["claude-sonnet-*"] }
+#       # settings: { auto: true }                        # never hand off; always post
 #       triggers:
 #         on_review_request:
 #           enabled: true                                 # arm it
@@ -34,28 +39,89 @@
 
 pack:
   name: pr-review-team
-  version: 2.10.0
-  description: Multi-lens PR review (correctness / security / design …) with refute-verify, deterministic reconcile, and an optional human hand-off.
-  tags: [review, github, code-quality, agents]
+  version: 3.0.0
+  description: Multi-lens PR review (correctness / security / design …) with refute-verify, deterministic reconcile, an optional human hand-off, and calibration that learns per-repo memory from past reviews.
+  tags: [review, github, code-quality, agents, memory]
   homepage: https://github.com/NodeSpy/conductor-packs
   license: Apache-2.0
   requires:
-    # The daemon versions this pack supports. 0.57.0 is the floor for
-    # whole-PR review (#154 §6): the lens reviewers run in a real `checkout:
-    # checkout-pr` workspace jail instead of reading an inlined, capped diff,
-    # and `github.pr_files` returns each changed file's `patch`.
-    # (0.57.0 is a superset of the older floors this pack also relies on:
-    # 0.54.0 for `decide:` steps (assess and verify) and 0.33.0 for the
-    # reactive hand-off surface the handoff step uses — `watch:`,
-    # handoff.bail / handoff.rerun, `idle_timeout:`, handoff.done
-    # auto-granted to the hand-off agent.)
-    conductor: ">=0.57.0"
+    # The daemon versions this pack supports. 0.69.0 is the floor for 3.0:
+    # `${repo}` expands inside a memory scope string (`standard:${repo}`) and
+    # a step's `memory: { extra_scopes: [...] }` appends to the default
+    # scopes instead of replacing them — the per-repo layering the lens panel
+    # reads. (A superset of the older floors: 0.57.0 for whole-PR review —
+    # the `checkout: checkout-pr` workspace jail and `github.pr_files`
+    # patches — 0.54.0 for `decide:` steps, and 0.33.0 for the reactive
+    # hand-off surface.)
+    conductor: ">=0.69.0"
     # Bind-only environment the pack needs — you wire this; the pack never
     # ships it.
     # requires.connectors is the pack's CAPABILITY BOUNDARY as well as its
     # socket list: the pack's skill.verbs may name no connector outside it,
     # and its wildcards are bounded to it.
-    connectors: [github]
+    connectors:
+      github: "*"
+      # Built-in, binds to itself: assess reads emphasis entries, and the
+      # calibration triggers read existing entries and write new ones — all
+      # through the js code binding (ctx.memory), so a config without a
+      # memory: section still loads.
+      memory: "*"
+
+# Every setting is substituted as TEXT (`${settings.NAME}`), so the pack
+# compares them as strings ("true", "14") wherever it reads one.
+settings:
+  auto:
+    type: boolean
+    default: false
+    desc: "true = never hand off: every review posts with the team's verdict (APPROVE or REQUEST_CHANGES), and emphasis entries only sharpen the review. false = assess may route a PR to a human hand-off, and a PR matching an emphasis entry leans to that hand-off."
+  state_dir:
+    type: string
+    default: ""
+    desc: "conductor's state directory, for the calibration triggers (empty = $XDG_STATE_HOME/conductor, else ~/.local/state/conductor). Calibration keeps its own files under <state_dir>/pr-review-team/."
+  audit_log:
+    type: string
+    default: ""
+    desc: "the audit log calibration reads reviews from (empty = <state_dir>/audit.jsonl; its rotated .1 is read too). Set it if your config moves store.audit_log."
+  git_base:
+    type: string
+    default: "https://github.com"
+    desc: "where calibration clones reviewed repos from (<git_base>/<owner>/<repo>.git); https clones authenticate through the gh CLI's login"
+  calibration_window_days:
+    type: string
+    default: "14"
+    desc: "how long after a reviewed PR merges a later commit that changes its lines counts as a follow-up"
+  calibration_bootstrap_days:
+    type: string
+    default: "30"
+    desc: "the first calibration run looks back this far"
+  calibration_unmerged_days:
+    type: string
+    default: "30"
+    desc: "stop waiting for a reviewed PR to merge after this many days"
+  calibration_discard_days:
+    type: string
+    default: "7"
+    desc: "a hand-off draft nobody posted within this many days counts as discarded"
+  calibration_min_lines:
+    type: string
+    default: "3"
+    desc: "a later commit is a follow-up only if it changes or removes at least this many lines the reviewed PR added"
+  calibration_team_pages:
+    type: string
+    default: "15"
+    desc: "pages (100 each) of teammates' review comments read per repo per calibration run"
+  backfill_max_pages:
+    type: string
+    default: "300"
+    desc: "pages (100 each) of review comments read per repo by review-backfill"
+  backfill_min_chars:
+    type: string
+    default: "40"
+    desc: "review-backfill ignores comments shorter than this"
+  backfill_reviewer_since:
+    type: string
+    default: ""
+    desc: "review-backfill: your own comments from this date (YYYY-MM-DD) on may have been posted by this pack, so they are not counted as yours (empty = the first review this pack posted, from the audit log)"
 
 # MODEL TIERS as fleets. conductor resolves each against your runtime's roster
 # best-first (see the models:/fleets model), so the pack ships NO presets and NO
@@ -112,6 +178,184 @@ x-templates:
     model: heavy
     mode: auto
     workspace: worktree
+
+  # ---- Calibration building blocks (review-calibration, review-backfill) ----
+  #
+  # The deterministic half runs in scripts/calibration.py, shipped with the
+  # pack. It needs the network (gh, git) and conductor's state directory, so
+  # these steps are confined like every pack code step until you grant them
+  # (`trust: full` in your packs: block — see the README). The agents get the
+  # collected evidence inline and need neither: they never touch the network,
+  # a clone, or the memory directory.
+  calib_script: &calib_script
+    use: cli
+    command: [python3]
+    code: "file:${pack.dir}/scripts/calibration.py"
+    env: &calib_env
+      STATE_DIR: "${settings.state_dir}"
+      AUDIT_LOG: "${settings.audit_log}"
+      GIT_BASE: "${settings.git_base}"
+
+  # What an agent proposes. One entry per lesson, classified by where it
+  # belongs; `none` is a candidate it considered and dropped (logged, never
+  # written).
+  learned_schema: &learned_schema
+    type: object
+    required: [entries, summary]
+    properties:
+      entries:
+        type: array
+        items:
+          type: object
+          required: [repo, kind, text, evidence]
+          properties:
+            repo: { type: string, description: "owner/name the lesson is about; for kind global, the repo it was learned on" }
+            kind: { type: string, enum: [fact, standard, emphasis, global, none] }
+            text: { type: string, description: "one or two plain sentences, naming the PR it came from" }
+            evidence: { type: array, items: { type: string }, description: "PR refs, owner/name#N" }
+            team: { type: boolean, description: "learned from teammates' comments rather than your own" }
+            supersedes: { type: string, description: "id of an existing entry this one replaces (same repo and kind)" }
+      summary: { type: string, description: "what was written, dropped and why — one line each" }
+
+  # Every memory entry the reviewer reads for this run's repos, minus
+  # outcome notes (not lessons). Read and written through the code binding
+  # rather than the memory.* verbs: a verb step needs a memory: section for
+  # the CONFIG to load, and these triggers ship in every install, armed or
+  # not — so without memory the pack still loads and only calibration
+  # fails, here, saying why.
+  known: &known
+    id: known
+    run: js
+    code: |
+      let all;
+      try {
+        all = ctx.memory.recall({ limit: 0 }) || [];
+      } catch (e) {
+        throw new Error("calibration writes conductor memory — add a top-level memory: section (" + e + ")");
+      }
+      const repos = (ctx.collect && ctx.collect.repos) || [];
+      const want = { global: 1 };
+      for (const r of repos) { want[r] = 1; want["standard:" + r] = 1; want["emphasis:" + r] = 1; }
+      const list = [];
+      for (const m of all) {
+        const tags = m.tags || [];
+        if (!want[m.scope || "global"] || tags.indexOf("outcome") >= 0) continue;
+        list.push({ id: m.id, scope: m.scope || "global", text: String(m.text || "").slice(0, 400) });
+        if (list.length >= 400) break;
+      }
+      const text = list.map(function (m) { return "- " + m.id + " [" + m.scope + "] " + m.text.replace(/\n/g, " "); }).join("\n");
+      return { list: list, text: text || "(none yet)" };
+
+  # The repos' own convention files, so a lesson already written down there
+  # is not written again.
+  repodocs: &repodocs
+    id: repodocs
+    run: js
+    code: |
+      const repos = (ctx.collect && ctx.collect.repos) || [];
+      const MAX = 6000;
+      const pick = function (step, i) {
+        const it = ctx[step] && ctx[step].items && ctx[step].items[i];
+        return (it && it.text) ? String(it.text).slice(0, MAX) : "";
+      };
+      const out = [];
+      for (let i = 0; i < repos.length; i++) {
+        const parts = [["CLAUDE.md", pick("doc_claude", i)], ["AGENTS.md", pick("doc_agents", i)], ["CONTRIBUTING.md", pick("doc_contributing", i)]]
+          .filter(function (p) { return p[1]; })
+          .map(function (p) { return "### " + repos[i] + " " + p[0] + "\n" + p[1]; });
+        if (parts.length) out.push(parts.join("\n\n"));
+      }
+      return { text: out.join("\n\n") || "(none)" };
+  doc_claude: &doc_claude
+    id: doc_claude
+    uses: github.file
+    for_each: "{{.collect.repos}}"
+    continue_on_error: true
+    options: { repo: "{{.item}}", path: CLAUDE.md, optional: true }
+  doc_agents: &doc_agents
+    id: doc_agents
+    uses: github.file
+    for_each: "{{.collect.repos}}"
+    continue_on_error: true
+    options: { repo: "{{.item}}", path: AGENTS.md, optional: true }
+  doc_contributing: &doc_contributing
+    id: doc_contributing
+    uses: github.file
+    for_each: "{{.collect.repos}}"
+    continue_on_error: true
+    options: { repo: "{{.item}}", path: CONTRIBUTING.md, optional: true }
+
+  # The WRITE RESTRICTION. Every proposed entry is checked before anything is
+  # written: its repo must be one this run collected evidence for, and its
+  # evidence must cite that repo. The scope is derived from kind + repo here,
+  # never taken from the agent:
+  #   fact      -> <owner/repo>          (the scope the lens panel reads as "this repo")
+  #   standard  -> standard:<owner/repo>
+  #   emphasis  -> emphasis:<owner/repo>
+  #   global    -> the shared set        (reviewer-wide; only with in-run evidence)
+  # Anything else is rejected and logged. `supersedes` is honored only for an
+  # existing entry in the very scope being written.
+  plan: &plan
+    id: plan
+    run: js
+    code: |
+      const src = ctx.calibrate || ctx.merge || {};
+      const entries = src.entries || [];
+      const allowed = {};
+      for (const r of ((ctx.collect && ctx.collect.repos) || [])) allowed[r] = 1;
+      const known = (ctx.known && ctx.known.list) || [];
+      const byId = {}; const seenText = {};
+      for (const m of known) { byId[m.id] = m; seenText[m.scope + "\u0000" + m.text.trim()] = 1; }
+      const origin = ctx.calibrate ? "calibration" : "backfill";
+      const repoOf = function (ref) { const m = /^([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)#\d+$/.exec(String(ref || "").trim()); return m ? m[1] : ""; };
+      const writes = [], forget = [], rejected = [], dropped = [], superseded = [];
+      for (const e of entries) {
+        const text = String(e.text || "").trim();
+        const repo = String(e.repo || "").trim();
+        const kind = String(e.kind || "");
+        const ev = (e.evidence || []).map(repoOf);
+        if (kind === "none") { dropped.push((repo || "?") + ": " + text); continue; }
+        if (!text || text.length > 800) { rejected.push(kind + " " + repo + ": empty or over 800 chars"); continue; }
+        if (!allowed[repo]) { rejected.push(kind + " " + repo + ": not a repo this run collected evidence for — " + text); continue; }
+        if (ev.length === 0 || ev.some(function (r) { return !allowed[r]; })) { rejected.push(kind + " " + repo + ": evidence must cite PRs in this run's repos — " + text); continue; }
+        let scope, label;
+        if (kind === "fact") { scope = repo; label = repo; }
+        else if (kind === "standard") { scope = "standard:" + repo; label = scope; }
+        else if (kind === "emphasis") { scope = "emphasis:" + repo; label = scope; }
+        else if (kind === "global") { scope = ""; label = "global"; }
+        else { rejected.push(kind + " " + repo + ": unknown kind — " + text); continue; }
+        if (kind !== "global" && ev.indexOf(repo) < 0) { rejected.push(kind + " " + repo + ": evidence does not cite " + repo + " — " + text); continue; }
+        if (seenText[label + "\u0000" + text]) { dropped.push(label + ": already recorded — " + text); continue; }
+        const tags = ["review-tuning", origin, kind === "global" ? "standard" : kind];
+        if (e.team) tags.push("team");
+        writes.push({ scope: scope, label: label, text: text, tags: tags });
+        if (e.supersedes) {
+          const old = byId[e.supersedes];
+          if (old && old.scope === label) { forget.push(old.id); superseded.push(old.id + " [" + label + "] " + old.text); }
+          else rejected.push("supersedes " + e.supersedes + ": not an existing entry in " + label + " (kept)");
+        }
+      }
+      return { writes: writes, forget: forget, rejected: rejected, dropped: dropped, superseded: superseded, count: writes.length };
+  # The writes themselves, by the pack's own step: one memory.remember per
+  # planned entry (the shared set is written with an empty scope, which is
+  # how a config-authored write reaches it), then the superseded entries are
+  # forgotten.
+  write: &write
+    id: write
+    if: "plan.count > 0"
+    run: js
+    code: |
+      const plan = ctx.plan || {};
+      const items = [];
+      for (const w of (plan.writes || [])) {
+        const e = ctx.memory.remember(w.text, w.tags, w.scope);
+        items.push({ id: e.id, scope: e.scope });
+      }
+      let forgotten = 0;
+      for (const id of (plan.forget || [])) {
+        if (ctx.memory.forget(id)) forgotten++;
+      }
+      return { items: items, count: items.length, forgotten: forgotten };
 
 workflows:
   # ---- The review ENGINE: produces a ReviewRecord, never posts. ----
@@ -221,6 +465,18 @@ workflows:
         for_each: "{{.inputs.lenses}}"
         parallel: true
         guidance: "You are one lens of a panel. Stay inside your lens; another reviewer owns the rest."
+        # 3.0: per-repo LAYERED memory. The defaults (the shared/global set,
+        # this repo, the workflow, the step) plus this repo's standard and
+        # emphasis scopes:
+        #   global              reviewer-wide standard (every repo)
+        #   <owner/repo>        facts about this repo the diff can't show
+        #   standard:<repo>     this repo's additions to the standard
+        #   emphasis:<repo>     "look hard at X" rules learned from misses
+        # The calibration triggers below write all four; you can also write
+        # them by hand. Nothing matching costs no tokens.
+        memory:
+          limit: 100
+          extra_scopes: ["standard:${repo}", "emphasis:${repo}"]
         output_schema:
           type: object
           required: [findings]
@@ -274,6 +530,14 @@ workflows:
           {{.std_claude.text}}
           {{.std_agents.text}}
           {{.std_contributing.text}}
+
+          SHARED MEMORY (appended at the end of this prompt, when there is any) is
+          layered: notes tagged `standard` are the review standard — reviewer-wide, or
+          this repo's additions to it — and weigh like REPO STANDARDS; notes tagged
+          `emphasis` name areas of this repo that past reviews got wrong, so look hard
+          at any change that touches them; every other note is a fact about this repo
+          or how it is built, deployed and maintained that the diff cannot show — use
+          it to judge whether the change actually works here.
 
           PULL REQUEST {{.inputs.repo}} #{{.inputs.pr}}: {{.meta.title}}
           Description:
@@ -562,18 +826,45 @@ workflows:
             total_deletions: totalDel,
           };
 
+      # This repo's EMPHASIS entries (memory scope `emphasis:<repo>`): "look
+      # hard at X" rules the calibration triggers learned from past misses.
+      # The lens panel reads them through its own memory in both modes; here
+      # they feed triage, where — with auto off — a PR that matches one leans
+      # to a human hand-off. Read through the code binding, not the
+      # memory.recall verb, so a config with no memory: section still loads:
+      # no memory (or none written yet) is simply no rules.
+      - id: emphasis
+        if: "!${settings.auto}"
+        run: js
+        code: |
+          let found = [];
+          try {
+            found = ctx.memory.recall({ scope: "emphasis:" + ctx.inputs.repo, limit: 50 }) || [];
+          } catch (e) {
+            found = [];
+          }
+          return { memories: found.map(function (m) { return { text: String(m.text || "") }; }) };
+
       # 1. Triage: may an automated review post itself ("auto"), or does this
       #    genuinely need a human ("manual")? A decide: step — four typed
       #    questions in one call — so any runtime in the light tier can answer
       #    it, a decision runtime included. `assessed` turns the answers into
       #    the auto/manual decision and the reason the hand-off shows.
+      #    Skipped with `auto: true`: nothing is handed off, so there is
+      #    nothing to triage.
       - id: assess
+        if: "!${settings.auto}"
         model: light
         retry: { max: 6, backoff: 30s }
         decide:
           state: |
             Code-review request on {{.inputs.repo}}#{{.inputs.pr}} ("{{.inputs.title}}").
 
+            EMPHASIS RULES learned from past reviews of this repo. A change that matches
+            one of these needs a human's review ("manual"), whatever else holds:
+            {{range .emphasis.memories}}- {{.text}}
+            {{else}}(none)
+            {{end}}
             FILES CHANGED ({{.budget.file_count}} total, +{{.budget.total_additions}}/-{{.budget.total_deletions}} lines):
             {{.budget.summary}}
 
@@ -596,7 +887,8 @@ workflows:
               criteria:
                 auto: The review may post itself.
                 manual: >-
-                  EITHER the change is genuinely high-stakes and needs human judgment —
+                  The change matches one of the EMPHASIS RULES in the request. OR the change is
+                  genuinely high-stakes and needs human judgment —
                   it clearly alters security/authentication/authorization/secrets or
                   permission/ACL boundaries; touches payments, billing, or money
                   movement; is a destructive or irreversible data change (drops/renames
@@ -634,6 +926,7 @@ workflows:
       - id: assessed
         run: js
         code: |
+          if ("${settings.auto}" === "true") return { decision: "auto", reason: "" };
           const a = ctx.assess || {};
           const decision = (a.decision && a.decision.choice) || "auto";
           if (decision === "auto") return { decision: decision, reason: "" };
@@ -641,6 +934,8 @@ workflows:
           if (a.tests_sufficient && a.tests_sufficient.noul < 0.5) why.push("tests look insufficient for the behavior changed");
           if (a.docs_sufficient && a.docs_sufficient.noul < 0.5) why.push("docs look out of date for what changed");
           if (a.glaring_holes && a.glaring_holes.noul >= 0.5) why.push("there may be a glaring logic or coverage hole");
+          const rules = (ctx.emphasis && ctx.emphasis.memories) || [];
+          if (why.length === 0 && rules.length > 0) why.push("it may match an emphasis rule learned from past reviews of this repo, or look high-stakes");
           if (why.length === 0) why.push("the change looks high-stakes (security, money, destructive data, or production infra)");
           return { decision: decision, reason: why.join("; ") + "." };
 
@@ -651,17 +946,19 @@ workflows:
           repo: "{{.inputs.repo}}"
           pr: "{{.inputs.pr}}"
 
-      # Decide post-vs-hand-off. Auto-post when assess said "auto", OR when the
-      # review came back clean (no comments) — handing a human an empty "looks
-      # good" is pure friction. Otherwise (a manual PR with real comments) hand
-      # the draft to a person.
+      # Decide post-vs-hand-off. With `auto: true` always post — the team's
+      # verdict stands, APPROVE included. Otherwise auto-post when assess said
+      # "auto", OR when the review came back clean (no comments) — handing a
+      # human an empty "looks good" is pure friction — and hand a manual PR
+      # with real comments to a person.
       - id: gate
         run: js
         code: |
-          const auto = ctx.assessed && ctx.assessed.decision === "auto";
+          const mode = "${settings.auto}" === "true" ? "auto" : "gated";
+          const auto = mode === "auto" || (ctx.assessed && ctx.assessed.decision === "auto");
           const comments = (ctx.review && ctx.review.comments) || [];
           const empty = comments.length === 0;
-          return { post: auto || empty, handoff: !auto && !empty };
+          return { mode: mode, post: auto || empty, handoff: !auto && !empty };
 
       # POST: submit the drafted review deterministically via the verb (as the
       # connector's own write identity).
@@ -752,3 +1049,287 @@ triggers:
       - id: run
         workflow: review-flow
         with: { repo: "{{.repo}}", pr: "{{.number}}", title: "{{.title}}" }
+
+  # ---- Calibration: learn from what happened after past reviews. ----
+  #
+  # Weekly (or by hand), read what changed since the last run — reviews this
+  # pack posted (from the audit log), follow-up commits that changed lines a
+  # reviewed PR added, what the human did with each hand-off draft, and what
+  # teammates flagged in review — and turn the misses into memory entries the
+  # lens panel reads next time. Repos come from the audit log; nothing is
+  # configured per repo.
+  #
+  # Ships DISARMED and CONFINED. To use it:
+  #   1. Grant the two script steps what they need, in your packs: block:
+  #        steps:
+  #          review-calibration/collect: { trust: full }
+  #          review-calibration/record:  { trust: full }
+  #   2. Arm it: triggers: { review-calibration: { enabled: true } }
+  #   3. Run it: `conductor run <instance>/review-calibration`, or on a
+  #      schedule — packs can't own one, so declare `review_calibration` on
+  #      your cron connector and fire this trigger from your own config with
+  #      `uses: conductor.run` (see the README).
+  # Its state, clones and log live under <state_dir>/pr-review-team/.
+  - name: review-calibration
+    on: manual
+    steps:
+      - <<: *calib_script
+        id: collect
+        timeout: 20m
+        args: [collect-calibration]
+        env:
+          <<: *calib_env
+          WINDOW_DAYS: "${settings.calibration_window_days}"
+          BOOTSTRAP_DAYS: "${settings.calibration_bootstrap_days}"
+          UNMERGED_DAYS: "${settings.calibration_unmerged_days}"
+          DISCARD_DAYS: "${settings.calibration_discard_days}"
+          MIN_LINES: "${settings.calibration_min_lines}"
+          TEAM_PAGES: "${settings.calibration_team_pages}"
+      - <<: *known
+        if: &calib_any "collect.count > 0 || collect.flagged > 0 || collect.handoffs > 0 || collect.team_count > 0"
+      - <<: *doc_claude
+        if: *calib_any
+      - <<: *doc_agents
+        if: *calib_any
+      - <<: *doc_contributing
+        if: *calib_any
+      - <<: *repodocs
+        if: *calib_any
+      - id: calibrate
+        if: *calib_any
+        type: agent
+        model: heavy
+        checkout: none
+        retry: { max: 3, backoff: 60s }
+        wait_timeout: 90m
+        archive_when_done: true
+        memory: false            # no recall, and no ```remember harvest: entries are written only by `write`
+        output_schema: *learned_schema
+        prompt: |
+          Calibrate an automated PR reviewer from what happened after its reviews. This
+          run covers only what is NEW since {{.collect.since}}; earlier items were
+          already decided. Decide everything yourself; never ask.
+
+          THE REVIEWER is a panel of lenses (architecture, complexity, performance,
+          refactoring, security, test quality, plus any the operator added). It sees the
+          PR checkout, the repo's CLAUDE.md/AGENTS.md/CONTRIBUTING, and memory. Memory is
+          layered, and every entry you propose has a KIND that says where it goes:
+            fact      a fact about one repo the diff can't show — how something is
+                      built, deployed, operated or used. Most misses are this.
+            standard  a review rule for one repo: how this repo wants code shaped, a
+                      convention, something that broke before.
+            emphasis  an area of one repo that needs a hard look: "a PR that <touches
+                      these paths / changes this kind of thing> needs close review,
+                      because <why> (owner/name#N)". Use it when the reviewer
+                      auto-posted on something it should have looked at much harder.
+            global    a reviewer-wide lesson about how to review, true in every repo.
+                      Rare; only when the evidence clearly isn't repo-specific.
+            none      a candidate you considered and dropped — say why in text.
+          Each entry names its repo (owner/name) and cites its evidence as PR refs
+          (owner/name#N) from THIS run. Entries for any other repo, or without
+          evidence, are rejected.
+
+          GOAL: find what the reviewer MISSED — problems in a PR it reviewed that
+          surfaced later — and propose the entries that would have let it catch them.
+          A generic example: a reviewed PR added a required environment variable; a
+          follow-up made it optional because the service is deployed by a job that
+          never sets it. The fact entry: "<service> is deployed by <job>, which sets
+          only <these> variables; a new required variable breaks the deploy
+          (owner/name#N)".
+
+          1. FOLLOW-UPS. Each FOLLOW-UP below is a commit that changed or removed lines
+             a reviewed PR added, within the window after it merged, with its message
+             and patch. Decide whether it fixed something the review should have
+             caught — or is just the next step of the work (stacked PRs, a planned
+             follow-up, a refactor). Only the first is a miss.
+          2. HAND-OFF OUTCOMES are the human's direct verdict on drafts. POSTED AS-IS
+             confirms the draft. In an EDITED one, a DROPPED comment is something it
+             shouldn't have raised, an ADDED one something it missed, REWORDED shows
+             how it should be said, a changed verdict shows misjudged severity.
+             DISCARDED means the review wasn't worth posting. A comment dropped and
+             re-added at a nearby line is a rewrite, not a miss.
+          3. TEAM. What teammates flagged in review since the last run (bots, replies
+             and the reviewer's own account excluded). On PRs marked ALSO REVIEWED BY
+             THE BOT, a real issue a teammate raised that the bot did not is a miss —
+             treat it like a follow-up. Across all of it, look for what the team keeps
+             flagging: concerns on more than one PR or from more than one person that
+             the lenses wouldn't surface on their own. One-offs, style nits and
+             questions are not patterns. Weigh a comment by whether the issue is real,
+             not by who posted it. The reviewer's own misses (1, 2) come first; a team
+             pattern carries somewhat less weight — keep it when it is clearly
+             important (repeated, several people, or it caught a real bug), mark it
+             team: true, and say "the team flags…" in the text.
+          4. Drop a candidate (kind none) when the repo's docs or an existing entry
+             already cover it, when it is not a reviewer miss (a new requirement, a
+             changed plan), or when the evidence is thin. Prefer a few high-signal
+             entries over many. To sharpen an existing entry rather than add a near
+             duplicate, write the improved text and set supersedes to its id (same
+             repo and kind).
+          5. summary: one line per entry written or dropped, and why.
+
+          REVIEWS ({{.collect.count}} new, {{.collect.flagged}} with follow-ups, {{.collect.handoffs}} hand-off outcome(s)):
+          {{.collect.reviews}}
+
+          TEAM COMMENTS ({{.collect.team_count}} on {{.collect.team_prs}} PRs, {{.collect.team_both}} also reviewed by the bot):
+          {{.collect.team}}
+
+          EXISTING MEMORY ENTRIES for these repos (id [scope] text):
+          {{.known.text}}
+
+          REPO DOCS:
+          {{.repodocs.text}}
+      - <<: *plan
+        if: *calib_any
+      - *write
+      - <<: *calib_script
+        id: record
+        args: [record]
+        env:
+          <<: *calib_env
+          MODE: calibration
+
+  # ---- Backfill: seed memory from a window of past human review comments. ----
+  #
+  # One-time (manual only) map-reduce over the repos you name: one agent per
+  # month extracts what reviewers look out for, one agent merges those into
+  # entries, and the same restricted write path as calibration writes them.
+  #   conductor run <instance>/review-backfill --input repos=owner/a,owner/b [--input days=180]
+  # Grant review-backfill/collect and review-backfill/record `trust: full`
+  # like calibration's, and arm it (`enabled: true`).
+  - name: review-backfill
+    on: [manual]
+    steps:
+      - <<: *calib_script
+        id: collect
+        timeout: 45m
+        args: [collect-backfill]
+        env:
+          <<: *calib_env
+          BACKFILL_DAYS: "{{ .inputs.days | default 365 }}"
+          MAX_PAGES: "${settings.backfill_max_pages}"
+          MIN_CHARS: "${settings.backfill_min_chars}"
+          REVIEWER_SINCE: "${settings.backfill_reviewer_since}"
+      - id: extract
+        if: "collect.month_count > 0"
+        for_each: "{{.collect.months}}"
+        parallel: true
+        type: agent
+        memory: false
+        model: light
+        checkout: none
+        retry: { max: 3, backoff: 60s }
+        wait_timeout: 60m
+        archive_when_done: true
+        output_schema:
+          type: object
+          required: [patterns]
+          properties:
+            patterns:
+              type: array
+              items:
+                type: object
+                required: [who, repo, text, evidence]
+                properties:
+                  who: { type: string, enum: [mine, team] }
+                  repo: { type: string, description: "owner/name, or global when it is about how reviews are done in general" }
+                  text: { type: string }
+                  evidence: { type: array, items: { type: string } }
+                  people: { type: integer }
+        prompt: |
+          Below is one month ({{.item.month}}) of human PR review comments, grouped by PR:
+          {{.item.mine}} written by the reviewer this calibrates (MINE — hand-written,
+          before an automated reviewer started posting under that account) and
+          {{.item.team}} by teammates (TEAM <login>).
+
+          Extract what reviewers here LOOK OUT FOR: concerns raised on more than one PR
+          or by more than one person, and facts about how these systems work that a
+          reviewer must know (how something is deployed, built, operated, or what broke
+          before). A comment of MINE counts even on a single PR when it states a clear
+          preference or rule. Skip one-off bugs, style nits, questions, and anything
+          only meaningful inside that one PR. Comments may be AI-written; keep a
+          concern only if it is real.
+
+          Return JSON {patterns: [...]}; each: who (mine|team), repo (owner/name, or
+          "global" when it is about how reviews are done in general), text (one or two
+          plain sentences, stated as what a reviewer should check or know), evidence
+          (PR refs, owner/name#N), people (distinct commenters who raised it). An empty
+          list is a valid answer for a quiet month.
+
+          {{.item.text}}
+      - id: patterns
+        if: "collect.month_count > 0"
+        run: js
+        code: |
+          const items = (ctx.extract && ctx.extract.items) || [];
+          const out = [];
+          for (const it of items) for (const p of ((it && it.patterns) || [])) out.push(p);
+          return { count: out.length, json: JSON.stringify(out, null, 1) };
+      - <<: *known
+        if: "patterns.count > 0"
+      - <<: *doc_claude
+        if: "patterns.count > 0"
+      - <<: *doc_agents
+        if: "patterns.count > 0"
+      - <<: *doc_contributing
+        if: "patterns.count > 0"
+      - <<: *repodocs
+        if: "patterns.count > 0"
+      - id: merge
+        if: "patterns.count > 0"
+        type: agent
+        model: heavy
+        checkout: none
+        retry: { max: 3, backoff: 60s }
+        wait_timeout: 120m
+        archive_when_done: true
+        memory: false            # no recall, and no ```remember harvest: entries are written only by `write`
+        output_schema: *learned_schema
+        prompt: |
+          A window ({{.collect.since}} on) of human PR review comments was split by
+          month and mined for patterns: {{.patterns.count}} candidates, below (who:
+          mine|team, repo, text, evidence, people). Turn them into memory entries for an
+          automated PR reviewer. Decide everything yourself; never ask.
+
+          Every entry has a KIND that says where it goes:
+            fact      a fact about one repo the diff can't show (how something is
+                      built, deployed, operated or used)
+            standard  a review rule for one repo (a convention, how this repo wants
+                      code shaped, something that broke before)
+            emphasis  a kind of change in one repo that must get a hard look: "a PR
+                      that <…> needs close review, because <…> (owner/name#N)"
+            global    a reviewer-wide lesson, true in every repo (repo: the repo it
+                      was learned on)
+            none      a candidate dropped — say why in text
+          Each names its repo (owner/name, one of {{.collect.repos}}) and cites evidence
+          as PR refs (owner/name#N). Anything else is rejected.
+
+          1. Merge duplicates across months: the same concern in several months is ONE
+             entry, stronger for recurring. Update an existing entry (supersedes: its
+             id, same repo and kind) rather than duplicate it.
+          2. Drop a pattern when the repo's docs already state it, when it is a generic
+             best practice the reviewer already applies, or when it rests on one
+             comment that isn't MINE.
+          3. WEIGHT: mine first. A team pattern needs to recur (several months, or
+             several people) to be kept, and is marked team: true; when it conflicts
+             with mine, mine wins. Prefer fewer, sharper entries — a year should yield
+             tens, not hundreds.
+          4. summary: one line per entry written, and per group merged or dropped.
+
+          CANDIDATE PATTERNS:
+          {{.patterns.json}}
+
+          EXISTING MEMORY ENTRIES for these repos (id [scope] text):
+          {{.known.text}}
+
+          REPO DOCS:
+          {{.repodocs.text}}
+      - <<: *plan
+        if: "patterns.count > 0"
+      - *write
+      - <<: *calib_script
+        id: record
+        if: "patterns.count > 0"
+        args: [record]
+        env:
+          <<: *calib_env
+          MODE: backfill
