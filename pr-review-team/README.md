@@ -3,7 +3,7 @@
 A distributable [conductor](https://github.com/NodeSpy/conductor) **pack**:
 multi-lens pull-request review with an optional human hand-off, and a
 calibration loop that teaches the reviewer from what happened after its
-reviews.
+reviews — under a learning scope you choose (the repo by default).
 
 On a review request it runs a panel of lens reviewers in parallel
 (Architecture, Complexity, Performance, Refactoring, Security, Test quality),
@@ -53,9 +53,10 @@ connectors and no secrets — posting uses your connector's own write identity.
 
 ## What it needs (`requires:`)
 
-- **`conductor: >=0.69.0`** — memory scope keys with `${repo}` inside them
-  (`standard:${repo}`) and a step's `memory: { extra_scopes: [...] }`, which
-  the lens panel's per-repo layering uses. It covers the older floors too:
+- **`conductor: >=0.69.0`** — memory scope keys that are templates over the
+  step's facts (`standard:{{.repo}}`, `org:{{.owner}}`) and a step's
+  `memory: { extra_scopes: [...] }`, which the lens panel's layering under
+  `scope_key` uses. It covers the older floors too:
   0.57.0 for whole-PR review (the agent workspace jail and
   `github.pr_files[].patch`), 0.54.0 for `decide:` steps, 0.33.0 for the
   reactive hand-off.
@@ -71,18 +72,19 @@ Every setting is optional. Set them under `packs.<instance>.settings`.
 | Setting | Default | What it does |
 |---|---|---|
 | `auto` | `false` | `true`: never hand off. Every review posts with the team's verdict (`APPROVE` or `REQUEST_CHANGES`); `assess` doesn't run; emphasis entries only sharpen the review. `false`: `assess` may route a PR to a human hand-off, and a PR matching an emphasis entry leans to that hand-off. |
+| `scope_key` | `{{.repo}}` | Where a review's learning lives: a memory scope-key template over the review's facts. See [Scope keys](#scope-keys). |
 | `state_dir` | `""` | conductor's state directory, for the calibration triggers. Empty: `$XDG_STATE_HOME/conductor`, else `~/.local/state/conductor`. Set it if your daemon runs with another state directory — code steps don't inherit `XDG_STATE_HOME`. |
 | `audit_log` | `""` | The audit log calibration reads reviews from. Empty: `<state_dir>/audit.jsonl` (its rotated `.1` is read too). Set it if your config moves `store.audit_log`. |
 | `git_base` | `https://github.com` | Where calibration clones reviewed repos from (`<git_base>/<owner>/<repo>.git`). https clones authenticate through the `gh` CLI's login. |
-| `calibration_window_days` | `14` | How long after a reviewed PR merges a later commit that changes its lines counts as a follow-up. |
+| `calibration_window_days` | `14` | How long after a reviewed PR merges a later commit that changes its lines, or a comment of yours on it, counts as a follow-up. |
 | `calibration_bootstrap_days` | `30` | How far back the first calibration run looks. |
-| `calibration_unmerged_days` | `30` | Stop waiting for a reviewed PR to merge after this many days. |
+| `calibration_unmerged_days` | `30` | Stop waiting for a reviewed PR to merge after this many days (and stop reading your comments on it). |
 | `calibration_discard_days` | `7` | A hand-off draft nobody posted within this many days counts as discarded. |
 | `calibration_min_lines` | `3` | A later commit is a follow-up only if it changes or removes at least this many lines the reviewed PR added. |
 | `calibration_team_pages` | `15` | Pages (100 comments each) of teammates' review comments read per repo per calibration run. |
-| `backfill_max_pages` | `300` | Pages of review comments read per repo by `review-backfill`. |
+| `backfill_max_pages` | `300` | Pages (100 comments each) read per repo by `review-backfill` — a safety cap. A repo that hits it is reported as truncated; raise it for a `days=all` train of a long history. |
 | `backfill_min_chars` | `40` | `review-backfill` ignores comments shorter than this. |
-| `backfill_reviewer_since` | `""` | `review-backfill`: your own comments from this date (`YYYY-MM-DD`) on may have been posted by this pack under your account, so they aren't counted as yours. Empty: the date of the first review this pack posted, from the audit log. |
+| `backfill_reviewer_since` | `""` | `review-backfill`: the date (`YYYY-MM-DD`) this pack started posting under your account. From then on your own comments count as yours only when the audit log shows the pack didn't post them; from before the audit log's oldest record they are dropped. Empty: the date of the first review this pack posted, from the audit log. |
 
 Settings are substituted as text. `auto` is read once, by the review flow's
 first step (`automode`), case-insensitively and with surrounding space
@@ -104,29 +106,65 @@ reviewer your trust.
 
 ## Memory: how the reviewer learns
 
-The lens reviewers read conductor's shared memory, layered per repo. Each
-review recalls, newest first and up to 100 entries across all of them:
+The lens reviewers read conductor's shared memory, layered by a **scope key**
+— the `scope_key` setting. Each review renders the key over its own facts and
+recalls, newest first and up to 100 entries across all of them:
 
 | Scope | What lives there |
 |---|---|
-| `global` (the shared set) | The reviewer-wide standard — rules that apply in every repo. |
-| `<owner/repo>` | Facts about this repo the diff can't show: how it is built, deployed, operated, used. |
-| `standard:<owner/repo>` | This repo's additions to the review standard. |
-| `emphasis:<owner/repo>` | "Look hard at X" rules: kinds of change in this repo that past reviews got wrong. |
+| `global` (the shared set) | The reviewer-wide standard — rules that apply everywhere. |
+| `<key>` | Facts the diff can't show: how the code is built, deployed, operated, used. |
+| `standard:<key>` | This key's additions to the review standard. |
+| `emphasis:<key>` | "Look hard at X" rules: kinds of change that past reviews got wrong. |
 
 Entries written by calibration are tagged with their layer (`standard`,
-`emphasis`, `fact`), and the lens prompt explains the tags: `standard` notes
-weigh like the repo's own CLAUDE.md/AGENTS.md/CONTRIBUTING, `emphasis` notes
-mark areas to look at hard, everything else is context.
+`emphasis`, `fact`) and `review-tuning`, and the lens prompt explains the
+tags: `standard` notes weigh like the repo's own CLAUDE.md/AGENTS.md/
+CONTRIBUTING, `emphasis` notes mark areas to look at hard, everything else is
+context.
 
-`emphasis:<repo>` also feeds `assess`: with `auto: false`, a PR that matches
+`emphasis:<key>` also feeds `assess`: with `auto: false`, a PR that matches
 an emphasis rule leans to the hand-off. With `auto: true` the rules only add
 review emphasis.
 
 You can write entries by hand too — with the `dir:` backend each one is a
 Markdown file in your memory directory, and the `scope:` line picks its
-layer. To change how many entries a review reads, override the step:
-`steps: { review-team/review: { memory: { limit: 40, extra_scopes: ["standard:${repo}", "emphasis:${repo}"] } } }`.
+layer. To change how many entries a review reads, override the step and keep
+the three layers:
+`steps: { review-team/review: { memory: { limit: 40, extra_scopes: ["{{.repo}}", "standard:{{.repo}}", "emphasis:{{.repo}}"] } } }`
+(with your own `scope_key` in place of `{{.repo}}`).
+
+### Scope keys
+
+The default, `{{.repo}}`, gives every repository its own layers — what one
+repo teaches stays in that repo. Any other grouping is a template over the
+review's facts, in core's scope-key syntax (`{{.fact}}`, `| default "x"`,
+`coalesce`, `index`, `print`, `printf`; no conditionals or variables):
+
+| `scope_key` | One layer per… |
+|---|---|
+| `{{.repo}}` (default) | repository: `acme/app`, `standard:acme/app`, … |
+| `org:{{.owner}}` | owner/org: every repo of `acme` shares `org:acme`, `standard:org:acme`, … |
+| `area:{{index .labels 0}}` | the PR's first label — a monorepo area, if you label PRs by area. A PR with no label has no key (`default` can't help: `index` of an empty list fails first), so it reads and teaches only the shared set. |
+| `{{.repo}}@{{.base}}` | repo and base branch: a release branch learns apart from `main`. |
+
+A key may read `repo`, `owner`, `name`, `number`, `pr`, `kind`, `title`,
+`labels`, `base`, `url`, `inputs.repo` and `inputs.pr` — the facts
+calibration can rebuild for a past PR. Anything else (`head`, `me`, step
+outputs) fails the run with an error naming the fact. Changed paths are not a
+fact; for a monorepo area, label the PRs. `labels`, `base` and `title` are
+chosen by the PR's author, and calibration reads their *current* values, so
+relabeling a PR moves its lessons. A key that reads a fact the PR has no
+value for (an empty label list, a blank title) doesn't apply to that PR:
+it reads only the shared set, and calibration won't cite it.
+
+To check what a key renders to, ask core:
+`echo '{"repo":"acme/app","owner":"acme"}' | conductor memory key --template 'org:{{.owner}}' --facts -`.
+
+Changing `scope_key` doesn't move entries already written: the old layers
+stay put and stop being read. Move them with `conductor memory rescope` (see
+[Starting over](#starting-over-a-fresh-train)) or retrain with a fresh
+backfill.
 
 ## Calibration
 
@@ -139,6 +177,17 @@ these need both. Arming them is your call.
 
 Reads what is new since its last run:
 
+- **your own comments on reviewed PRs ("owner catches")** — reviews post as
+  your account, so anything that account wrote on a PR *after* the pack
+  reviewed it, and that the pack didn't post, is you correcting it: a later
+  `CHANGES_REQUESTED` review, an inline comment (a reply to the pack's comment
+  is shown with it), a conversation comment, or a dismissal of the pack's
+  review. They count until `calibration_window_days` after the PR merges
+  (`calibration_unmerged_days` if it doesn't), and they are the strongest
+  signal the agent gets. The pack's own posts are told apart by the audit
+  log's `submit_review` records (review body and time, and the inline
+  comments it sent) — never by author — so a PR whose audit records have
+  rotated away is skipped rather than guessed at;
 - **reviews this pack posted** — from the audit log, so the repos it covers
   are exactly the repos it reviewed; nothing is configured per repo;
 - **follow-up commits** — commits that changed or removed lines a reviewed PR
@@ -147,24 +196,34 @@ Reads what is new since its last run:
 - **hand-off outcomes** — each draft it handed to a human compared with what
   was actually posted: as-is, edited (dropped / added / reworded comments, a
   changed verdict), or discarded;
-- **teammates' review comments** on those repos (bots, replies, and the
-  reviewer's own account — from `gh api user` — excluded).
+- **teammates' review comments** on those repos (bots, replies, and your own
+  account excluded — yours are the owner catches above).
+
+**Teaching it in auto mode.** With `auto: true` nothing is handed off, so
+there are no drafts to learn from: comment on the PR instead. Request changes
+on a PR the pack approved, reply to one of its inline comments to say it was
+wrong, or note what it missed in the conversation — the next calibration run
+reads that as a miss and turns it into an entry for the PR's key.
 
 An agent reads all of that inline — no network, no files, no memory access —
 and proposes entries, each with a `kind` (`fact`, `standard`, `emphasis`,
-`global`, or `none` for a candidate it dropped), a repo, and the PRs it rests
-on. A deterministic step then checks every proposal before anything is
-written:
+`global`, or `none` for a candidate it dropped), a key, and the PRs it rests
+on. Calibration maps every PR it shows the agent to that PR's key by
+rendering `scope_key` over the PR's facts (fetching title, labels, base and
+URL from GitHub only when the key reads them), so a lesson lands exactly
+where reviews of such PRs read. A deterministic step then checks every
+proposal before anything is written:
 
-- the scope comes from the kind and repo — `fact` → `<repo>`, `standard` →
-  `standard:<repo>`, `emphasis` → `emphasis:<repo>`, `global` → the shared
+- the scope comes from the kind and key — `fact` → `<key>`, `standard` →
+  `standard:<key>`, `emphasis` → `emphasis:<key>`, `global` → the shared
   set — never from the agent;
-- what one repo teaches stays in that repo: a `global` entry is accepted only
-  when its evidence cites PRs from **at least two different repos** in the
-  run. One resting on a single repo (however many of its PRs) is downgraded
-  to `standard:<that repo>`, and the downgrade is logged;
-- the repo must be one this run collected evidence for, and the evidence must
-  cite PRs in this run's repos (a per-repo entry must cite its own repo);
+- what one key teaches stays under that key: every PR a per-key entry cites
+  must map to that key, and the key must be one this run collected evidence
+  for;
+- a `global` entry is accepted only when its evidence maps to **at least two
+  different keys**. One resting on a single key (however many of its PRs) is
+  downgraded to `standard:<that key>`, and the downgrade is logged;
+- evidence must be PRs this run collected under a key;
 - a proposal may replace an existing entry only in the scope it writes.
 
 Anything else is rejected and logged. Repo names read from the audit log or
@@ -177,14 +236,51 @@ advances once the writes land, so a failed run re-reads the same window.
 
 ### review-backfill
 
-A one-time seed from a window of past human review comments on repos you
-name: one agent per month extracts what reviewers look out for, one agent
-merges the patterns into entries, and the same checked write path writes
-them.
+A seed from past human review comments on repos you name: one agent per
+month extracts what reviewers look out for, one agent merges the patterns
+into entries, and the same checked write path writes them, each to the key
+its evidence PRs map to.
 
 ```
 conductor run review/review-backfill --input repos=your-org/app,your-org/api --input days=365
 ```
+
+- `days` — how far back to read: a number of days (default 365), or `all`
+  for each repo's whole history. `backfill_max_pages` stays a safety cap (100
+  comments a page); a repo that hits it is listed as **truncated** in the run
+  log and on stderr — raise the setting and run again.
+- Your own comments from the pack's era count as yours only when the audit
+  log shows the pack didn't post them (see `backfill_reviewer_since`).
+
+### Starting over: a fresh train
+
+To retrain a key from its entire history, replacing what calibration learned
+so far:
+
+```
+conductor run review/review-backfill --input repos=owner/app --input days=all --input fresh=true
+```
+
+`fresh=true` (default `false`) archives, just before the new entries are
+written, every **learned** entry in the layers of the keys being trained —
+`<key>`, `standard:<key>`, `emphasis:<key>`. "Learned" means tagged
+`review-tuning`; entries you wrote by hand without that tag stay, and the
+shared `global` set is never archived by a per-key train. Nothing is
+deleted: each entry moves to `archive:<its scope>` (e.g.
+`archive:standard:owner/app`), which no review reads, and the moves are
+listed in the run log.
+
+To archive or restore by hand, use core's rescope (a dry run until you add
+`--apply`):
+
+```
+conductor memory rescope --scope 'standard:owner/app' --tag review-tuning --to 'archive:{scope}'
+conductor memory rescope --scope 'archive:*' --to '<scope to restore to>' --apply
+```
+
+`--scope` takes a key, `*` or a glob (`'standard:owner/*'`); `{scope}` in
+`--to` is each entry's current scope. Rescope never touches entries a pack
+ships.
 
 ### Arming calibration
 
@@ -242,7 +338,8 @@ conductor memory export \
   --out ../review-training --name review-training
 ```
 
-Commit `../review-training` to a repo (a private one is fine — give the pack
+(Use your `scope_key`'s keys — e.g. `org:your-org`, `standard:org:your-org`,
+… — if it isn't the default.) Commit `../review-training` to a repo (a private one is fine — give the pack
 source an `auth:` credential) and install it:
 
 ```yaml
@@ -259,14 +356,21 @@ Re-export and push to update it.
 3.0.0 is a major version: a `~> 2.x` pin won't pick it up.
 
 - **Needs conductor >= 0.69.0.**
-- **Routing is now emphasis.** `assess` reads `emphasis:<repo>` itself. If you
+- **Learning has a scope key.** `scope_key` defaults to `{{.repo}}`, so the
+  layers are `<repo>`, `standard:<repo>` and `emphasis:<repo>` — entries you
+  already keep per repo are read as before.
+- **Routing is now emphasis.** `assess` reads `emphasis:<key>` itself. If you
   override `review-flow/assess`'s `decide.state` to inject routing rules,
   delete that override; it also references the `diffcap` step 2.10 removed.
   Move routing entries to the new scope — with the `dir:` backend, change
   each file's `scope: routing:<repo>` line to `scope: emphasis:<repo>`.
-- **The lens panel reads memory by default** (limit 100, the per-repo layers
-  above). A `review-team/review: { memory: … }` override is no longer needed;
-  if you keep one, include the `extra_scopes`.
+- **The lens panel reads memory by default** (limit 100, the layers of
+  `scope_key` above). A `review-team/review: { memory: … }` override is no
+  longer needed; if you keep one, include all three `extra_scopes`.
+- **Your own comments teach it.** Calibration used to skip everything your
+  account wrote; it now reads what you wrote after the pack's review as owner
+  catches, and backfill counts your pack-era comments unless the audit log
+  shows the pack posted them.
 - **Calibration moved into the pack.** If you run your own calibration or
   backfill triggers, the pack's `review-calibration` and `review-backfill`
   replace them; arm those and remove yours. The pack keeps its own position

@@ -65,22 +65,47 @@ def run_js_mem(code, ctx, store):
     return r["out"], r["store"]
 
 
-def entry(repo, kind, text, evidence, **kw):
-    e = {"repo": repo, "kind": kind, "text": text, "evidence": evidence}
+def entry(key, kind, text, evidence, **kw):
+    e = {"key": key, "kind": kind, "text": text, "evidence": evidence}
     e.update(kw)
     return e
 
 
+def pr_facts(ref, **meta):
+    """A PR's facts as collect emits them (scripts/calibration.py pr_facts)."""
+    repo, n = ref.split("#")
+    owner, name = repo.split("/")
+    f = {"repo": repo, "owner": owner, "name": name, "number": int(n), "pr": int(n), "issue": 0,
+         "kind": "review_requested", "inputs": {"repo": repo, "pr": int(n)}}
+    f.update(meta)
+    return f
+
+
+def scopekeys(template, ctx):
+    return run_js(load()["x-templates"]["scopekeys"]["code"], ctx, {"scope_key": template})
+
+
+def keys_for(refs, template="{{.repo}}"):
+    """The `keys` step's output for these PRs under a scope_key template."""
+    return scopekeys(template, {"collect": {"prs": [{"ref": r, "facts": pr_facts(r)} for r in refs]}})
+
+
+RUN = ("acme/api#1", "acme/api#2", "acme/api#3", "acme/api#4", "acme/api#5", "acme/api#6", "acme/api#7", "acme/api#9",
+       "acme/web#1", "acme/web#2", "acme/web#3", "other/svc#3")
+
+
 class PlanTest(unittest.TestCase):
-    """The write restriction: scope comes from kind + repo, and only for repos
-    this run collected evidence for."""
+    """The write restriction: the scope comes from kind + key, and a key's
+    entries must rest on PRs that map to that key. With the default scope_key
+    ({{.repo}}) a key is a repo — the 3.0 behavior."""
 
     @classmethod
     def setUpClass(cls):
         cls.code = load()["x-templates"]["plan"]["code"]
+        cls.repo_keys = keys_for(RUN)
 
-    def plan(self, entries, repos=("acme/api",), known=(), via="calibrate"):
-        ctx = {"collect": {"repos": list(repos)}, "known": {"list": list(known)}, via: {"entries": entries}}
+    def plan(self, entries, keys=None, known=(), via="calibrate"):
+        ctx = {"keys": keys or self.repo_keys, "known": {"list": list(known)}, via: {"entries": entries}}
         return run_js(self.code, ctx)
 
     def test_each_kind_lands_in_its_own_scope(self):
@@ -90,7 +115,7 @@ class PlanTest(unittest.TestCase):
             entry("acme/api", "emphasis", "a PR that touches billing/ needs close review (acme/api#6)", ["acme/api#6"]),
             entry("acme/api", "global", "a swallowed error is blocking (acme/api#7, acme/web#2)",
                   ["acme/api#7", "acme/web#2"]),
-        ], repos=("acme/api", "acme/web"))
+        ])
         self.assertEqual([(w["scope"], w["label"]) for w in out["writes"]], [
             ("acme/api", "acme/api"),
             ("standard:acme/api", "standard:acme/api"),
@@ -103,56 +128,60 @@ class PlanTest(unittest.TestCase):
         self.assertEqual(out["writes"][2]["tags"], ["review-tuning", "calibration", "emphasis"])
         self.assertEqual(out["writes"][3]["tags"], ["review-tuning", "calibration", "standard"])
 
-    def test_a_global_resting_on_one_repo_stays_in_that_repo(self):
-        # one repo's evidence never reaches every other repo's review
-        out = self.plan([entry("acme/api", "global", "a swallowed error is blocking (acme/api#7)", ["acme/api#7"])],
-                        repos=("acme/api", "acme/web"))
+    def test_a_global_resting_on_one_key_stays_in_that_key(self):
+        out = self.plan([entry("acme/api", "global", "a swallowed error is blocking (acme/api#7)", ["acme/api#7"])])
         self.assertEqual([(w["scope"], w["label"], w["tags"]) for w in out["writes"]],
                          [("standard:acme/api", "standard:acme/api", ["review-tuning", "calibration", "standard"])])
         self.assertEqual(len(out["downgraded"]), 1)
         self.assertIn("global -> standard:acme/api", out["downgraded"][0])
         self.assertEqual(out["rejected"], [])
 
-    def test_several_prs_of_one_repo_are_still_one_repo(self):
+    def test_several_prs_of_one_key_are_still_one_key(self):
         out = self.plan([entry("acme/api", "global", "x", ["acme/api#1", "acme/api#2", "acme/api#3"])])
         self.assertEqual([w["scope"] for w in out["writes"]], ["standard:acme/api"])
         self.assertEqual(len(out["downgraded"]), 1)
 
-    def test_a_downgrade_lands_in_the_cited_repo_not_the_named_one(self):
-        out = self.plan([entry("acme/web", "global", "x", ["acme/api#1"])], repos=("acme/api", "acme/web"))
+    def test_a_downgrade_lands_in_the_cited_key_not_the_named_one(self):
+        out = self.plan([entry("acme/web", "global", "x", ["acme/api#1"])])
         self.assertEqual([w["scope"] for w in out["writes"]], ["standard:acme/api"])
 
-    def test_two_distinct_repos_make_a_global(self):
-        out = self.plan([entry("acme/web", "global", "x", ["acme/web#1", "acme/api#9"])], repos=("acme/api", "acme/web"))
+    def test_two_distinct_keys_make_a_global(self):
+        out = self.plan([entry("acme/web", "global", "x", ["acme/web#1", "acme/api#9"])])
         self.assertEqual([w["scope"] for w in out["writes"]], [""])
         self.assertEqual(out["downgraded"], [])
 
-    def test_a_downgraded_global_supersedes_only_within_its_repo(self):
+    def test_a_downgraded_global_supersedes_only_within_its_key(self):
         known = [{"id": "m1", "scope": "global", "text": "old"}, {"id": "m2", "scope": "standard:acme/api", "text": "old"}]
         out = self.plan([entry("acme/api", "global", "a", ["acme/api#1"], supersedes="m1"),
                          entry("acme/api", "global", "b", ["acme/api#1"], supersedes="m2")], known=known)
         self.assertEqual(out["forget"], ["m2"])
 
-    def test_a_repo_outside_the_run_is_rejected(self):
-        out = self.plan([entry("other/svc", "fact", "x", ["other/svc#1"])])
+    def test_a_key_outside_the_run_is_rejected(self):
+        out = self.plan([entry("other/elsewhere", "fact", "x", ["other/svc#3"])])
         self.assertEqual(out["writes"], [])
-        self.assertIn("not a repo this run collected evidence for", out["rejected"][0])
+        self.assertIn("not a key this run collected evidence for", out["rejected"][0])
 
-    def test_evidence_must_stay_inside_the_run(self):
+    def test_evidence_must_be_prs_this_run_collected(self):
         out = self.plan([
-            entry("acme/api", "fact", "cites a foreign PR", ["other/svc#1"]),
-            entry("acme/api", "global", "global, cites a foreign PR", ["acme/api#2", "other/svc#1"]),
+            entry("acme/api", "fact", "cites a PR the run never showed", ["acme/api#99"]),
+            entry("acme/api", "global", "global, cites a foreign PR", ["acme/api#2", "elsewhere/x#1"]),
             entry("acme/api", "standard", "no evidence", []),
             entry("acme/api", "fact", "bad ref", ["acme/api"]),
         ])
         self.assertEqual(out["writes"], [])
         self.assertEqual(len(out["rejected"]), 4)
+        self.assertIn("acme/api#99 is not a PR this run collected", out["rejected"][0])
 
-    def test_a_per_repo_entry_must_cite_its_own_repo(self):
-        out = self.plan([entry("acme/api", "fact", "evidence is the other in-run repo", ["acme/web#3"])],
-                        repos=("acme/api", "acme/web"))
+    def test_every_evidence_pr_must_map_to_the_entrys_key(self):
+        out = self.plan([entry("acme/api", "fact", "one PR of another key", ["acme/api#1", "acme/web#3"]),
+                         entry("acme/api", "fact", "only another key", ["acme/web#3"])])
         self.assertEqual(out["writes"], [])
-        self.assertIn("does not cite acme/api", out["rejected"][0])
+        self.assertIn("evidence must all map to acme/api (also cites acme/web)", out["rejected"][0])
+        self.assertEqual(len(out["rejected"]), 2)
+
+    def test_refs_are_normalized(self):
+        out = self.plan([entry("acme/api", "fact", "x", [" acme/api#01 "])])
+        self.assertEqual([w["scope"] for w in out["writes"]], ["acme/api"])
 
     def test_the_agent_cannot_name_a_scope(self):
         out = self.plan([entry("acme/api", "routing", "x", ["acme/api#1"]),
@@ -194,6 +223,133 @@ class PlanTest(unittest.TestCase):
         out = self.plan([entry("acme/api", "fact", "the team flags N+1 queries (acme/api#2)", ["acme/api#2"], team=True)],
                         via="merge")
         self.assertEqual(out["writes"][0]["tags"], ["review-tuning", "backfill", "fact", "team"])
+
+
+class OwnerKeyTest(unittest.TestCase):
+    """scope_key = org:{{.owner}}: an owner's repos share one layer; another owner's don't."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.plan_code = load()["x-templates"]["plan"]["code"]
+        cls.keys = keys_for(RUN, "org:{{.owner}}")
+
+    def plan(self, entries):
+        return run_js(self.plan_code, {"keys": self.keys, "known": {"list": []}, "calibrate": {"entries": entries}})
+
+    def test_prs_of_one_owner_map_to_one_key(self):
+        k = self.keys
+        self.assertEqual(k["key_list"], ["org:acme", "org:other"])
+        self.assertEqual(k["keys"]["acme/api#1"], "org:acme")
+        self.assertEqual(k["keys"]["acme/web#2"], "org:acme")
+        self.assertEqual(k["keys"]["other/svc#3"], "org:other")
+        self.assertIn("- org:acme: acme/api#1", k["text"])
+
+    def test_two_repos_of_one_owner_share_a_layer(self):
+        out = self.plan([entry("org:acme", "standard", "handlers return typed errors", ["acme/api#1", "acme/web#2"])])
+        self.assertEqual([w["scope"] for w in out["writes"]], ["standard:org:acme"])
+
+    def test_a_different_owner_cannot_be_written_from_this_evidence(self):
+        out = self.plan([entry("org:other", "fact", "x", ["acme/api#1"]),
+                         entry("org:acme", "fact", "y", ["acme/api#1", "other/svc#3"])])
+        self.assertEqual(out["writes"], [])
+        self.assertEqual(len(out["rejected"]), 2)
+
+    def test_global_needs_two_distinct_keys_not_two_repos(self):
+        two_repos_one_key = self.plan([entry("org:acme", "global", "x", ["acme/api#1", "acme/web#2"])])
+        self.assertEqual([w["scope"] for w in two_repos_one_key["writes"]], ["standard:org:acme"])
+        self.assertEqual(len(two_repos_one_key["downgraded"]), 1)
+        two_keys = self.plan([entry("org:acme", "global", "x", ["acme/api#1", "other/svc#3"])])
+        self.assertEqual([w["scope"] for w in two_keys["writes"]], [""])
+
+    def test_the_lens_panel_reads_the_same_layers(self):
+        review = flow_step(load(), "review-team", "review")
+        self.assertEqual(review["memory"]["extra_scopes"],
+                         ["${settings.scope_key}", "standard:${settings.scope_key}", "emphasis:${settings.scope_key}"])
+
+
+class ScopeKeyTest(unittest.TestCase):
+    """The pack's js port of core's scope-key renderer, and the scope_key rules."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.code = load()["x-templates"]["scopekeys"]["code"]
+
+    def vectors(self, name):
+        with open(os.path.join(HERE, "testdata", name)) as f:
+            v = json.load(f)
+        # render every case through the step's renderer, in one node run
+        src = self.code[self.code.index("// ---- the scope-key renderer"):self.code.index("// ---- end of the renderer ----")]
+        prog = "const ctx = {};\n" + src + "\nconst v = %s;\nprocess.stdout.write(JSON.stringify(v.cases.map(function (c) { return renderKey(c.template, v.facts); })));" % json.dumps(v)
+        res = subprocess.run(["node", "-e", prog], capture_output=True, text=True)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        got = json.loads(res.stdout)
+        for c, g in zip(v["cases"], got):
+            self.assertEqual(g, None if c.get("drop") else c["want"], c["template"])
+        return len(got)
+
+    def test_cores_vectors(self):
+        self.assertEqual(self.vectors("scope_key_vectors.json"), 37)
+
+    def test_extra_cases_rendered_by_core(self):
+        self.assertEqual(self.vectors("scope_key_vectors_extra.json"), 48)
+
+    def test_the_aliases_pass_through_the_setting(self):
+        ctx = {"inputs": {"repo": "acme/api", "pr": 7}}
+        self.assertEqual(scopekeys("standard:${repo}", ctx)["key"], "standard:acme/api")
+
+    def test_the_default_key_is_the_repo(self):
+        man = load()
+        self.assertEqual(man["settings"]["scope_key"]["default"], "{{.repo}}")
+        self.assertEqual(scopekeys("{{.repo}}", {"inputs": {"repo": "acme/api", "pr": 7}}), {"key": "acme/api", "applies": True})
+
+    def test_a_review_renders_over_its_pr_metadata(self):
+        ctx = {"inputs": {"repo": "acme/api", "pr": 7},
+               "prmeta": {"title": "t", "labels": [{"name": "payments"}, "x"], "base": "release-2", "url": "u"}}
+        self.assertEqual(scopekeys("area:{{index .labels 0}}", ctx)["key"], "area:payments")
+        self.assertEqual(scopekeys("{{.repo}}@{{.base}}", ctx)["key"], "acme/api@release-2")
+        self.assertEqual(scopekeys("area:{{index .labels 0}}", {"inputs": {"repo": "acme/api", "pr": 7}, "prmeta": {"labels": []}}),
+                         {"key": "", "applies": False})   # no label: the key doesn't apply, nothing is read
+
+    def test_emphasis_reads_this_reviews_key(self):
+        code = flow_step(load(), "review-flow", "emphasis")["code"]
+        store = [{"id": "e1", "scope": "emphasis:org:acme", "text": "billing needs a hard look", "tags": []},
+                 {"id": "e2", "scope": "emphasis:acme/api", "text": "the repo's own rule", "tags": []},
+                 {"id": "e3", "scope": "emphasis:org:other", "text": "another owner's rule", "tags": []}]
+        out, _ = run_js_mem(code, {"scopekey": {"key": "org:acme", "applies": True}}, store)
+        self.assertEqual(out, {"key": "org:acme", "memories": [{"text": "billing needs a hard look"}]})
+        out, _ = run_js_mem(code, {"scopekey": {"key": "", "applies": False}}, store)
+        self.assertEqual(out["memories"], [])                    # a key that doesn't apply reads nothing
+
+    def test_review_flow_renders_the_key_before_emphasis(self):
+        ids = [s.get("id") for s in load()["workflows"]["review-flow"]["steps"]]
+        self.assertLess(ids.index("prmeta"), ids.index("scopekey"))
+        self.assertLess(ids.index("scopekey"), ids.index("emphasis"))
+        self.assertLess(ids.index("emphasis"), ids.index("assess"))
+
+    def test_unrebuildable_facts_fail_loudly(self):
+        for t in ("team:{{.inputs.team}}", "{{.steps.triage.outputs.area}}", "{{.head}}", "{{.me.login}}",
+                  "{{.workflow}}", "{{index .inputs \"team\"}}", "{{.}}", "x:${step}"):
+            with self.assertRaises(AssertionError) as cm:
+                scopekeys(t, {"inputs": {"repo": "acme/api", "pr": 7}})
+            self.assertIn("a key may read only", str(cm.exception), t)
+        for t in ("{{.owner", "{{if .owner}}x{{end}}", "   "):
+            with self.assertRaises(AssertionError) as cm:
+                scopekeys(t, {})
+            self.assertIn("the scope_key setting", str(cm.exception), t)
+
+    def test_keyspec_says_when_collect_must_fetch_pr_metadata(self):
+        self.assertEqual(scopekeys("org:{{.owner}}", {}), {"needs_meta": False})
+        self.assertEqual(scopekeys("{{printf \"%s/%s\" .repo (index .labels 0)}}", {}), {"needs_meta": True})
+
+    def test_a_pr_whose_key_does_not_render_cannot_be_cited(self):
+        out = scopekeys("area:{{index .labels 0}}", {"collect": {"prs": [
+            {"ref": "acme/api#1", "facts": pr_facts("acme/api#1", labels=["billing"])},
+            {"ref": "acme/api#2", "facts": pr_facts("acme/api#2", labels=[])}]}})
+        self.assertEqual(out["keys"], {"acme/api#1": "area:billing"})
+        self.assertEqual(out["unkeyed"], ["acme/api#2"])
+        plan = run_js(load()["x-templates"]["plan"]["code"],
+                      {"keys": out, "known": {"list": []}, "calibrate": {"entries": [entry("area:billing", "fact", "x", ["acme/api#2"])]}})
+        self.assertIn("acme/api#2 is not a PR this run collected under a scope key", plan["rejected"][0])
 
 
 class AutoModeTest(unittest.TestCase):
@@ -337,7 +493,7 @@ class FreshTrainTest(unittest.TestCase):
         ]
 
     def test_moves_only_the_learned_entries_of_the_trained_keys(self):
-        out, store = run_js_mem(self.archive, {"collect": {"keys": ["acme/api"]}}, self.store())
+        out, store = run_js_mem(self.archive, {"keys": {"key_list": ["acme/api"]}}, self.store())
         self.assertEqual(sorted(out["ids"]), ["a1", "a2", "a3"])
         by_scope = {}
         for m in store:
@@ -355,7 +511,7 @@ class FreshTrainTest(unittest.TestCase):
 
     def test_plan_does_not_dedup_against_what_was_archived(self):
         known = [{"id": "a2", "scope": "standard:acme/api", "text": "learned standard"}]
-        ctx = {"collect": {"repos": ["acme/api"]}, "known": {"list": known}, "archive": {"ids": ["a2"]},
+        ctx = {"keys": keys_for(["acme/api#1"]), "known": {"list": known}, "archive": {"ids": ["a2"]},
                "merge": {"entries": [entry("acme/api", "standard", "learned standard", ["acme/api#1"], supersedes="a2")]}}
         out = run_js(self.plan, ctx)
         self.assertEqual([w["scope"] for w in out["writes"]], ["standard:acme/api"])   # re-learned, not "already recorded"
@@ -367,12 +523,6 @@ class FreshTrainTest(unittest.TestCase):
         self.assertLess(steps.index("merge"), steps.index("archive"))
         self.assertLess(steps.index("archive"), steps.index("plan"))
         self.assertLess(steps.index("fresh"), steps.index("extract"))
-
-
-class LayeringTest(unittest.TestCase):
-    def test_lens_panel_reads_the_repo_layers(self):
-        review = flow_step(load(), "review-team", "review")
-        self.assertEqual(review["memory"]["extra_scopes"], ["standard:${repo}", "emphasis:${repo}"])
 
 
 if __name__ == "__main__":

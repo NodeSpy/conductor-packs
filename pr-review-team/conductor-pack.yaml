@@ -13,9 +13,12 @@
 # don't pile up.
 #
 # The reviewer LEARNS through memory: the lens panel reads reviewer-wide
-# entries plus this repo's facts, standard and emphasis entries, and two
-# disarmed triggers (review-calibration, review-backfill) write those entries
-# from what happened after past reviews. See the README.
+# entries plus the facts, standard and emphasis entries of the review's SCOPE
+# KEY (the scope_key setting — the repo by default, or any key you template
+# over the review's facts), and two disarmed triggers (review-calibration,
+# review-backfill) write those entries from what happened after past reviews:
+# follow-up commits, hand-off edits, teammates' comments, and what you
+# yourself wrote on a PR after the pack reviewed it. See the README.
 #
 # Define-behavior / bind-environment: this pack ships only BEHAVIOR (workflows
 # and disarmed triggers). It carries NO connectors and NO secrets — you bind
@@ -40,16 +43,17 @@
 pack:
   name: pr-review-team
   version: 3.0.0
-  description: Multi-lens PR review (correctness / security / design …) with refute-verify, deterministic reconcile, an optional human hand-off, and calibration that learns per-repo memory from past reviews.
+  description: Multi-lens PR review (correctness / security / design …) with refute-verify, deterministic reconcile, an optional human hand-off, and calibration that learns memory, under a scope key you choose, from past reviews.
   tags: [review, github, code-quality, agents, memory]
   homepage: https://github.com/NodeSpy/conductor-packs
   license: Apache-2.0
   requires:
     # The daemon versions this pack supports. 0.69.0 is the floor for 3.0:
-    # `${repo}` expands inside a memory scope string (`standard:${repo}`) and
-    # a step's `memory: { extra_scopes: [...] }` appends to the default
-    # scopes instead of replacing them — the per-repo layering the lens panel
-    # reads. (A superset of the older floors: 0.57.0 for whole-PR review —
+    # memory scope keys are templates over the step's facts
+    # (`standard:{{.repo}}`, `org:{{.owner}}`), and a step's
+    # `memory: { extra_scopes: [...] }` appends to the default scopes instead
+    # of replacing them — the layering the lens panel reads under the
+    # scope_key setting. (A superset of the older floors: 0.57.0 for whole-PR review —
     # the `checkout: checkout-pr` workspace jail and `github.pr_files`
     # patches — 0.54.0 for `decide:` steps, and 0.33.0 for the reactive
     # hand-off surface.)
@@ -76,6 +80,10 @@ settings:
     type: boolean
     default: false
     desc: "true/yes/1 (any case) = never hand off: every review posts with the team's verdict (APPROVE or REQUEST_CHANGES), and emphasis entries only sharpen the review. false = assess may route a PR to a human hand-off, and a PR matching an emphasis entry leans to that hand-off. Any other value fails the review run."
+  scope_key:
+    type: string
+    default: "{{.repo}}"
+    desc: "where a review's learning lives: a memory scope-key template over the review's facts. The lens panel reads <key>, standard:<key> and emphasis:<key>, and calibration writes each lesson to the key its evidence PRs render to. Default {{.repo}} = one layer per repository; e.g. org:{{.owner}} shares one layer across an owner's repos. May read repo, owner, name, number, pr, kind, title, labels, base, url, inputs.repo, inputs.pr (core's template syntax: {{.x}}, | default \"y\", coalesce, index, print, printf)."
   state_dir:
     type: string
     default: ""
@@ -115,7 +123,7 @@ settings:
   backfill_max_pages:
     type: string
     default: "300"
-    desc: "pages (100 each) of review comments read per repo by review-backfill"
+    desc: "pages (100 each) of review comments read per repo by review-backfill — a safety cap; a repo that hits it is reported as truncated. Raise it for a days=all train of a long history."
   backfill_min_chars:
     type: string
     default: "40"
@@ -123,7 +131,7 @@ settings:
   backfill_reviewer_since:
     type: string
     default: ""
-    desc: "review-backfill: your own comments from this date (YYYY-MM-DD) on may have been posted by this pack, so they are not counted as yours (empty = the first review this pack posted, from the audit log)"
+    desc: "review-backfill: the date (YYYY-MM-DD) this pack started posting under your account. From then on your own comments count as yours only when the audit log shows the pack did not post them; from before the audit log's oldest record they are dropped (empty = the first review this pack posted, from the audit log)"
 
 # MODEL TIERS as fleets. conductor resolves each against your runtime's roster
 # best-first (see the models:/fleets model), so the pack ships NO presets and NO
@@ -197,6 +205,8 @@ x-templates:
       STATE_DIR: "${settings.state_dir}"
       AUDIT_LOG: "${settings.audit_log}"
       GIT_BASE: "${settings.git_base}"
+      # fetch each PR's title/labels/base/url only when scope_key reads one
+      NEED_META: "{{.keyspec.needs_meta}}"
 
   # What an agent proposes. One entry per lesson, classified by where it
   # belongs; `none` is a candidate it considered and dropped (logged, never
@@ -209,17 +219,17 @@ x-templates:
         type: array
         items:
           type: object
-          required: [repo, kind, text, evidence]
+          required: [key, kind, text, evidence]
           properties:
-            repo: { type: string, description: "owner/name the lesson is about; for kind global, the repo it was learned on (global needs evidence from two or more repos)" }
+            key: { type: string, description: "the scope key the lesson belongs to — one of the KEYS listed, the key its evidence PRs map to (for kind global, any of them; global needs evidence from two or more keys)" }
             kind: { type: string, enum: [fact, standard, emphasis, global, none] }
             text: { type: string, description: "one or two plain sentences, naming the PR it came from" }
             evidence: { type: array, items: { type: string }, description: "PR refs, owner/name#N" }
             team: { type: boolean, description: "learned from teammates' comments rather than your own" }
-            supersedes: { type: string, description: "id of an existing entry this one replaces (same repo and kind)" }
+            supersedes: { type: string, description: "id of an existing entry this one replaces (same key and kind)" }
       summary: { type: string, description: "what was written, dropped and why — one line each" }
 
-  # Every memory entry the reviewer reads for this run's repos, minus
+  # Every memory entry the reviewer reads for this run's keys, minus
   # outcome notes (not lessons). Read and written through the code binding
   # rather than the memory.* verbs: a verb step needs a memory: section for
   # the CONFIG to load, and these triggers ship in every install, armed or
@@ -235,9 +245,9 @@ x-templates:
       } catch (e) {
         throw new Error("calibration writes conductor memory — add a top-level memory: section (" + e + ")");
       }
-      const repos = (ctx.collect && ctx.collect.repos) || [];
+      const keys = (ctx.keys && ctx.keys.key_list) || [];
       const want = { global: 1 };
-      for (const r of repos) { want[r] = 1; want["standard:" + r] = 1; want["emphasis:" + r] = 1; }
+      for (const k of keys) { want[k] = 1; want["standard:" + k] = 1; want["emphasis:" + k] = 1; }
       const list = [];
       for (const m of all) {
         const tags = m.tags || [];
@@ -287,18 +297,276 @@ x-templates:
     continue_on_error: true
     options: { repo: "{{.item}}", path: CONTRIBUTING.md, optional: true }
 
+  # THE SCOPE KEY. `scope_key` names where a review's learning lives: the
+  # lens panel reads <key>, standard:<key> and emphasis:<key> (core renders
+  # the template for the review), and everything the pack does with a key
+  # itself — emphasis for assess, mapping calibration's evidence PRs to keys,
+  # archiving a fresh train — renders it here, with one js port of core's
+  # renderer. Core has no js binding for it; this port is tested against
+  # core's own vectors. One step, three uses:
+  #   review-flow  (ctx.inputs.repo/pr + the PR's metadata) -> { key }
+  #   calibration  (ctx.collect.prs: [{ref, facts}])        -> { keys, key_list, unkeyed, text }
+  #   before collect (nothing to render yet)                -> { needs_meta }
+  # A key may read only facts calibration can rebuild for a past PR — the
+  # target (repo, owner, name, number, pr), kind, inputs.repo/inputs.pr and,
+  # fetched when read, title, labels, base and url. Anything else fails the
+  # run here, saying so: learning keyed on a fact calibration can't rebuild
+  # could never land where reviews read it.
+  scopekeys: &scopekeys
+    run: js
+    code: |
+      // The setting arrives as text inside a raw template literal. Core's
+      // dollar-brace aliases (repo, workflow, step) would interpolate there,
+      // so they are defined as their own text — spelled in two halves, so no
+      // alias appears in this code for anything to expand.
+      const repo = "$" + "{repo}", workflow = "$" + "{workflow}", step = "$" + "{step}";
+      const TEMPLATE = String.raw`${settings.scope_key}`;
+      // ---- the scope-key renderer: core's memory.RenderScopeKey, in js ----
+      // A pipeline-only subset of Go text/template (default, coalesce, index,
+      // print, printf), rendered twice like core does — once for real, once
+      // with every empty fact replaced by a probe — so a key that reads a
+      // fact with no value ("", missing, a zero number) does not render.
+      // Tested against core's own vectors (tests/testdata/scope_key_vectors*.json).
+      const PROBE = "\u0000empty-fact\u0000";
+      const FUNCS = { "default": 1, coalesce: 1, index: 1, print: 1, printf: 1 };
+      const KEYWORDS = { "if": 1, range: 1, "with": 1, "else": 1, end: 1, define: 1, template: 1, block: 1, "break": 1, "continue": 1 };
+      const control = function (s) { return /[\u0000-\u001f\u007f-\u009f]/.test(s); };
+      const isMap = function (v) { return v !== null && typeof v === "object" && !Array.isArray(v); };
+      const empty = function (v) { return v === null || v === undefined || v === "" || v === PROBE; };
+      const NOVALUE = {};
+      const fmtv = function (v) {
+        if (v === undefined || v === null || v === NOVALUE) return "<no value>";
+        if (typeof v === "string") return v;
+        if (typeof v === "number" || typeof v === "boolean") return String(v);
+        if (Array.isArray(v)) return "[" + v.map(fmtv).join(" ") + "]";
+        return "map[" + Object.keys(v).sort().map(function (k) { return k + ":" + fmtv(v[k]); }).join(" ") + "]";
+      };
+      const lexAction = function (src) {
+        const toks = []; let i = 0;
+        while (i < src.length) {
+          const c = src[i];
+          if (/\s/.test(c)) { i++; continue; }
+          if (c === "(" || c === ")" || c === "|") { toks.push({ t: c }); i++; continue; }
+          if (c === '"') {
+            let j = i + 1, s = "";
+            while (j < src.length && src[j] !== '"') {
+              if (src[j] === "\\") { const n = src[j + 1]; s += n === "n" ? "\n" : n === "t" ? "\t" : n; j += 2; } else s += src[j++];
+            }
+            if (j >= src.length) throw new Error("unterminated string");
+            toks.push({ t: "lit", v: s }); i = j + 1; continue;
+          }
+          if (c === "`") {
+            const j = src.indexOf("`", i + 1);
+            if (j < 0) throw new Error("unterminated raw string");
+            toks.push({ t: "lit", v: src.slice(i + 1, j) }); i = j + 1; continue;
+          }
+          let m = /^\.([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*)?/.exec(src.slice(i));
+          if (m) { toks.push({ t: "field", path: m[1] ? m[1].split(".") : [] }); i += m[0].length; continue; }
+          m = /^-?\d+(?:\.\d+)?/.exec(src.slice(i));
+          if (m) { toks.push({ t: "lit", v: Number(m[0]) }); i += m[0].length; continue; }
+          m = /^[A-Za-z_]\w*/.exec(src.slice(i));
+          if (m) {
+            const w = m[0];
+            if (KEYWORDS[w]) throw new Error(w + " is not allowed in a scope key");
+            if (w === "true" || w === "false") toks.push({ t: "lit", v: w === "true" });
+            else if (w === "nil") toks.push({ t: "lit", v: null });
+            else if (FUNCS[w]) toks.push({ t: "fn", v: w });
+            else throw new Error("function " + w + " is not allowed in a scope key");
+            i += w.length; continue;
+          }
+          throw new Error("unexpected " + JSON.stringify(c) + " in a scope key (no variables)");
+        }
+        return toks;
+      };
+      const parsePipe = function (toks, pos, close) {
+        const cmds = [[]];
+        while (pos < toks.length) {
+          const k = toks[pos];
+          if (k.t === ")") { if (!close) throw new Error("unexpected )"); return [cmds, pos + 1]; }
+          if (k.t === "|") { if (cmds[cmds.length - 1].length === 0) throw new Error("empty command"); cmds.push([]); pos++; continue; }
+          if (k.t === "(") { const r = parsePipe(toks, pos + 1, true); cmds[cmds.length - 1].push({ t: "pipe", cmds: r[0] }); pos = r[1]; continue; }
+          cmds[cmds.length - 1].push(k); pos++;
+        }
+        if (close) throw new Error("unclosed (");
+        if (cmds[cmds.length - 1].length === 0) throw new Error("empty pipeline");
+        return [cmds, pos];
+      };
+      const parseKey = function (key) {
+        let src = key;
+        for (const a of ["repo", "workflow", "step"]) src = src.split("$" + "{" + a + "}").join("{{." + a + "}}");
+        if (src.indexOf("{{") < 0) return null;
+        const nodes = []; let i = 0;
+        while (i < src.length) {
+          const o = src.indexOf("{{", i);
+          if (o < 0) { nodes.push({ text: src.slice(i) }); break; }
+          let text = src.slice(i, o), j = o + 2, trimRight = false;
+          if (src.slice(j, j + 2) === "- ") { text = text.replace(/\s+$/, ""); j += 2; }
+          if (text) nodes.push({ text: text });
+          let q = null, k = j;
+          for (; k < src.length; k++) {
+            const ch = src[k];
+            if (q) { if (ch === "\\" && q === '"') { k++; continue; } if (ch === q) q = null; continue; }
+            if (ch === '"' || ch === "`") { q = ch; continue; }
+            if (src.slice(k, k + 2) === "}}") break;
+          }
+          if (k >= src.length) throw new Error("unclosed action");
+          let body = src.slice(j, k);
+          if (/\s-$/.test(body)) { body = body.slice(0, -2); trimRight = true; }
+          i = k + 2;
+          if (trimRight) while (i < src.length && /\s/.test(src[i])) i++;
+          if (/^\/\*[\s\S]*\*\/$/.test(body.trim())) continue;
+          nodes.push({ pipe: parsePipe(lexAction(body), 0, false)[0] });
+        }
+        return nodes;
+      };
+      const field = function (facts, path) {
+        let cur = facts;
+        for (const seg of path) {
+          if (!isMap(cur)) throw new Error("can't evaluate field " + seg);
+          cur = Object.prototype.hasOwnProperty.call(cur, seg) ? cur[seg] : NOVALUE;
+          if (cur === null || cur === undefined) cur = NOVALUE;
+        }
+        return cur;
+      };
+      const arg = function (a, facts) {
+        if (a.t === "lit") return a.v;
+        if (a.t === "field") return field(facts, a.path);
+        if (a.t === "pipe") return runPipe(a.cmds, facts);
+        throw new Error("bad argument");
+      };
+      const unwrap = function (v) { return v === NOVALUE ? null : v; };
+      const call = function (fn, args) {
+        args = args.map(unwrap);
+        if (fn === "default") return (args.length < 2 || empty(args[1])) ? args[0] : args[1];
+        if (fn === "coalesce") { for (const v of args) if (!empty(v)) return v; return ""; }
+        if (fn === "index") {
+          let x = args[0];
+          if (x === null) throw new Error("index of untyped nil");
+          for (const k of args.slice(1)) {
+            if (Array.isArray(x)) { if (typeof k !== "number" || k < 0 || k >= x.length) throw new Error("index out of range"); x = x[k]; }
+            else if (isMap(x)) x = Object.prototype.hasOwnProperty.call(x, k) ? x[k] : null;
+            else throw new Error("can't index item");
+          }
+          return x;
+        }
+        const sv = function (v) { return v === null ? "<nil>" : fmtv(v); };
+        if (fn === "print") {
+          let out = "";
+          args.forEach(function (v, n) { if (n > 0 && typeof v !== "string" && typeof args[n - 1] !== "string") out += " "; out += sv(v); });
+          return out;
+        }
+        const f = String(args[0] == null ? "" : args[0]); let n = 1;
+        return f.replace(/%([%svdq])/g, function (m, c) {
+          if (c === "%") return "%";
+          if (n >= args.length) return "%!" + c + "(MISSING)";
+          const v = args[n++];
+          return c === "q" ? JSON.stringify(sv(v)) : sv(v);
+        });
+      };
+      const runPipe = function (cmds, facts) {
+        let val, piped = false;
+        for (const cmd of cmds) {
+          const head = cmd[0];
+          if (head.t === "fn") {
+            const args = cmd.slice(1).map(function (a) { return arg(a, facts); });
+            if (piped) args.push(val);
+            val = call(head.v, args);
+          } else {
+            if (cmd.length > 1 || piped) throw new Error("can't give argument to non-function");
+            val = arg(head, facts);
+          }
+          piped = true;
+        }
+        return val;
+      };
+      const exec = function (nodes, facts) {
+        return nodes.map(function (n) { return n.text !== undefined ? n.text : fmtv(runPipe(n.pipe, facts)); }).join("");
+      };
+      const probe = function (facts) {
+        const out = {};
+        for (const k of Object.keys(facts)) {
+          const v = facts[k];
+          out[k] = (v === null || v === undefined || v === "" || v === 0) ? PROBE : isMap(v) ? probe(v) : v;
+        }
+        return out;
+      };
+      // renderKey(key, facts) -> the key, or null when it does not apply.
+      const renderKey = function (key, facts) {
+        if (control(key)) return null;
+        let nodes;
+        try { nodes = parseKey(key); } catch (e) { return null; }
+        if (nodes === null) return key;
+        let out;
+        try { out = exec(nodes, facts); } catch (e) { return null; }
+        if (out.indexOf("<no value>") >= 0) return null;
+        try { if (exec(nodes, probe(facts)).indexOf(PROBE) >= 0) return null; } catch (e) { return null; }
+        out = out.trim();
+        if (out === "" || control(out)) return null;
+        return out;
+      };
+      // ---- end of the renderer ----
+      const SUPPORTED = { repo: 1, owner: 1, name: 1, number: 1, pr: 1, kind: 1, title: 1, labels: 1, base: 1, url: 1 };
+      const INPUTS = { repo: 1, pr: 1 };
+      const META = { title: 1, labels: 1, base: 1, url: 1 };
+      const setting = "pr-review-team: the scope_key setting " + JSON.stringify(TEMPLATE);
+      if (!TEMPLATE.trim()) throw new Error(setting + " is empty — leave it unset for the per-repo default, {{.repo}}");
+      let nodes;
+      try { nodes = parseKey(TEMPLATE); } catch (e) { throw new Error(setting + " does not parse: " + e.message); }
+      const bad = []; let needsMeta = false;
+      const walk = function (cmds) {
+        for (const c of cmds) for (const a of c) {
+          if (a.t === "pipe") { walk(a.cmds); continue; }
+          if (a.t !== "field") continue;
+          const p = a.path;
+          const ok = p.length > 0 && (p[0] === "inputs" ? (p.length > 1 && INPUTS[p[1]] === 1) : SUPPORTED[p[0]] === 1);
+          if (!ok) bad.push("." + p.join("."));
+          if (p.length > 0 && META[p[0]]) needsMeta = true;
+        }
+      };
+      for (const n of (nodes || [])) if (n.pipe) walk(n.pipe);
+      if (bad.length) throw new Error(setting + " reads " + bad.join(", ") + " — a key may read only repo, owner, name, number, pr, kind, title, " +
+        "labels, base, url, inputs.repo and inputs.pr: calibration rebuilds those for a past PR, and learning keyed on anything else could never land where reviews read it");
+      const labelsOf = function (ls) { return (ls || []).map(function (l) { return typeof l === "string" ? l : (l && l.name) || ""; }).filter(Boolean); };
+      if (ctx.collect && ctx.collect.prs) {
+        const keys = {}, byKey = {}, unkeyed = [];
+        for (const p of ctx.collect.prs) {
+          const k = renderKey(TEMPLATE, p.facts || {});
+          if (k === null) { unkeyed.push(p.ref); continue; }
+          keys[p.ref] = k;
+          (byKey[k] = byKey[k] || []).push(p.ref);
+        }
+        const list = Object.keys(byKey).sort();
+        const text = list.map(function (k) { return "- " + k + ": " + byKey[k].join(", "); }).join("\n") +
+          (unkeyed.length ? "\n- (no key — cannot be cited): " + unkeyed.join(", ") : "");
+        return { keys: keys, key_list: list, unkeyed: unkeyed, count: list.length, text: text || "(none)" };
+      }
+      if (ctx.inputs && ctx.inputs.repo && ctx.inputs.pr) {
+        const repo = String(ctx.inputs.repo), pr = Number(ctx.inputs.pr), slash = repo.indexOf("/");
+        const facts = { repo: repo, owner: repo.slice(0, slash), name: repo.slice(slash + 1), number: pr, pr: pr, issue: 0,
+                        kind: "review_requested", inputs: { repo: repo, pr: pr } };
+        const m = ctx.prmeta || {};
+        if (m.title !== undefined) facts.title = m.title;
+        if (m.labels !== undefined) facts.labels = labelsOf(m.labels);
+        if (m.base !== undefined) facts.base = m.base;
+        if (m.url !== undefined) facts.url = m.url;
+        const k = renderKey(TEMPLATE, facts);
+        return { key: k === null ? "" : k, applies: k !== null };
+      }
+      return { needs_meta: needsMeta };
+
   # The WRITE RESTRICTION. Every proposed entry is checked before anything is
-  # written: its repo must be one this run collected evidence for, and its
-  # evidence must cite that repo. The scope is derived from kind + repo here,
+  # written. Its evidence must be PRs this run collected, each mapped to its
+  # scope key by `keys` (the scope_key template over that PR's facts — the
+  # key its review read), and the scope is derived from kind + key here,
   # never taken from the agent:
-  #   fact      -> <owner/repo>          (the scope the lens panel reads as "this repo")
-  #   standard  -> standard:<owner/repo>
-  #   emphasis  -> emphasis:<owner/repo>
+  #   fact      -> <key>                 (only if EVERY evidence PR maps to <key>)
+  #   standard  -> standard:<key>        (same)
+  #   emphasis  -> emphasis:<key>        (same)
   #   global    -> the shared set        (reviewer-wide) — ONLY when the
-  #                evidence cites PRs from at least two distinct repos in this
-  #                run. One repo's evidence never reaches every other repo's
-  #                review: a global entry resting on one repo is downgraded to
-  #                standard:<that repo>, and the downgrade is logged.
+  #                evidence maps to at least two distinct keys. One key's
+  #                evidence never reaches every other key's reviews: a global
+  #                entry resting on one key is downgraded to standard:<that
+  #                key>, and the downgrade is logged.
   # Anything else is rejected and logged. `supersedes` is honored only for an
   # existing entry in the very scope being written.
   plan: &plan
@@ -307,39 +575,45 @@ x-templates:
     code: |
       const src = ctx.calibrate || ctx.merge || {};
       const entries = src.entries || [];
+      const keyOf = (ctx.keys && ctx.keys.keys) || {};
       const allowed = {};
-      for (const r of ((ctx.collect && ctx.collect.repos) || [])) allowed[r] = 1;
+      for (const k of ((ctx.keys && ctx.keys.key_list) || [])) allowed[k] = 1;
       const archived = {};
       for (const id of ((ctx.archive && ctx.archive.ids) || [])) archived[id] = 1;
       const known = ((ctx.known && ctx.known.list) || []).filter(function (m) { return !archived[m.id]; });
       const byId = {}; const seenText = {};
       for (const m of known) { byId[m.id] = m; seenText[m.scope + "\u0000" + m.text.trim()] = 1; }
       const origin = ctx.calibrate ? "calibration" : "backfill";
-      const repoOf = function (ref) { const m = /^([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)#\d+$/.exec(String(ref || "").trim()); return m ? m[1] : ""; };
+      const refOf = function (ref) {
+        const m = /^([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)#(\d+)$/.exec(String(ref || "").trim());
+        return m ? m[1] + "#" + Number(m[2]) : "";
+      };
       const writes = [], forget = [], rejected = [], dropped = [], superseded = [], downgraded = [];
       for (const e of entries) {
         const text = String(e.text || "").trim();
-        let repo = String(e.repo || "").trim();
+        let key = String(e.key || "").trim();
         let kind = String(e.kind || "");
-        const ev = (e.evidence || []).map(repoOf);
-        if (kind === "none") { dropped.push((repo || "?") + ": " + text); continue; }
-        if (!text || text.length > 800) { rejected.push(kind + " " + repo + ": empty or over 800 chars"); continue; }
-        if (!allowed[repo]) { rejected.push(kind + " " + repo + ": not a repo this run collected evidence for — " + text); continue; }
-        if (ev.length === 0 || ev.some(function (r) { return !allowed[r]; })) { rejected.push(kind + " " + repo + ": evidence must cite PRs in this run's repos — " + text); continue; }
-        if (kind === "global") {
-          const cited = ev.filter(function (r, i) { return ev.indexOf(r) === i; });
-          if (cited.length < 2) {
-            downgraded.push("global -> standard:" + cited[0] + " (evidence from one repo only) — " + text);
-            kind = "standard"; repo = cited[0];
-          }
+        if (kind === "none") { dropped.push((key || "?") + ": " + text); continue; }
+        if (!text || text.length > 800) { rejected.push(kind + " " + key + ": empty or over 800 chars"); continue; }
+        if (["fact", "standard", "emphasis", "global"].indexOf(kind) < 0) { rejected.push(kind + " " + key + ": unknown kind — " + text); continue; }
+        const refs = (e.evidence || []).map(refOf);
+        if (refs.length === 0 || refs.some(function (r) { return !r; })) { rejected.push(kind + " " + key + ": evidence must be PR refs (owner/name#N) — " + text); continue; }
+        const stray = refs.filter(function (r) { return !keyOf[r]; });
+        if (stray.length) { rejected.push(kind + " " + key + ": evidence " + stray.join(", ") + " is not a PR this run collected under a scope key — " + text); continue; }
+        const cited = refs.map(function (r) { return keyOf[r]; }).filter(function (k, i, a) { return a.indexOf(k) === i; });
+        if (kind === "global" && cited.length < 2) {
+          downgraded.push("global -> standard:" + cited[0] + " (evidence from one key only) — " + text);
+          kind = "standard"; key = cited[0];
+        } else if (kind !== "global") {
+          if (!allowed[key]) { rejected.push(kind + " " + key + ": not a key this run collected evidence for — " + text); continue; }
+          const other = cited.filter(function (k) { return k !== key; });
+          if (other.length) { rejected.push(kind + " " + key + ": evidence must all map to " + key + " (also cites " + other.join(", ") + ") — " + text); continue; }
         }
         let scope, label;
-        if (kind === "fact") { scope = repo; label = repo; }
-        else if (kind === "standard") { scope = "standard:" + repo; label = scope; }
-        else if (kind === "emphasis") { scope = "emphasis:" + repo; label = scope; }
-        else if (kind === "global") { scope = ""; label = "global"; }
-        else { rejected.push(kind + " " + repo + ": unknown kind — " + text); continue; }
-        if (kind !== "global" && ev.indexOf(repo) < 0) { rejected.push(kind + " " + repo + ": evidence does not cite " + repo + " — " + text); continue; }
+        if (kind === "fact") { scope = key; label = key; }
+        else if (kind === "standard") { scope = "standard:" + key; label = scope; }
+        else if (kind === "emphasis") { scope = "emphasis:" + key; label = scope; }
+        else { scope = ""; label = "global"; }
         if (seenText[label + "\u0000" + text]) { dropped.push(label + ": already recorded — " + text); continue; }
         const tags = ["review-tuning", origin, kind === "global" ? "standard" : kind];
         if (e.team) tags.push("team");
@@ -397,7 +671,7 @@ x-templates:
     id: archive
     run: js
     code: |
-      const keys = (ctx.collect && (ctx.collect.keys || ctx.collect.repos)) || [];
+      const keys = (ctx.keys && ctx.keys.key_list) || [];
       const layer = {};
       for (const k of keys) { if (k) { layer[k] = 1; layer["standard:" + k] = 1; layer["emphasis:" + k] = 1; } }
       const all = ctx.memory.recall({ limit: 0 }) || [];
@@ -521,18 +795,20 @@ workflows:
         for_each: "{{.inputs.lenses}}"
         parallel: true
         guidance: "You are one lens of a panel. Stay inside your lens; another reviewer owns the rest."
-        # 3.0: per-repo LAYERED memory. The defaults (the shared/global set,
-        # this repo, the workflow, the step) plus this repo's standard and
-        # emphasis scopes:
-        #   global              reviewer-wide standard (every repo)
-        #   <owner/repo>        facts about this repo the diff can't show
-        #   standard:<repo>     this repo's additions to the standard
-        #   emphasis:<repo>     "look hard at X" rules learned from misses
+        # 3.0: LAYERED memory, keyed by the scope_key setting (a template
+        # core renders over this review's facts; {{.repo}} by default). The
+        # defaults (the shared/global set, the repo, the workflow, the step)
+        # plus this review's key and its standard and emphasis layers:
+        #   global              reviewer-wide standard (every review)
+        #   <key>               facts the diff can't show
+        #   standard:<key>      this key's additions to the standard
+        #   emphasis:<key>      "look hard at X" rules learned from misses
         # The calibration triggers below write all four; you can also write
-        # them by hand. Nothing matching costs no tokens.
+        # them by hand. A key that doesn't apply to a review (a fact it reads
+        # is empty) is simply not read. Nothing matching costs no tokens.
         memory:
           limit: 100
-          extra_scopes: ["standard:${repo}", "emphasis:${repo}"]
+          extra_scopes: ["${settings.scope_key}", "standard:${settings.scope_key}", "emphasis:${settings.scope_key}"]
         output_schema:
           type: object
           required: [findings]
@@ -589,11 +865,11 @@ workflows:
 
           SHARED MEMORY (appended at the end of this prompt, when there is any) is
           layered: notes tagged `standard` are the review standard — reviewer-wide, or
-          this repo's additions to it — and weigh like REPO STANDARDS; notes tagged
-          `emphasis` name areas of this repo that past reviews got wrong, so look hard
-          at any change that touches them; every other note is a fact about this repo
-          or how it is built, deployed and maintained that the diff cannot show — use
-          it to judge whether the change actually works here.
+          additions to it for the code this PR belongs to — and weigh like REPO
+          STANDARDS; notes tagged `emphasis` name kinds of change that past reviews got
+          wrong here, so look hard at any change that touches them; every other note is
+          a fact about this code or how it is built, deployed and maintained that the
+          diff cannot show — use it to judge whether the change actually works here.
 
           PULL REQUEST {{.inputs.repo}} #{{.inputs.pr}}: {{.meta.title}}
           Description:
@@ -900,24 +1176,38 @@ workflows:
             total_deletions: totalDel,
           };
 
-      # This repo's EMPHASIS entries (memory scope `emphasis:<repo>`): "look
+      # This review's scope key (the scope_key setting over the PR's facts —
+      # the same key the lens panel's memory reads), for emphasis below. It
+      # runs in both modes so a scope_key that reads a fact calibration can't
+      # rebuild fails every review loudly, not only the gated ones.
+      - id: prmeta
+        uses: github.pr_get
+        options: { repo: "{{.inputs.repo}}", pr: "{{.inputs.pr}}" }
+      - <<: *scopekeys
+        id: scopekey
+
+      # This review's EMPHASIS entries (memory scope `emphasis:<key>`): "look
       # hard at X" rules the calibration triggers learned from past misses.
       # The lens panel reads them through its own memory in both modes; here
       # they feed triage, where — with auto off — a PR that matches one leans
       # to a human hand-off. Read through the code binding, not the
       # memory.recall verb, so a config with no memory: section still loads:
-      # no memory (or none written yet) is simply no rules.
+      # no memory (or none written yet, or a key that doesn't apply) is simply
+      # no rules.
       - id: emphasis
         if: "!automode.auto"
         run: js
         code: |
           let found = [];
-          try {
-            found = ctx.memory.recall({ scope: "emphasis:" + ctx.inputs.repo, limit: 50 }) || [];
-          } catch (e) {
-            found = [];
+          const key = (ctx.scopekey && ctx.scopekey.key) || "";
+          if (key) {
+            try {
+              found = ctx.memory.recall({ scope: "emphasis:" + key, limit: 50 }) || [];
+            } catch (e) {
+              found = [];
+            }
           }
-          return { memories: found.map(function (m) { return { text: String(m.text || "") }; }) };
+          return { key: key, memories: found.map(function (m) { return { text: String(m.text || "") }; }) };
 
       # 1. Triage: may an automated review post itself ("auto"), or does this
       #    genuinely need a human ("manual")? A decide: step — four typed
@@ -934,7 +1224,7 @@ workflows:
           state: |
             Code-review request on {{.inputs.repo}}#{{.inputs.pr}} ("{{.inputs.title}}").
 
-            EMPHASIS RULES learned from past reviews of this repo. A change that matches
+            EMPHASIS RULES learned from past reviews ({{.emphasis.key}}). A change that matches
             one of these needs a human's review ("manual"), whatever else holds:
             {{range .emphasis.memories}}- {{.text}}
             {{else}}(none)
@@ -1009,7 +1299,7 @@ workflows:
           if (a.docs_sufficient && a.docs_sufficient.noul < 0.5) why.push("docs look out of date for what changed");
           if (a.glaring_holes && a.glaring_holes.noul >= 0.5) why.push("there may be a glaring logic or coverage hole");
           const rules = (ctx.emphasis && ctx.emphasis.memories) || [];
-          if (why.length === 0 && rules.length > 0) why.push("it may match an emphasis rule learned from past reviews of this repo, or look high-stakes");
+          if (why.length === 0 && rules.length > 0) why.push("it may match an emphasis rule learned from past reviews, or look high-stakes");
           if (why.length === 0) why.push("the change looks high-stakes (security, money, destructive data, or production infra)");
           return { decision: decision, reason: why.join("; ") + "." };
 
@@ -1149,6 +1439,8 @@ triggers:
   - name: review-calibration
     on: manual
     steps:
+      - <<: *scopekeys
+        id: keyspec
       - <<: *calib_script
         id: collect
         timeout: 20m
@@ -1161,8 +1453,11 @@ triggers:
           DISCARD_DAYS: "${settings.calibration_discard_days}"
           MIN_LINES: "${settings.calibration_min_lines}"
           TEAM_PAGES: "${settings.calibration_team_pages}"
-      - <<: *known
+      - <<: *scopekeys
+        id: keys
         if: &calib_any "collect.count > 0 || collect.flagged > 0 || collect.handoffs > 0 || collect.owner_count > 0 || collect.team_count > 0"
+      - <<: *known
+        if: *calib_any
       - <<: *doc_claude
         if: *calib_any
       - <<: *doc_agents
@@ -1189,23 +1484,27 @@ triggers:
           THE REVIEWER is a panel of lenses (architecture, complexity, performance,
           refactoring, security, test quality, plus any the operator added). It sees the
           PR checkout, the repo's CLAUDE.md/AGENTS.md/CONTRIBUTING, and memory. Memory is
-          layered, and every entry you propose has a KIND that says where it goes:
-            fact      a fact about one repo the diff can't show — how something is
-                      built, deployed, operated or used. Most misses are this.
-            standard  a review rule for one repo: how this repo wants code shaped, a
+          kept per SCOPE KEY — the operator chose what a key is (a repo, an owner, a
+          label …); every PR maps to one, listed under KEYS below, and a review reads
+          only its own key's entries (plus the reviewer-wide set). Every entry you
+          propose names its key and has a KIND that says where it goes:
+            fact      a fact the diff can't show about the code under one key — how
+                      something is built, deployed, operated or used. Most misses are
+                      this.
+            standard  a review rule for one key: how this code wants to be shaped, a
                       convention, something that broke before.
-            emphasis  an area of one repo that needs a hard look: "a PR that <touches
+            emphasis  an area under one key that needs a hard look: "a PR that <touches
                       these paths / changes this kind of thing> needs close review,
                       because <why> (owner/name#N)". Use it when the reviewer
                       auto-posted on something it should have looked at much harder.
-            global    a reviewer-wide lesson about how to review, true in every repo.
-                      Rare; only when the evidence clearly isn't repo-specific. It
-                      must cite PRs from at least two different repos — one resting
-                      on a single repo is recorded as that repo's standard instead.
+            global    a reviewer-wide lesson about how to review, true under every key.
+                      Rare; only when the evidence clearly isn't specific to one key.
+                      It must cite PRs of at least two different keys — one resting on
+                      a single key is recorded as that key's standard instead.
             none      a candidate you considered and dropped — say why in text.
-          Each entry names its repo (owner/name) and cites its evidence as PR refs
-          (owner/name#N) from THIS run. Entries for any other repo, or without
-          evidence, are rejected.
+          Each entry cites its evidence as PR refs (owner/name#N) from THIS run, and
+          EVERY evidence PR of a fact/standard/emphasis entry must map to that entry's
+          key. Anything else is rejected.
 
           GOAL: find what the reviewer MISSED — problems in a PR it reviewed that
           surfaced later — and propose the entries that would have let it catch them.
@@ -1252,7 +1551,7 @@ triggers:
              changed plan), or when the evidence is thin. Prefer a few high-signal
              entries over many. To sharpen an existing entry rather than add a near
              duplicate, write the improved text and set supersedes to its id (same
-             repo and kind).
+             key and kind).
           5. summary: one line per entry written or dropped, and why.
 
           OWNER CATCHES ({{.collect.owner_count}} on {{.collect.owner_prs}} reviewed PRs):
@@ -1264,7 +1563,10 @@ triggers:
           TEAM COMMENTS ({{.collect.team_count}} on {{.collect.team_prs}} PRs, {{.collect.team_both}} also reviewed by the bot):
           {{.collect.team}}
 
-          EXISTING MEMORY ENTRIES for these repos (id [scope] text):
+          KEYS (each scope key and the PRs that map to it):
+          {{.keys.text}}
+
+          EXISTING MEMORY ENTRIES for these keys (id [scope] text):
           {{.known.text}}
 
           REPO DOCS:
@@ -1294,6 +1596,8 @@ triggers:
   - name: review-backfill
     on: [manual]
     steps:
+      - <<: *scopekeys
+        id: keyspec
       - <<: *calib_script
         id: collect
         timeout: 45m
@@ -1360,6 +1664,9 @@ triggers:
           const out = [];
           for (const it of items) for (const p of ((it && it.patterns) || [])) out.push(p);
           return { count: out.length, json: JSON.stringify(out, null, 1) };
+      - <<: *scopekeys
+        id: keys
+        if: "patterns.count > 0"
       - <<: *known
         if: "patterns.count > 0"
       - <<: *doc_claude
@@ -1386,23 +1693,25 @@ triggers:
           mine|team, repo, text, evidence, people). Turn them into memory entries for an
           automated PR reviewer. Decide everything yourself; never ask.
 
-          Every entry has a KIND that says where it goes:
-            fact      a fact about one repo the diff can't show (how something is
-                      built, deployed, operated or used)
-            standard  a review rule for one repo (a convention, how this repo wants
-                      code shaped, something that broke before)
-            emphasis  a kind of change in one repo that must get a hard look: "a PR
+          Memory is kept per SCOPE KEY (the operator chose what a key is — a repo, an
+          owner, a label …); every PR maps to one, listed under KEYS below. Every entry
+          names its key and has a KIND that says where it goes:
+            fact      a fact the diff can't show about the code under one key (how
+                      something is built, deployed, operated or used)
+            standard  a review rule for one key (a convention, how this code wants to
+                      be shaped, something that broke before)
+            emphasis  a kind of change under one key that must get a hard look: "a PR
                       that <…> needs close review, because <…> (owner/name#N)"
-            global    a reviewer-wide lesson, true in every repo (repo: the repo it
-                      was learned on); needs evidence from at least two repos, else
-                      it is recorded as that repo's standard
+            global    a reviewer-wide lesson, true under every key; needs evidence
+                      from at least two keys, else it is recorded as that key's
+                      standard
             none      a candidate dropped — say why in text
-          Each names its repo (owner/name, one of {{.collect.repos}}) and cites evidence
-          as PR refs (owner/name#N). Anything else is rejected.
+          Each cites evidence as PR refs (owner/name#N), and every evidence PR of a
+          fact/standard/emphasis entry must map to its key. Anything else is rejected.
 
           1. Merge duplicates across months: the same concern in several months is ONE
              entry, stronger for recurring. Update an existing entry (supersedes: its
-             id, same repo and kind) rather than duplicate it.
+             id, same key and kind) rather than duplicate it.
           2. Drop a pattern when the repo's docs already state it, when it is a generic
              best practice the reviewer already applies, or when it rests on one
              comment that isn't MINE.
@@ -1415,7 +1724,10 @@ triggers:
           CANDIDATE PATTERNS:
           {{.patterns.json}}
 
-          EXISTING MEMORY ENTRIES for these repos (id [scope] text):
+          KEYS (each scope key and the PRs that map to it):
+          {{.keys.text}}
+
+          EXISTING MEMORY ENTRIES for these keys (id [scope] text):
           {{.known.text}}
 
           REPO DOCS:

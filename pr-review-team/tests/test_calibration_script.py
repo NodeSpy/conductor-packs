@@ -27,7 +27,7 @@ FAKE_GH = textwrap.dedent('''\
         print("rev"); sys.exit(0)
     if a[:1] == ["api"]:
         path, _, q = a[1].partition("?")
-        page = [p for p in q.split("&") if p.startswith("page=")][0]
+        page = ([p for p in q.split("&") if p.startswith("page=")] or ["page=1"])[0]
         if path.endswith("/pulls/comments"):
             print(open(os.environ["FAKE_COMMENTS"]).read() if page == "page=1" else "[]"); sys.exit(0)
         api = json.load(open(os.environ["FAKE_API"]))
@@ -163,6 +163,25 @@ class CollectCalibrationTest(unittest.TestCase):
         cache = os.path.join(self.f.state, "pr-review-team")
         self.assertTrue(os.path.isdir(os.path.join(cache, "clones", "acme", "api", ".git")))
 
+    def test_every_pr_shown_comes_with_its_facts(self):
+        out = json.loads(self.f.run("collect-calibration").stdout)
+        refs = [p["ref"] for p in out["prs"]]
+        self.assertEqual(refs, ["acme/api#1", "acme/api#2"])   # the reviewed PR (+ its team comment) and the hand-off
+        self.assertEqual(out["prs"][0]["facts"], {"repo": "acme/api", "owner": "acme", "name": "api", "number": 1, "pr": 1,
+                                                  "issue": 0, "kind": "review_requested",
+                                                  "inputs": {"repo": "acme/api", "pr": 1}})
+        with open(os.path.join(self.f.root, "gh.log")) as f:
+            self.assertNotIn("pulls/1 ", f.read() + " ")         # no PR fetched unless the key needs it
+
+    def test_pr_metadata_is_fetched_when_the_key_reads_it(self):
+        self.f.set_api({"repos/acme/api/pulls/1": {"title": "Add handler", "labels": [{"name": "billing"}],
+                                                   "base": {"ref": "main"}, "html_url": "https://example.test/acme/api/pull/1"}})
+        out = json.loads(self.f.run("collect-calibration", NEED_META="true").stdout)
+        f1 = out["prs"][0]["facts"]
+        self.assertEqual((f1["title"], f1["labels"], f1["base"], f1["url"]),
+                         ("Add handler", ["billing"], "main", "https://example.test/acme/api/pull/1"))
+        self.assertNotIn("title", out["prs"][1]["facts"])        # its fetch failed: those facts stay absent
+
     def test_state_advances_only_when_record_promotes_it(self):
         self.assertEqual(json.loads(self.f.run("collect-calibration").stdout)["count"], 2)
         # no record yet (say the agent failed): the next run sees the same window
@@ -290,6 +309,24 @@ class OwnerCatchTest(unittest.TestCase):
         self.api(extra_reviews=[rv(12, "rev", t0 + d(minutes=1), "COMMENTED", "wait, one more thing")])
         self.assertIn("wait, one more thing", self.collect()["owner"])
 
+    def test_the_owner_repeating_the_pack_s_words_later_is_a_catch(self):
+        # same account and the same body as the pack's review, but a day later: not the post
+        t0, d = self.t0, dt.timedelta
+        self.api(extra_reviews=[rv(12, "rev", t0 + d(days=1), "CHANGES_REQUESTED", "looks good")])
+        out = self.collect()
+        self.assertEqual(out["owner_count"], 1)
+        self.assertIn("OWNER REVIEW CHANGES_REQUESTED", out["owner"])
+
+    def test_pack_inline_comments_are_known_by_review_or_by_body(self):
+        # one carries the pack review's id (its body since edited), one the audited body
+        # (its review id lost): neither is the owner's
+        t0, d = self.t0, dt.timedelta
+        self.api(inline=[cm(101, "rev", t0 + d(seconds=40), "pack inline note, edited", review=11),
+                         cm(102, "rev", t0 + d(seconds=40), "pack inline note", review=None, line=4)])
+        out = self.collect()
+        self.assertEqual(out["owner_count"], 0)
+        self.assertNotIn("OWNER INLINE", out["owner"])
+
     def test_a_dismissed_pack_review_is_reported_once(self):
         self.api(pack_state="DISMISSED")
         out = self.collect()
@@ -390,6 +427,27 @@ class CollectBackfillTest(unittest.TestCase):
         self.assertIn("TEAM bob b.go", text)
         self.assertNotIn("posted by the pack", text)
         self.assertIn("my own hand-written note after the pack started", text)
+
+    def test_pack_era_comments_before_the_audit_log_are_dropped(self):
+        # the pack started before the oldest audit record: own comments from then can't be
+        # told apart from the pack's, so they are dropped rather than taught as yours
+        n = self.f.now
+        self.f.audit(post(n - dt.timedelta(days=10), "acme/api", 9))
+        mine = {"user": {"login": "rev", "type": "User"}, "in_reply_to_id": None, "path": "a.go"}
+        self.f.set_comments([
+            dict(mine, created_at=iso(n - dt.timedelta(days=20)), pull_request_url="x/pulls/5",
+                 body="written in the pack era before the audit log began, can't be told"),
+            dict(mine, created_at=iso(n - dt.timedelta(days=60)), pull_request_url="x/pulls/3",
+                 body="written before the pack started, so this one is mine for sure"),
+        ])
+        res = self.f.run("collect-backfill", stdin=json.dumps({"inputs": {"repos": "acme/api"}}),
+                         BACKFILL_DAYS="90", REVIEWER_SINCE=(n - dt.timedelta(days=30)).strftime("%Y-%m-%d"))
+        self.assertEqual(res.returncode, 0, res.stderr)
+        out = json.loads(res.stdout)
+        self.assertEqual((out["mine"], out["pack_dropped"]), (1, 1))
+        text = "".join(m["text"] for m in out["months"])
+        self.assertIn("mine for sure", text)
+        self.assertNotIn("can't be told", text)
 
     def test_days_all_reads_the_whole_history(self):
         n = self.f.now

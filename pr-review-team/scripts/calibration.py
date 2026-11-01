@@ -318,6 +318,46 @@ def owner_activity(repo, pr, me, posts, cache):
     return out
 
 
+# ---------------------------------------------------------------------------
+# Scope-key facts. The pack's learning scope is a template (the scope_key
+# setting) over a review's facts; the lens panel's memory reads the key core
+# renders for the review. Calibration maps every PR it shows the agent to its
+# key the same way: these are that PR's facts as the review saw them, and the
+# pack's `keys` step renders the template over them. Only the facts a past PR
+# still has are rebuilt — the target (repo, owner, name, number/pr), the event
+# kind, the review-team step's inputs, and — fetched only when the template
+# reads them — title, labels, base and url (their CURRENT values).
+# ---------------------------------------------------------------------------
+
+def pr_facts(repo, pr, need_meta, cache):
+    key = "%s#%d" % (repo, pr)
+    if key in cache:
+        return cache[key]
+    owner, name = repo.split("/", 1)
+    f = {"repo": repo, "owner": owner, "name": name, "number": pr, "pr": pr, "issue": 0,
+         "kind": "review_requested", "inputs": {"repo": repo, "pr": pr}}
+    if need_meta and valid_repo(repo):
+        d = gh_json("repos/%s/pulls/%d" % (repo, pr))
+        if isinstance(d, dict):
+            f["title"] = d.get("title") or ""
+            f["labels"] = [l.get("name") for l in (d.get("labels") or []) if isinstance(l, dict) and l.get("name")]
+            f["base"] = (d.get("base") or {}).get("ref") or ""
+            f["url"] = d.get("html_url") or ""
+    cache[key] = f
+    return f
+
+
+def facts_for(refs):
+    """[{ref, facts}] for every "owner/name#N" in refs (sorted, deduplicated)."""
+    # the pack's keyspec step says whether scope_key reads a fact that needs the PR fetched
+    need, cache, out = (os.environ.get("NEED_META") or "").strip() == "true", {}, []
+    for ref in sorted(set(refs)):
+        repo, _, n = ref.rpartition("#")
+        if valid_repo(repo) and n.isdigit():
+            out.append({"ref": ref, "facts": pr_facts(repo, int(n), need, cache)})
+    return out
+
+
 def cap(text, limit, what):
     if len(text) <= limit:
         return text
@@ -624,6 +664,9 @@ def collect_calibration():
         "team": cap("\n".join(team_lines) + "\n", TEAM_CAP, "team comments"),
         "team_count": sum(len(v) for v in team.values()), "team_prs": len(team), "team_both": both,
         "invalid_repos": sorted(invalid),
+        # every PR the agent is shown, with its facts, for the pack's `keys` step
+        "prs": facts_for(list(new_keys) + list(followups) + list(catches) + list(team)
+                         + [o.split(" ", 1)[0] for o in outcomes if not o.startswith(" ")]),
     }
 
 
@@ -710,7 +753,8 @@ def collect_backfill(ctx):
     return {"months": out, "month_count": len(out), "repos": repos, "reviewer": me,
             "since": "all" if whole else since.date().isoformat(),
             "mine": sum(o["mine"] for o in out), "team": sum(o["team"] for o in out),
-            "truncated": truncated, "max_pages": max_pages, "pack_dropped": pack_dropped}
+            "truncated": truncated, "max_pages": max_pages, "pack_dropped": pack_dropped,
+            "prs": facts_for([k for m in months.values() for k in m])}
 
 
 # ---------------------------------------------------------------------------
@@ -738,7 +782,7 @@ def record(ctx):
     trunc = ((ctx.get("collect") or {}).get("truncated")) or []
     if trunc:
         lines.append("TRUNCATED by backfill_max_pages (older comments not read): " + ", ".join(trunc))
-    for key, title in (("downgraded", "Downgraded (global resting on one repo)"), ("superseded", "Superseded"),
+    for key, title in (("downgraded", "Downgraded (global resting on one key)"), ("superseded", "Superseded"),
                        ("rejected", "Rejected (out of scope)"), ("dropped", "Dropped")):
         items = plan.get(key) or []
         if items:
