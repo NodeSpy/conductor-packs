@@ -68,12 +68,14 @@ pack:
       memory: "*"
 
 # Every setting is substituted as TEXT (`${settings.NAME}`), so the pack
-# compares them as strings ("true", "14") wherever it reads one.
+# compares them as strings ("14") wherever it reads one. `auto` is the
+# exception: review-flow's first step (`automode`) normalizes it once and
+# fails the run on a value it can't read; everything else reads that step.
 settings:
   auto:
     type: boolean
     default: false
-    desc: "true = never hand off: every review posts with the team's verdict (APPROVE or REQUEST_CHANGES), and emphasis entries only sharpen the review. false = assess may route a PR to a human hand-off, and a PR matching an emphasis entry leans to that hand-off."
+    desc: "true/yes/1 (any case) = never hand off: every review posts with the team's verdict (APPROVE or REQUEST_CHANGES), and emphasis entries only sharpen the review. false = assess may route a PR to a human hand-off, and a PR matching an emphasis entry leans to that hand-off. Any other value fails the review run."
   state_dir:
     type: string
     default: ""
@@ -209,7 +211,7 @@ x-templates:
           type: object
           required: [repo, kind, text, evidence]
           properties:
-            repo: { type: string, description: "owner/name the lesson is about; for kind global, the repo it was learned on" }
+            repo: { type: string, description: "owner/name the lesson is about; for kind global, the repo it was learned on (global needs evidence from two or more repos)" }
             kind: { type: string, enum: [fact, standard, emphasis, global, none] }
             text: { type: string, description: "one or two plain sentences, naming the PR it came from" }
             evidence: { type: array, items: { type: string }, description: "PR refs, owner/name#N" }
@@ -292,7 +294,11 @@ x-templates:
   #   fact      -> <owner/repo>          (the scope the lens panel reads as "this repo")
   #   standard  -> standard:<owner/repo>
   #   emphasis  -> emphasis:<owner/repo>
-  #   global    -> the shared set        (reviewer-wide; only with in-run evidence)
+  #   global    -> the shared set        (reviewer-wide) — ONLY when the
+  #                evidence cites PRs from at least two distinct repos in this
+  #                run. One repo's evidence never reaches every other repo's
+  #                review: a global entry resting on one repo is downgraded to
+  #                standard:<that repo>, and the downgrade is logged.
   # Anything else is rejected and logged. `supersedes` is honored only for an
   # existing entry in the very scope being written.
   plan: &plan
@@ -308,16 +314,23 @@ x-templates:
       for (const m of known) { byId[m.id] = m; seenText[m.scope + "\u0000" + m.text.trim()] = 1; }
       const origin = ctx.calibrate ? "calibration" : "backfill";
       const repoOf = function (ref) { const m = /^([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)#\d+$/.exec(String(ref || "").trim()); return m ? m[1] : ""; };
-      const writes = [], forget = [], rejected = [], dropped = [], superseded = [];
+      const writes = [], forget = [], rejected = [], dropped = [], superseded = [], downgraded = [];
       for (const e of entries) {
         const text = String(e.text || "").trim();
-        const repo = String(e.repo || "").trim();
-        const kind = String(e.kind || "");
+        let repo = String(e.repo || "").trim();
+        let kind = String(e.kind || "");
         const ev = (e.evidence || []).map(repoOf);
         if (kind === "none") { dropped.push((repo || "?") + ": " + text); continue; }
         if (!text || text.length > 800) { rejected.push(kind + " " + repo + ": empty or over 800 chars"); continue; }
         if (!allowed[repo]) { rejected.push(kind + " " + repo + ": not a repo this run collected evidence for — " + text); continue; }
         if (ev.length === 0 || ev.some(function (r) { return !allowed[r]; })) { rejected.push(kind + " " + repo + ": evidence must cite PRs in this run's repos — " + text); continue; }
+        if (kind === "global") {
+          const cited = ev.filter(function (r, i) { return ev.indexOf(r) === i; });
+          if (cited.length < 2) {
+            downgraded.push("global -> standard:" + cited[0] + " (evidence from one repo only) — " + text);
+            kind = "standard"; repo = cited[0];
+          }
+        }
         let scope, label;
         if (kind === "fact") { scope = repo; label = repo; }
         else if (kind === "standard") { scope = "standard:" + repo; label = scope; }
@@ -335,7 +348,8 @@ x-templates:
           else rejected.push("supersedes " + e.supersedes + ": not an existing entry in " + label + " (kept)");
         }
       }
-      return { writes: writes, forget: forget, rejected: rejected, dropped: dropped, superseded: superseded, count: writes.length };
+      return { writes: writes, forget: forget, rejected: rejected, dropped: dropped, superseded: superseded,
+               downgraded: downgraded, count: writes.length };
   # The writes themselves, by the pack's own step: one memory.remember per
   # planned entry (the shared set is written with an empty scope, which is
   # how a config-authored write reaches it), then the superseded entries are
@@ -773,6 +787,24 @@ workflows:
       event: "{{.review.event}}"                # the review team's verdict
       review: "{{.review.review}}"              # the drafted ReviewRecord JSON
     steps:
+      # The auto setting, read ONCE. Settings arrive as text, and a consumer
+      # may write `auto: "True"` or `auto: " yes "`; every later step reads
+      # this step's boolean instead of comparing the raw text itself (where a
+      # spelling it didn't expect used to mean "gated", silently). A value
+      # that is neither true nor false fails the run here, before anything is
+      # fetched or posted.
+      - id: automode
+        run: js
+        code: |
+          // a raw template literal, so a quote or newline in the value is still
+          // just text (and anything that can't even parse fails the run too)
+          const raw = String.raw`${settings.auto}`;
+          const v = raw.trim().toLowerCase();
+          if (v === "true" || v === "yes" || v === "1") return { auto: true, mode: "auto" };
+          if (v === "false" || v === "no" || v === "0") return { auto: false, mode: "gated" };
+          throw new Error("pr-review-team: the auto setting must be true or false (yes/no/1/0 also accepted), got " +
+                          JSON.stringify(raw) + " — fix settings.auto in your packs: block");
+
       # 0. Every changed file (status + line counts) and as many patches as
       #    fit a length budget, fetched through the connector and PASSED IN
       #    to triage. 2.10 replaced the old `github.pr_diff` + 60 KB cap
@@ -834,7 +866,7 @@ workflows:
       # memory.recall verb, so a config with no memory: section still loads:
       # no memory (or none written yet) is simply no rules.
       - id: emphasis
-        if: "!${settings.auto}"
+        if: "!automode.auto"
         run: js
         code: |
           let found = [];
@@ -853,7 +885,7 @@ workflows:
       #    Skipped with `auto: true`: nothing is handed off, so there is
       #    nothing to triage.
       - id: assess
-        if: "!${settings.auto}"
+        if: "!automode.auto"
         model: light
         retry: { max: 6, backoff: 30s }
         decide:
@@ -926,7 +958,7 @@ workflows:
       - id: assessed
         run: js
         code: |
-          if ("${settings.auto}" === "true") return { decision: "auto", reason: "" };
+          if (ctx.automode.auto) return { decision: "auto", reason: "" };
           const a = ctx.assess || {};
           const decision = (a.decision && a.decision.choice) || "auto";
           if (decision === "auto") return { decision: decision, reason: "" };
@@ -954,8 +986,8 @@ workflows:
       - id: gate
         run: js
         code: |
-          const mode = "${settings.auto}" === "true" ? "auto" : "gated";
-          const auto = mode === "auto" || (ctx.assessed && ctx.assessed.decision === "auto");
+          const mode = ctx.automode.mode;
+          const auto = ctx.automode.auto === true || (ctx.assessed && ctx.assessed.decision === "auto");
           const comments = (ctx.review && ctx.review.comments) || [];
           const empty = comments.length === 0;
           return { mode: mode, post: auto || empty, handoff: !auto && !empty };
@@ -1123,7 +1155,9 @@ triggers:
                       because <why> (owner/name#N)". Use it when the reviewer
                       auto-posted on something it should have looked at much harder.
             global    a reviewer-wide lesson about how to review, true in every repo.
-                      Rare; only when the evidence clearly isn't repo-specific.
+                      Rare; only when the evidence clearly isn't repo-specific. It
+                      must cite PRs from at least two different repos — one resting
+                      on a single repo is recorded as that repo's standard instead.
             none      a candidate you considered and dropped — say why in text.
           Each entry names its repo (owner/name) and cites its evidence as PR refs
           (owner/name#N) from THIS run. Entries for any other repo, or without
@@ -1298,7 +1332,8 @@ triggers:
             emphasis  a kind of change in one repo that must get a hard look: "a PR
                       that <…> needs close review, because <…> (owner/name#N)"
             global    a reviewer-wide lesson, true in every repo (repo: the repo it
-                      was learned on)
+                      was learned on); needs evidence from at least two repos, else
+                      it is recorded as that repo's standard
             none      a candidate dropped — say why in text
           Each names its repo (owner/name, one of {{.collect.repos}}) and cites evidence
           as PR refs (owner/name#N). Anything else is rejected.

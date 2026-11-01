@@ -84,8 +84,12 @@ Every setting is optional. Set them under `packs.<instance>.settings`.
 | `backfill_min_chars` | `40` | `review-backfill` ignores comments shorter than this. |
 | `backfill_reviewer_since` | `""` | `review-backfill`: your own comments from this date (`YYYY-MM-DD`) on may have been posted by this pack under your account, so they aren't counted as yours. Empty: the date of the first review this pack posted, from the audit log. |
 
-Settings are substituted as text, so `auto: true` and `auto: "true"` are the
-same.
+Settings are substituted as text. `auto` is read once, by the review flow's
+first step (`automode`), case-insensitively and with surrounding space
+trimmed: `true`/`yes`/`1` and `false`/`no`/`0` are accepted, so `auto: true`,
+`auto: "True"` and `auto: " yes "` all mean on. Anything else **fails the run**
+with an error naming the setting — a misspelled `auto` is never quietly read
+as "gated".
 
 ## Auto mode
 
@@ -155,11 +159,18 @@ written:
 - the scope comes from the kind and repo — `fact` → `<repo>`, `standard` →
   `standard:<repo>`, `emphasis` → `emphasis:<repo>`, `global` → the shared
   set — never from the agent;
+- what one repo teaches stays in that repo: a `global` entry is accepted only
+  when its evidence cites PRs from **at least two different repos** in the
+  run. One resting on a single repo (however many of its PRs) is downgraded
+  to `standard:<that repo>`, and the downgrade is logged;
 - the repo must be one this run collected evidence for, and the evidence must
   cite PRs in this run's repos (a per-repo entry must cite its own repo);
 - a proposal may replace an existing entry only in the scope it writes.
 
-Anything else is rejected and logged. The pack's own `write` step makes the
+Anything else is rejected and logged. Repo names read from the audit log or
+the run's state must be plain `owner/name` before they reach git, `gh` or a
+path; anything else is skipped and listed in the collect step's
+`invalid_repos`. The pack's own `write` step makes the
 writes (`ctx.memory.remember`); the run's section is appended to
 `<state_dir>/pr-review-team/calibration-log.md`. The run's position only
 advances once the writes land, so a failed run re-reads the same window.

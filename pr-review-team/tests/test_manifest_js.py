@@ -63,8 +63,9 @@ class PlanTest(unittest.TestCase):
             entry("acme/api", "fact", "the worker is deployed by a cron job (acme/api#4)", ["acme/api#4"]),
             entry("acme/api", "standard", "handlers return typed errors (acme/api#5)", ["acme/api#5"]),
             entry("acme/api", "emphasis", "a PR that touches billing/ needs close review (acme/api#6)", ["acme/api#6"]),
-            entry("acme/api", "global", "a swallowed error is blocking (acme/api#7)", ["acme/api#7"]),
-        ])
+            entry("acme/api", "global", "a swallowed error is blocking (acme/api#7, acme/web#2)",
+                  ["acme/api#7", "acme/web#2"]),
+        ], repos=("acme/api", "acme/web"))
         self.assertEqual([(w["scope"], w["label"]) for w in out["writes"]], [
             ("acme/api", "acme/api"),
             ("standard:acme/api", "standard:acme/api"),
@@ -73,8 +74,39 @@ class PlanTest(unittest.TestCase):
         ])
         self.assertEqual(out["count"], 4)
         self.assertEqual(out["rejected"], [])
+        self.assertEqual(out["downgraded"], [])
         self.assertEqual(out["writes"][2]["tags"], ["review-tuning", "calibration", "emphasis"])
         self.assertEqual(out["writes"][3]["tags"], ["review-tuning", "calibration", "standard"])
+
+    def test_a_global_resting_on_one_repo_stays_in_that_repo(self):
+        # one repo's evidence never reaches every other repo's review
+        out = self.plan([entry("acme/api", "global", "a swallowed error is blocking (acme/api#7)", ["acme/api#7"])],
+                        repos=("acme/api", "acme/web"))
+        self.assertEqual([(w["scope"], w["label"], w["tags"]) for w in out["writes"]],
+                         [("standard:acme/api", "standard:acme/api", ["review-tuning", "calibration", "standard"])])
+        self.assertEqual(len(out["downgraded"]), 1)
+        self.assertIn("global -> standard:acme/api", out["downgraded"][0])
+        self.assertEqual(out["rejected"], [])
+
+    def test_several_prs_of_one_repo_are_still_one_repo(self):
+        out = self.plan([entry("acme/api", "global", "x", ["acme/api#1", "acme/api#2", "acme/api#3"])])
+        self.assertEqual([w["scope"] for w in out["writes"]], ["standard:acme/api"])
+        self.assertEqual(len(out["downgraded"]), 1)
+
+    def test_a_downgrade_lands_in_the_cited_repo_not_the_named_one(self):
+        out = self.plan([entry("acme/web", "global", "x", ["acme/api#1"])], repos=("acme/api", "acme/web"))
+        self.assertEqual([w["scope"] for w in out["writes"]], ["standard:acme/api"])
+
+    def test_two_distinct_repos_make_a_global(self):
+        out = self.plan([entry("acme/web", "global", "x", ["acme/web#1", "acme/api#9"])], repos=("acme/api", "acme/web"))
+        self.assertEqual([w["scope"] for w in out["writes"]], [""])
+        self.assertEqual(out["downgraded"], [])
+
+    def test_a_downgraded_global_supersedes_only_within_its_repo(self):
+        known = [{"id": "m1", "scope": "global", "text": "old"}, {"id": "m2", "scope": "standard:acme/api", "text": "old"}]
+        out = self.plan([entry("acme/api", "global", "a", ["acme/api#1"], supersedes="m1"),
+                         entry("acme/api", "global", "b", ["acme/api#1"], supersedes="m2")], known=known)
+        self.assertEqual(out["forget"], ["m2"])
 
     def test_a_repo_outside_the_run_is_rejected(self):
         out = self.plan([entry("other/svc", "fact", "x", ["other/svc#1"])])
@@ -139,22 +171,65 @@ class PlanTest(unittest.TestCase):
         self.assertEqual(out["writes"][0]["tags"], ["review-tuning", "backfill", "fact", "team"])
 
 
+class AutoModeTest(unittest.TestCase):
+    """The auto setting is read once, by the automode step, and a value that is
+    neither true nor false fails the run instead of quietly meaning gated."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.code = flow_step(load(), "review-flow", "automode")["code"]
+
+    def mode(self, raw):
+        return run_js(self.code, {}, {"auto": raw})
+
+    def test_spellings_of_true(self):
+        for raw in ("true", "True", " yes ", "YES", "1", "\tTRUE\n"):
+            self.assertEqual(self.mode(raw), {"auto": True, "mode": "auto"}, raw)
+
+    def test_spellings_of_false(self):
+        for raw in ("false", "False", " no ", "0", "FALSE"):
+            self.assertEqual(self.mode(raw), {"auto": False, "mode": "gated"}, raw)
+
+    def test_garbage_fails_loudly(self):
+        for raw in ("ture", "", "on", "2", "auto"):
+            with self.assertRaises(AssertionError) as cm:
+                self.mode(raw)
+            self.assertIn("the auto setting must be true or false", str(cm.exception), raw)
+
+    def test_quotes_and_newlines_are_just_garbage(self):
+        for raw in ('tr"ue', "yes\nno", "'true'"):
+            with self.assertRaises(AssertionError) as cm:
+                self.mode(raw)
+            self.assertIn("the auto setting must be true or false", str(cm.exception), raw)
+        # one that breaks the step's own syntax (a trailing backslash) still fails the run
+        with self.assertRaises(AssertionError):
+            self.mode("true\\")
+
+    def test_it_runs_first_and_drives_every_condition(self):
+        man = load()
+        steps = man["workflows"]["review-flow"]["steps"]
+        self.assertEqual(steps[0]["id"], "automode")
+        raw = yaml.safe_dump(man)
+        self.assertEqual(raw.count("${settings.auto}"), 1)   # only the automode step reads the text
+
+
 class GateTest(unittest.TestCase):
     """auto=true never hands off; auto=false is the 2.x gate."""
 
     @classmethod
     def setUpClass(cls):
         man = load()
+        cls.automode = flow_step(man, "review-flow", "automode")["code"]
         cls.gate = flow_step(man, "review-flow", "gate")["code"]
         cls.assessed = flow_step(man, "review-flow", "assessed")["code"]
 
     def decide(self, auto, decision, comments):
-        s = {"auto": auto}
+        m = run_js(self.automode, {}, {"auto": auto})
         assess = {"decision": {"choice": decision}, "tests_sufficient": {"noul": 0.9},
                   "docs_sufficient": {"noul": 0.9}, "glaring_holes": {"noul": 0.1}}
-        assessed = run_js(self.assessed, {"assess": assess}, s)
-        ctx = {"assessed": assessed, "review": {"comments": [{"path": "a.go", "line": 1}] * comments}}
-        return assessed, run_js(self.gate, ctx, s)
+        assessed = run_js(self.assessed, {"automode": m, "assess": assess})
+        ctx = {"automode": m, "assessed": assessed, "review": {"comments": [{"path": "a.go", "line": 1}] * comments}}
+        return assessed, run_js(self.gate, ctx)
 
     def test_auto_posts_even_when_assess_says_manual(self):
         assessed, g = self.decide("true", "manual", 2)
@@ -164,8 +239,17 @@ class GateTest(unittest.TestCase):
     def test_the_gate_itself_never_hands_off_in_auto(self):
         # even if an overridden assess/assessed step says manual
         ctx = {"assessed": {"decision": "manual"}, "review": {"comments": [{"path": "a.go", "line": 1}]}}
-        self.assertEqual(run_js(self.gate, ctx, {"auto": "true"}), {"mode": "auto", "post": True, "handoff": False})
-        self.assertEqual(run_js(self.gate, ctx, {"auto": "false"}), {"mode": "gated", "post": False, "handoff": True})
+        on, off = dict(ctx, automode={"auto": True, "mode": "auto"}), dict(ctx, automode={"auto": False, "mode": "gated"})
+        self.assertEqual(run_js(self.gate, on), {"mode": "auto", "post": True, "handoff": False})
+        self.assertEqual(run_js(self.gate, off), {"mode": "gated", "post": False, "handoff": True})
+
+    def test_auto_spelled_True_posts(self):
+        assessed, g = self.decide("True", "manual", 2)
+        self.assertEqual((assessed["decision"], g["handoff"], g["post"]), ("auto", False, True))
+
+    def test_gate_without_the_automode_step_fails(self):
+        with self.assertRaises(AssertionError):
+            run_js(self.gate, {"assessed": {"decision": "auto"}, "review": {"comments": []}})
 
     def test_auto_posts_a_clean_review(self):
         _, g = self.decide("true", "auto", 0)
@@ -187,13 +271,14 @@ class GateTest(unittest.TestCase):
     def test_gated_reason_names_emphasis(self):
         assess = {"decision": {"choice": "manual"}, "tests_sufficient": {"noul": 0.9},
                   "docs_sufficient": {"noul": 0.9}, "glaring_holes": {"noul": 0.1}}
-        out = run_js(self.assessed, {"assess": assess, "emphasis": {"memories": [{"text": "r"}]}}, {"auto": "false"})
+        out = run_js(self.assessed, {"automode": {"auto": False, "mode": "gated"}, "assess": assess,
+                                     "emphasis": {"memories": [{"text": "r"}]}})
         self.assertIn("emphasis rule", out["reason"])
 
     def test_assess_and_emphasis_are_skipped_in_auto(self):
         man = load()
         for sid in ("emphasis", "assess"):
-            self.assertEqual(flow_step(man, "review-flow", sid)["if"], "!${settings.auto}")
+            self.assertEqual(flow_step(man, "review-flow", sid)["if"], "!automode.auto")
 
 
 class LayeringTest(unittest.TestCase):

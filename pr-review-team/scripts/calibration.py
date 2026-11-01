@@ -20,6 +20,17 @@ import sys
 
 PACK_DIR_NAME = "pr-review-team"
 
+# owner/name, nothing else: a repo read from the audit log, the state file or
+# --input reaches git URLs, gh API paths and directories under the cache only
+# after it matches this (no "..", no extra "/", no spaces or URL syntax).
+REPO_RE = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
+
+
+def valid_repo(repo):
+    if not isinstance(repo, str) or not REPO_RE.fullmatch(repo):
+        return False
+    return all(part not in (".", "..") for part in repo.split("/"))
+
 
 def now():
     return dt.datetime.now(dt.timezone.utc)
@@ -142,6 +153,8 @@ GIT_AUTH = ["-c", "credential.helper=", "-c", "credential.helper=!gh auth git-cr
 def clone(repo, fetched):
     """A partial (blob:none) clone of repo under the pack's cache dir, fetched once per run.
     Returns (dir, default-branch ref) or None when it can't be had."""
+    if not valid_repo(repo):
+        return None
     if repo in fetched:
         return fetched[repo]
     d = os.path.join(cache_dir(), "clones", *repo.split("/", 1))
@@ -163,6 +176,8 @@ def clone(repo, fetched):
 def human_comments(repo, since, max_pages, skip_login=None):
     """Top-level inline review comments on repo's PRs created after `since`, newest first,
     by humans (bots and replies dropped; skip_login's dropped too when given)."""
+    if not valid_repo(repo):
+        return
     for page in range(1, max_pages + 1):
         batch = gh_json("repos/%s/pulls/comments?sort=created&direction=desc&per_page=100&page=%d" % (repo, page))
         if not isinstance(batch, list) or not batch:
@@ -250,7 +265,7 @@ def collect_calibration():
 
     # 1. Reviews posted since the last run — the repos calibration covers are
     #    exactly the repos these name (plus the ones still tracked).
-    new_keys = []
+    new_keys, invalid = [], set()
     for e in audit_events(['submit_review']):
         if not is_review_post(e):
             continue
@@ -258,8 +273,13 @@ def collect_calibration():
         if ts <= last:
             continue
         o = e.get("options") or {}
-        repo, pr = o.get("repo") or e.get("repo"), int(o.get("pr") or e.get("number") or 0)
-        if not repo or not pr:
+        repo = o.get("repo") or e.get("repo")
+        try:
+            pr = int(o.get("pr") or e.get("number") or 0)
+        except (TypeError, ValueError):
+            pr = 0
+        if not valid_repo(repo) or pr <= 0:
+            invalid.add(str(repo))
             continue
         key = "%s#%d" % (repo, pr)
         comments = norm_comments(o.get("comments"))
@@ -276,6 +296,10 @@ def collect_calibration():
     fetched = {}
     followups = {}
     for key, r in list(tracked.items()):
+        if not isinstance(r, dict) or not valid_repo(r.get("repo")):
+            invalid.add(str(r.get("repo") if isinstance(r, dict) else key))
+            del tracked[key]
+            continue
         c = clone(r["repo"], fetched)
         if not c:
             if day(r["at"]) < t_now - dt.timedelta(days=UNMERGED_DAYS):
@@ -326,6 +350,9 @@ def collect_calibration():
         repo, num, ts = e.get("repo"), e.get("number"), e.get("ts", "")
         if not repo or not num or not ts:
             continue
+        if not valid_repo(repo) or not str(num).isdigit():
+            invalid.add(str(repo))
+            continue
         key = "%s#%d" % (repo, int(num))
         step, o = step_name(e), e.get("outputs") or {}
         if e.get("event") == "step" and step == "review" and isinstance(o.get("review"), str):
@@ -343,6 +370,10 @@ def collect_calibration():
             pending[key] = h
     outcomes, handoff_repos = [], set()
     for key, h in sorted(pending.items()):
+        if not valid_repo(key.rsplit("#", 1)[0]):
+            invalid.add(key.rsplit("#", 1)[0])
+            del pending[key]
+            continue
         after = [p for t, p in posts.get(key, []) if t > h["at"]]
         if not after:
             if iso(h["at"]) < t_now - dt.timedelta(days=DISCARD_DAYS):
@@ -431,6 +462,7 @@ def collect_calibration():
         "reviews": cap("\n".join(out) + "\n", REVIEWS_CAP, "reviews"),
         "team": cap("\n".join(team_lines) + "\n", TEAM_CAP, "team comments"),
         "team_count": sum(len(v) for v in team.values()), "team_prs": len(team), "team_both": both,
+        "invalid_repos": sorted(invalid),
     }
 
 
@@ -449,7 +481,7 @@ def parse_repos(raw):
     out = []
     for r in items:
         r = str(r).strip()
-        if re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", r) and r not in out:
+        if valid_repo(r) and r not in out:
             out.append(r)
     return out
 
@@ -514,7 +546,8 @@ def record(ctx):
     for i, w in enumerate(writes):
         got = written[i] if i < len(written) and isinstance(written[i], dict) else {}
         lines.append("- %s [%s] %s" % (got.get("id") or "?", w.get("label") or w.get("scope") or "global", w.get("text", "")))
-    for key, title in (("superseded", "Superseded"), ("rejected", "Rejected (out of scope)"), ("dropped", "Dropped")):
+    for key, title in (("downgraded", "Downgraded (global resting on one repo)"), ("superseded", "Superseded"),
+                       ("rejected", "Rejected (out of scope)"), ("dropped", "Dropped")):
         items = plan.get(key) or []
         if items:
             lines.append("%s (%d):" % (title, len(items)))
@@ -531,6 +564,7 @@ def record(ctx):
             os.replace(nxt, os.path.join(cache, "calibration.json"))
             promoted = True
     return {"written": len(writes), "rejected": len(plan.get("rejected") or []),
+            "downgraded": len(plan.get("downgraded") or []),
             "dropped": len(plan.get("dropped") or []), "promoted": promoted,
             "log": os.path.join(cache, "calibration-log.md")}
 

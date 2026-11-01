@@ -4,6 +4,7 @@ fake `gh` on PATH — no network, nothing outside a temp dir.
     python3 -m unittest discover -s pr-review-team/tests
 """
 import datetime as dt
+import importlib.util
 import json
 import os
 import shutil
@@ -11,6 +12,7 @@ import subprocess
 import tempfile
 import textwrap
 import unittest
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SCRIPT = os.path.join(HERE, "..", "scripts", "calibration.py")
@@ -19,6 +21,8 @@ FAKE_GH = textwrap.dedent('''\
     #!/usr/bin/env python3
     import json, os, sys
     a = sys.argv[1:]
+    with open(os.environ["FAKE_GH_LOG"], "a") as log:
+        log.write(" ".join(a) + "\\n")
     if a[:2] == ["api", "user"]:
         print("rev"); sys.exit(0)
     if a[:1] == ["api"] and "/pulls/comments?" in a[1]:
@@ -75,7 +79,8 @@ class Fixture:
 
     def run(self, cmd, stdin="{}", **env):
         e = {"PATH": self.bin + ":" + os.environ["PATH"], "HOME": self.root, "STATE_DIR": self.state,
-             "GIT_BASE": "file://" + os.path.join(self.root, "forge"), "FAKE_COMMENTS": self.comments}
+             "GIT_BASE": "file://" + os.path.join(self.root, "forge"), "FAKE_COMMENTS": self.comments,
+             "FAKE_GH_LOG": os.path.join(self.root, "gh.log")}
         e.update(env)
         return subprocess.run(["python3", SCRIPT, cmd], input=stdin, capture_output=True, text=True, env=e)
 
@@ -162,11 +167,72 @@ class CollectCalibrationTest(unittest.TestCase):
             log = f.read()
         self.assertIn("- m1 [acme/api] t", log)
 
+    def test_a_malformed_repo_never_reaches_git_gh_or_a_path(self):
+        n = self.f.now
+        bad = ["../../escape", "acme/..", "./x", "acme/api/extra", "acme/api;rm", "acme api", "https://evil/x"]
+        self.f.audit(*[post(n - dt.timedelta(days=1), r, 3) for r in bad])
+        self.f.audit({"event": "step", "step": "gate", "ts": iso(n - dt.timedelta(hours=2)), "repo": "../../escape",
+                      "number": 4, "outputs": {"handoff": True}})
+        cache = os.path.join(self.f.state, "pr-review-team")
+        os.makedirs(cache, exist_ok=True)
+        with open(os.path.join(cache, "calibration.json"), "w") as f:   # a tampered state file
+            json.dump({"last_run": iso(n - dt.timedelta(days=5)),
+                       "tracked": {"x#1": {"repo": "../../escape2", "pr": 1, "at": iso(n)[:10]}},
+                       "handoffs": {"../../escape3#2": {"at": iso(n - dt.timedelta(days=30))}}}, f)
+        res = self.f.run("collect-calibration")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        out = json.loads(res.stdout)
+        self.assertEqual(out["repos"], ["acme/api"])
+        for r in bad[:3] + ["../../escape2"]:
+            self.assertIn(r, out["invalid_repos"])
+        self.assertEqual(sorted(os.listdir(os.path.join(cache, "clones"))), ["acme"])
+        self.assertEqual(sorted(os.listdir(self.f.root)), sorted(["state", "bin", "comments.json", "work", "forge", "gh.log"]))
+        with open(os.path.join(self.f.root, "gh.log")) as f:
+            calls = f.read()
+        with open(os.path.join(cache, "calibration.next.json")) as f:
+            nxt = f.read()
+        for text in (calls, nxt, out["reviews"], out["team"]):
+            self.assertNotIn("escape", text)
+            self.assertNotIn("evil", text)
+
     def test_without_the_audit_log_it_names_the_grant(self):
         os.remove(os.path.join(self.f.state, "audit.jsonl"))
         res = self.f.run("collect-calibration")
         self.assertEqual(res.returncode, 3)
         self.assertIn("trust: full", res.stderr)
+
+
+class RepoGuardTest(unittest.TestCase):
+    """The innermost guards, called directly: whatever a caller hands them, a
+    malformed repo is neither cloned nor sent to gh."""
+
+    def setUp(self):
+        spec = importlib.util.spec_from_file_location("calibration", SCRIPT)
+        self.c = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.c)
+        self.root = tempfile.mkdtemp(prefix="calib-guard-")
+        self.state = os.path.join(self.root, "a", "b", "state")
+
+    def tearDown(self):
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def test_clone_refuses(self):
+        with mock.patch.dict(os.environ, {"STATE_DIR": self.state, "GIT_BASE": "file://" + self.root}), \
+                mock.patch.object(self.c.subprocess, "run", side_effect=AssertionError("ran a command")):
+            for r in ("../../x", "acme/..", "a/b/c", "a b/c"):
+                self.assertIsNone(self.c.clone(r, {}))
+        self.assertFalse(os.path.exists(os.path.join(self.state, "pr-review-team", "clones")))
+
+    def test_gh_paths_refuse(self):
+        with mock.patch.object(self.c, "gh_json", side_effect=AssertionError("called gh")):
+            for r in ("../x", "acme/..", "a/b/c"):
+                self.assertEqual(list(self.c.human_comments(r, self.c.now(), 3)), [])
+
+    def test_valid_repo(self):
+        for r in ("acme/api", "a-b.c/d_e.f", "A/B"):
+            self.assertTrue(self.c.valid_repo(r), r)
+        for r in ("", "acme", "../x", "acme/..", "./x", "a/b/c", "a b/c", "a/b#1", None, 3):
+            self.assertFalse(self.c.valid_repo(r), r)
 
 
 class CollectBackfillTest(unittest.TestCase):
@@ -190,7 +256,7 @@ class CollectBackfillTest(unittest.TestCase):
             {"created_at": iso(n - dt.timedelta(days=41)), "user": {"login": "bob", "type": "User"}, "in_reply_to_id": None,
              "path": "b.go", "body": "lgtm", "pull_request_url": "x/pulls/4"},
         ])
-        res = self.f.run("collect-backfill", stdin=json.dumps({"inputs": {"repos": "acme/api, bad repo, acme/api"}}),
+        res = self.f.run("collect-backfill", stdin=json.dumps({"inputs": {"repos": "acme/api, bad repo, ../acme, acme/.., acme/api"}}),
                          BACKFILL_DAYS="90")
         self.assertEqual(res.returncode, 0, res.stderr)
         out = json.loads(res.stdout)
