@@ -87,6 +87,7 @@ Every setting is optional. Set them under `packs.<instance>.settings`.
 | `calibration_discard_days` | `7` | A hand-off draft nobody posted within this many days counts as discarded. |
 | `calibration_min_lines` | `3` | A later commit is a follow-up only if it changes or removes at least this many lines the reviewed PR added. |
 | `calibration_team_pages` | `15` | Pages (100 comments each) of teammates' review comments read per repo per calibration run. |
+| `perspectives_as_lenses` | `false` | `true`: a learned perspective distinct from every lens may become an extra lens for its key, at most 3 per key. See [Perspectives](#perspectives-the-team-in-the-review). |
 | `trusted_associations` | `OWNER,MEMBER,COLLABORATOR` | Calibration and backfill learn only from comments (and follow-up commits) by authors with one of these GitHub `author_association` values; your own account always counts. `none` = only yours. See [Training data and prompt injection](#training-data-and-prompt-injection). |
 | `backfill_max_pages` | `300` | Pages (100 comments each) read per repo by `review-backfill` — a safety cap. A repo that hits it is reported as truncated; raise it for a `days=all` train of a long history. |
 | `backfill_min_chars` | `40` | `review-backfill` ignores comments shorter than this. |
@@ -122,6 +123,7 @@ calibration triggers (or by you) — layered by a **scope key**, the
 | `standard:<key>` | standard | This key's additions to the review standard. |
 | `emphasis:<key>` | emphasis | "Look hard at X" rules: kinds of change that past reviews got wrong. |
 | `<key>` | facts | Facts the diff can't show: how the code is built, deployed, operated, used. |
+| `perspective:<key>` | perspectives | What the engineers on this code keep looking for — see [Perspectives](#perspectives-the-team-in-the-review). |
 
 **Notes steer the review; they never replace it.** Each lens reviewer is told
 to do a full, independent review of the whole change through its lens first,
@@ -135,9 +137,10 @@ blocking weight; learned `standard` notes are strong guidance, not law.
 
 The pack reads the notes itself (the review's `notes` step) rather than having
 conductor inject them, so they arrive in a fixed order — standard (the shared
-set, then `standard:<key>`), then emphasis, then facts, newest first within a
-layer — and under a cap: **`memory_limit`** notes per review (default 40;
-`0` turns them off). When the cap bites, facts go first. A lens that raised a
+set, then `standard:<key>`), then emphasis, then facts, then perspectives,
+newest first within a layer — and under a cap: **`memory_limit`** notes per
+review (default 40; `0` turns them off). When the cap bites, perspectives go
+first, then facts. A lens that raised a
 finding because of a note says so (the finding's `note`), which `review-eval`
 counts. The lens step itself has conductor memory turned off, so it neither
 reads memory on its own nor writes any back.
@@ -151,6 +154,34 @@ You can write entries by hand too — with the `dir:` backend each one is a
 Markdown file in your memory directory, and the `scope:` line picks its
 layer. To check that the notes help rather than crowd out the review, run
 [`review-eval`](#measuring-it-review-eval).
+
+### Perspectives: the team in the review
+
+The reviewer aims to be the best reviewer for a scope: the sum of what the
+engineers who work on it look for. Calibration and backfill learn each trusted
+engineer's recurring concerns as **perspective** entries in
+`perspective:<key>`: who (their GitHub login), what they consistently look
+for, and where (paths or areas). A perspective must rest on **at least 3 of
+that engineer's own comments across at least 2 PRs**, each a PR they
+commented on. The deterministic plan step checks this against the comments
+the run collected, and only trusted authors' comments are collected, so an
+outside contributor never forms one. Entries are written as "<login> looks for:
+<concern> Where: <paths>".
+
+The lenses read perspectives as notes, inside `memory_limit`: "engineers on
+this code tend to look for these; take the ones that fit your lens as extra
+focus, never instead of it."
+
+`perspectives_as_lenses` (default `false`): when `true`, a perspective the
+agent marks as distinct from every existing lens becomes an **extra lens**
+for its key ("Perspective: <login>"). The plan step allows at most 3 per key
+and keeps the rest as notes, and the review reads at most 3. A lens's focus
+is learned text that the lens follows, which is why this is off by default.
+
+**Perspectives name people.** They are entries about named colleagues, kept
+in your conductor memory, and `conductor memory export` carries them like
+any other entry. Keep them in a private training pack or your own memory
+directory; never put them in a public pack, an example or a shared config.
 
 ### Scope keys
 
@@ -195,17 +226,19 @@ these need both. Arming them is your call.
 
 Reads what is new since its last run:
 
-- **your own comments on reviewed PRs ("owner catches")** — reviews post as
-  your account, so anything that account wrote on a PR *after* the pack
-  reviewed it, and that the pack didn't post, is you correcting it: a later
+- **catches** — what any trusted engineer (`trusted_associations`, and your
+  own account) raised on a PR *after* the pack reviewed it: a later
   `CHANGES_REQUESTED` review, an inline comment (a reply to the pack's comment
   is shown with it), a conversation comment, or a dismissal of the pack's
-  review. They count until `calibration_window_days` after the PR merges
-  (`calibration_unmerged_days` if it doesn't), and they are the strongest
-  signal the agent gets. The pack's own posts are told apart by the audit
-  log's `submit_review` records (review body and time, and the inline
-  comments it sent) — never by author — so a PR whose audit records have
-  rotated away is skipped rather than guessed at;
+  review. Each is a miss, and every engineer's catch weighs the same. Yours
+  are marked "(owner)" in the evidence and the log so you can find them, not
+  ranked above anyone else's. They count until `calibration_window_days`
+  after the PR merges (`calibration_unmerged_days` if it doesn't), and they
+  are the strongest signal the agent gets. Reviews post as your account, so
+  the pack's own posts are told apart from yours by the audit log's
+  `submit_review` records (review body and time, and the inline comments it
+  sent), never by author. A PR whose audit records have rotated away is
+  skipped rather than guessed at;
 - **reviews this pack posted** — from the audit log, so the repos it covers
   are exactly the repos it reviewed; nothing is configured per repo;
 - **follow-up commits** — commits that changed or removed lines a reviewed PR
@@ -214,19 +247,20 @@ Reads what is new since its last run:
 - **hand-off outcomes** — each draft it handed to a human compared with what
   was actually posted: as-is, edited (dropped / added / reworded comments, a
   changed verdict), or discarded;
-- **teammates' review comments** on those repos (bots, replies, and your own
-  account excluded — yours are the owner catches above), from trusted authors
-  only (`trusted_associations`).
+- **teammates' review comments** on those repos, from trusted authors only
+  (`trusted_associations`; bots, replies, your own account and anything
+  already a catch excluded).
 
 **Teaching it in auto mode.** With `auto: true` nothing is handed off, so
-there are no drafts to learn from: comment on the PR instead. Request changes
+there are no drafts to learn from: you or any trusted teammate comment on the
+PR instead. Request changes
 on a PR the pack approved, reply to one of its inline comments to say it was
 wrong, or note what it missed in the conversation — the next calibration run
 reads that as a miss and turns it into an entry for the PR's key.
 
 An agent reads all of that inline — no network, no files, no memory access —
 and proposes entries, each with a `kind` (`fact`, `standard`, `emphasis`,
-`global`, or `none` for a candidate it dropped), a key, and the PRs it rests
+`global`, `perspective`, or `none` for a candidate it dropped), a key, and the PRs it rests
 on. Calibration maps every PR it shows the agent to that PR's key by
 rendering `scope_key` over the PR's facts (fetching title, labels, base and
 URL from GitHub only when the key reads them), so a lesson lands exactly
@@ -286,7 +320,7 @@ instruction that got learned would stay. The pack defends at each step:
   PR that landed it is by such an author, or it was pushed straight to the
   branch. Your own account always counts. Everything else (outside
   contributors, bots, unknown) is dropped and counted in the run log. Every
-  entry must cite at least one PR with trusted evidence: an owner catch, a
+  entry must cite at least one PR with trusted evidence: a catch, a
   hand-off outcome, a trusted follow-up or a trusted author's comment.
 - **How the agents see it.** Each quoted item is fenced as data between
   `<<<TOKEN` and `TOKEN>>>`, with a token drawn fresh each run, so text
@@ -304,10 +338,10 @@ instruction that got learned would stay. The pack defends at each step:
   - an entry that would make reviews go easier on something (approve, skip,
     ignore, trust, allowlist, lower severity, "not blocking" and the like)
     is written to `quarantine:<key>` (`quarantine:global` for a shared
-    one), which no review reads, unless its evidence includes an owner
-    catch or a hand-off you edited or discarded. It never replaces an
-    existing entry. Backfill has no owner catches, so there such entries
-    are always quarantined.
+    one), which no review reads, unless its evidence includes a catch (by
+    you or any trusted engineer) or a hand-off you edited or discarded. It
+    never replaces an existing entry. Backfill has no catches, so in
+    backfill such entries are always quarantined.
 
   The run log (`calibration-log.md`) lists each quarantined entry with its
   exact text and the command that would promote it, for example:
@@ -413,6 +447,7 @@ conductor run review/review-eval --input repos=owner/app                 # the 5
 conductor run review/review-eval --input repos=owner/app --input count=10
 conductor run review/review-eval --input prs=owner/app#12,owner/app#15
 conductor run review/review-eval --input repos=owner/app --input scope_key='org:{{.owner}}'   # try another key
+conductor run review/review-eval --input repos=owner/app --input baseline=team                  # against the team
 ```
 
 It **posts nothing** (it runs the review engine, never the posting flow or
@@ -446,6 +481,39 @@ Arm it like the calibration triggers (its `pick` step reads the audit log and
     triggers:
       review-eval: { enabled: true }
 ```
+
+### Against the team: `baseline=team`
+
+With `--input baseline=team`, the yardstick is what your engineers actually
+said. It takes past PRs where trusted engineers (the `trusted_associations`
+set, plus your own account) left inline review comments. The pack's own posts
+are left out, using the audit log. It replays each PR through the lens panel,
+memory off and then memory on, as if it had no comments yet, and matches the
+findings against those comments the same way (path, nearby line, the light
+judge):
+
+- **recall** — the share of the engineers' comments the reviewer also raised;
+- **noise** — the share of the reviewer's findings no engineer raised. These
+  aren't always wrong, but nobody asked for them.
+
+The report gives both per PR and overall, without and with memory, and lists
+what was missed and what was extra.
+
+**Held out, so the score isn't memorization.** Calibration and backfill record
+every PR they showed their agents in a ledger,
+`<state_dir>/pr-review-team/trained.json`. Team-baseline eval skips those PRs
+when it picks them itself, and refuses a named one. Add
+`--input trained=flag` to score trained-on PRs anyway; they are flagged in
+the report. Some limits:
+
+- A replay reviews the PR's current diff, not the commit each comment was
+  made on.
+- The lens reviewers keep their read-only `gh` in the checkout, so nothing
+  but the prompt stops one from reading the PR's comments. Treat a
+  suspiciously high recall with that in mind.
+
+It posts nothing and writes no memory, exactly like the memory baseline.
+`count` and `prs` work the same way.
 
 When an eval ran since the last calibration, `review-calibration` adds its
 summary to the calibration log — a note to read, not a gate.
@@ -498,14 +566,15 @@ Re-export and push to update it.
   default injection added).
 - **Only trusted authors teach it.** Teammates' comments count only from
   `trusted_associations` (default `OWNER,MEMBER,COLLABORATOR`), and entries
-  that would make reviews go easier on something are quarantined unless an
-  owner catch backs them. If your teammates show up as `CONTRIBUTOR` (for
+  that would make reviews go easier on something are quarantined unless a
+  catch backs them. If your teammates show up as `CONTRIBUTOR` (for
   example, org membership the reviewer's token can't see), the run log's
   "Untrusted" line counts them; widen the setting only if you mean it.
-- **Your own comments teach it.** Calibration used to skip everything your
-  account wrote; it now reads what you wrote after the pack's review as owner
-  catches, and backfill counts your pack-era comments unless the audit log
-  shows the pack posted them.
+- **Your team's corrections teach it.** Calibration used to skip everything
+  your account wrote; it now reads what you and every trusted engineer wrote
+  after the pack's review as catches, all with the same weight, and backfill
+  counts your pack-era comments unless the audit log shows the pack posted
+  them. Backfill weighs your comments and your teammates' alike.
 - **Calibration moved into the pack.** If you run your own calibration or
   backfill triggers, the pack's `review-calibration` and `review-backfill`
   replace them; arm those and remove yours. The pack keeps its own position

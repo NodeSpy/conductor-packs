@@ -174,14 +174,15 @@ def clone(repo, fetched):
     return fetched[repo]
 
 
-def human_comments(repo, since, max_pages, skip_login=None, truncated=None, trusted=None, dropped=None, owner=None):
+def human_comments(repo, since, max_pages, skip_login=None, truncated=None, trusted=None, dropped=None, owner=None, skip_ids=()):
     """Top-level inline review comments on repo's PRs created after `since`, newest first,
     by humans (bots and replies dropped; skip_login's dropped too when given). With
     `trusted` (a set of author_association values), a comment counts only when its
     author's association is in it — or its author is `owner`, the reviewer's own
     account; everything else (bots included) is dropped and counted in `dropped`
-    by reason. When the page cap ends the read before `since` is reached, repo is
-    appended to `truncated`."""
+    by reason. Comments whose id is in skip_ids (already read, or already counted) are
+    passed over silently. When the page cap ends the read before `since` is reached,
+    repo is appended to `truncated`."""
     if not valid_repo(repo):
         return
     for page in range(1, max_pages + 1):
@@ -192,7 +193,7 @@ def human_comments(repo, since, max_pages, skip_login=None, truncated=None, trus
             ts = iso(c["created_at"])
             if ts <= since:
                 return
-            if c.get("in_reply_to_id"):
+            if c.get("in_reply_to_id") or (c.get("id") is not None and c.get("id") in skip_ids):
                 continue
             u = c.get("user") or {}
             login = u.get("login", "")
@@ -376,44 +377,64 @@ def pack_review_ids(repo, pr, me, posts, cache):
     return cache[key]
 
 
-def owner_activity(repo, pr, me, posts, cache):
-    """What the reviewer's own account did on a PR this pack reviewed that the pack did NOT
-    post: reviews (with their verdict), inline comments and replies, conversation comments —
-    and the pack's own reviews that were since dismissed. [(ts or None, label, text)]."""
+def catch_activity(repo, pr, me, posts, cache, trusted):
+    """What people did on a PR this pack reviewed — reviews (with their verdict), inline
+    comments and replies, conversation comments — and the pack's own reviews that were
+    since dismissed: [(ts or None, login, label, text, comment id or None)]. The
+    reviewer's own account is one of them, minus what the pack posted under it (told
+    apart by the audit log, never by author). An entry by a bot or an author outside
+    `trusted` has login None and its reason as label (text empty): counted, never read."""
     if not valid_repo(repo):
         return []
     ids, reviews = pack_review_ids(repo, pr, me, posts, cache)
     audited = set().union(*[p["comments"] for p in posts]) if posts else set()
     out = []
+
+    def who(obj):
+        """(login, "") for a trusted engineer, else (None, why not)."""
+        u = obj.get("user") or {}
+        login = u.get("login") or ""
+        if u.get("type") == "Bot" or login.endswith("[bot]"):
+            return None, "bot"
+        if login == me or str(obj.get("author_association") or "") in trusted:
+            return login, ""
+        return None, str(obj.get("author_association") or "unknown")
+
     for rv in reviews:
         if rv.get("id") in ids:
             if rv.get("state") == "DISMISSED":
-                out.append((None, "DISMISSED the pack's review", norm(rv.get("body"))[:300]))
+                out.append((None, "", "DISMISSED the pack's review", norm(rv.get("body"))[:300], None))
             continue
-        if (rv.get("user") or {}).get("login") != me or not rv.get("submitted_at"):
+        if not rv.get("submitted_at"):
             continue
         state, body = rv.get("state") or "", norm(rv.get("body"))
         if not body and state not in ("CHANGES_REQUESTED",):
             continue   # the empty shell of inline comments (listed below), or a bare approval
-        out.append((iso(rv["submitted_at"]), "REVIEW " + state, body[:600]))
+        login, why = who(rv)
+        out.append((iso(rv["submitted_at"]), login, why or "REVIEW " + state, "" if why else body[:600], None))
     inline = gh_list("repos/%s/pulls/%d/comments" % (repo, pr))
     by_id = {c.get("id"): c for c in inline}
     for c in inline:
-        if (c.get("user") or {}).get("login") != me or not c.get("created_at"):
+        if not c.get("created_at"):
             continue
         body = norm(c.get("body"))
-        if c.get("pull_request_review_id") in ids or body in audited:
+        if (c.get("user") or {}).get("login") == me and (c.get("pull_request_review_id") in ids or body in audited):
             continue   # the pack's own inline comment
+        login, why = who(c)
+        if why:
+            out.append((iso(c["created_at"]), None, why, "", c.get("id")))
+            continue
         label = "INLINE %s:%s" % (c.get("path"), c.get("line") or c.get("original_line") or "")
         parent = by_id.get(c.get("in_reply_to_id"))
         if parent is not None:
             label += " (reply to %s: %s)" % (
                 "the pack's comment" if parent.get("pull_request_review_id") in ids else (parent.get("user") or {}).get("login"),
                 norm(parent.get("body"))[:200])
-        out.append((iso(c["created_at"]), label, body[:600]))
+        out.append((iso(c["created_at"]), login, label, body[:600], c.get("id")))
     for c in gh_list("repos/%s/issues/%d/comments" % (repo, pr)):
-        if (c.get("user") or {}).get("login") == me and c.get("created_at"):
-            out.append((iso(c["created_at"]), "COMMENT", norm(c.get("body"))[:600]))
+        if c.get("created_at"):
+            login, why = who(c)
+            out.append((iso(c["created_at"]), login, why or "COMMENT", "" if why else norm(c.get("body"))[:600], None))
     return out
 
 
@@ -476,7 +497,7 @@ def write_json_atomic(path, obj):
 
 REVIEWS_CAP = 120_000   # bytes of review/follow-up text handed to the agent
 TEAM_CAP = 60_000       # bytes of team comments handed to the agent
-OWNER_CAP = 60_000      # bytes of owner catches handed to the agent
+CATCH_CAP = 60_000      # bytes of catches handed to the agent
 PATCH_CAP = 3_000       # bytes of one follow-up commit's patch
 
 
@@ -683,13 +704,19 @@ def collect_calibration():
             owner_outcomes.add(key)
             outcomes += ["    - " + x for x in diff]
 
-    # 2c. OWNER CATCHES. Reviews post as the reviewer's own account, so what that account
-    #     wrote on a reviewed PR by hand — after the pack's review, through the follow-up
-    #     window — is the owner correcting it: the strongest miss signal there is, and
-    #     the only direct one in auto mode, where nothing is handed off. Told apart from
-    #     the pack's own posts by the audit log, never by author.
+    # 2c. CATCHES. What a trusted engineer raised on a reviewed PR after the pack's
+    #     review, through the follow-up window, is something the review missed — the
+    #     strongest signal there is, and the only direct one in auto mode, where nothing
+    #     is handed off. Everyone's catch weighs the same; the reviewer's own account
+    #     (the owner: reviews post as it) is marked as such. The pack's own posts under
+    #     that account are told apart by the audit log, never by author.
     posts_by_pr = pack_posts()
-    review_cache, catches = {}, {}
+    review_cache, catches, owner_catches, catch_ids = {}, {}, 0, set()
+    people = {}   # login -> {"repo#pr": comments} — what each trusted engineer wrote, for perspectives
+    def saw(login, key):
+        if login:
+            p = people.setdefault(login, {})
+            p[key] = p.get(key, 0) + 1
     for key, r in sorted(tracked.items()):
         posts = posts_by_pr.get(key)
         if not posts:
@@ -701,15 +728,26 @@ def collect_calibration():
             end = first + dt.timedelta(days=UNMERGED_DAYS)
         seen_dismissed = set(r.get("dismissed") or [])
         got = []
-        for ts, label, text in owner_activity(r["repo"], r["pr"], me, posts, review_cache):
+        for ts, login, label, text, cid in catch_activity(r["repo"], r["pr"], me, posts, review_cache, trusted):
             if ts is None:   # a dismissal: reported once
                 if text in seen_dismissed:
                     continue
                 seen_dismissed.add(text)
             elif not (ts > first and ts > last and ts <= end):
                 continue
-            got.append("    - OWNER%s: %s" % ("" if ts is None else " (" + ts.strftime("%Y-%m-%d") + ")",
-                                              fence("%s: %s" % (label, text), 900)))
+            if ts is not None and login is None:   # learn only from trusted authors
+                k = "catch (%s)" % label
+                untrusted[k] = untrusted.get(k, 0) + 1
+                if cid is not None:
+                    catch_ids.add(cid)   # nor read again as a team comment
+                continue
+            if cid is not None:
+                catch_ids.add(cid)
+            saw(login, key)
+            owner_catches += login == me
+            by = "" if ts is None else " by %s%s (%s)" % (fence.clean(login, 60), " (owner)" if login == me else "",
+                                                           ts.strftime("%Y-%m-%d"))
+            got.append("    - CATCH%s: %s" % (by, fence("%s: %s" % (label, text), 900)))
         r["dismissed"] = sorted(seen_dismissed)
         if got:
             catches[key] = got
@@ -718,8 +756,10 @@ def collect_calibration():
     repos = sorted({r["repo"] for r in tracked.values()} | handoff_repos)
     team = {}
     for repo in repos:
-        for _, login, c in human_comments(repo, last, TEAM_PAGES, skip_login=me, trusted=trusted, dropped=untrusted):
+        # a catch (or an untrusted one, already counted) is not read again as a team comment
+        for _, login, c in human_comments(repo, last, TEAM_PAGES, skip_login=me, trusted=trusted, dropped=untrusted, skip_ids=catch_ids):
             pr = int(c["pull_request_url"].rsplit("/", 1)[-1])
+            saw(login, "%s#%d" % (repo, pr))
             team.setdefault("%s#%d" % (repo, pr), []).append({
                 "by": fence.clean(login, 60), "path": c.get("path"), "body": c.get("body") or ""})
 
@@ -751,10 +791,10 @@ def collect_calibration():
         out += review_lines(key, key)
         out += followup_lines(key)
 
-    owner_lines = []
+    catch_lines = []
     for key in sorted(catches):
-        owner_lines += review_lines(key, key)
-        owner_lines += catches[key]
+        catch_lines += review_lines(key, key)
+        catch_lines += catches[key]
 
     team_lines, both = [], 0
     for key, cs in sorted(team.items(), key=lambda kv: ((kv[0] not in tracked), kv[0])):
@@ -774,19 +814,21 @@ def collect_calibration():
         "handoffs": sum(1 for o in outcomes if not o.startswith("    ")),
         "repos": repos, "reviewer": me,
         "reviews": cap_items(out, REVIEWS_CAP, "reviews"),
-        "owner": cap_items(owner_lines, OWNER_CAP, "owner catches"),
-        "owner_count": sum(len(v) for v in catches.values()), "owner_prs": len(catches),
+        "catches": cap_items(catch_lines, CATCH_CAP, "catches"),
+        "catch_count": sum(len(v) for v in catches.values()), "catch_prs": len(catches), "owner_count": owner_catches,
         "team": cap_items(team_lines, TEAM_CAP, "team comments"),
         "team_count": sum(len(v) for v in team.values()), "team_prs": len(team), "team_both": both,
         "invalid_repos": sorted(invalid),
         # the fence token the evidence above is wrapped in, what was dropped as
         # untrusted (by reason), and which PRs carry trusted evidence: a learned
-        # entry must cite one of trusted_refs, and only owner_refs (an owner catch,
-        # or a hand-off the owner edited or discarded) let one that would make the
-        # reviewer go easier on something be read by reviews (the pack's plan step)
+        # entry must cite one of trusted_refs, and only catch_refs (a catch, or a
+        # hand-off the owner edited or discarded) let one that would make the
+        # reviewer go easier on something be read by reviews (the pack's plan step);
+        # people: each trusted engineer's comments per PR, which perspective entries
+        # must rest on
         "fence": fence.token, "untrusted": untrusted, "trusted_associations": sorted(trusted),
         "trusted_refs": sorted(set(followups) | set(catches) | set(team) | set(owner_outcomes) | set(outcome_refs)),
-        "owner_refs": sorted(set(catches) | set(owner_outcomes)),
+        "catch_refs": sorted(set(catches) | set(owner_outcomes)), "people": people,
         # every PR the agent is shown, with its facts, for the pack's `keys` step
         "prs": facts_for(list(new_keys) + list(followups) + list(catches) + list(team)
                          + [o.split(" ", 1)[0] for o in outcomes if not o.startswith(" ")]),
@@ -845,7 +887,7 @@ def collect_backfill(ctx):
     posts_by_pr, review_cache, start = pack_posts(), {}, audit_start()
     t_now = now()
     since = dt.datetime(1970, 1, 1, tzinfo=dt.timezone.utc) if whole else t_now - dt.timedelta(days=days)
-    months, counts, truncated, pack_dropped = {}, {}, [], 0
+    months, counts, truncated, pack_dropped, people = {}, {}, [], 0, {}
     for repo in repos:
         for ts, login, c in human_comments(repo, since, max_pages, truncated=truncated, trusted=trusted, dropped=untrusted, owner=me):
             if login == me and pack_since and ts >= pack_since:
@@ -867,6 +909,8 @@ def collect_backfill(ctx):
             pr = c["pull_request_url"].rsplit("/", 1)[-1]
             months.setdefault(m, {}).setdefault("%s#%s" % (repo, pr), []).append(
                 "    - %s %s" % (who, fence("%s: %s" % (c.get("path"), body), 500)))
+            ref = "%s#%s" % (repo, pr)
+            people.setdefault(login, {})[ref] = people.setdefault(login, {}).get(ref, 0) + 1
             k = counts.setdefault(m, {"mine": 0, "team": 0})
             k["mine" if login == me else "team"] += 1
     out = []
@@ -881,10 +925,10 @@ def collect_backfill(ctx):
             "mine": sum(o["mine"] for o in out), "team": sum(o["team"] for o in out),
             "truncated": truncated, "max_pages": max_pages, "pack_dropped": pack_dropped,
             # see collect-calibration: every comment kept here is from a trusted author, so
-            # every PR it names is trusted evidence; none is an owner catch (backfill reads
+            # every PR it names is trusted evidence; none is a catch (backfill reads
             # comments, not corrections of the pack's reviews)
             "fence": fence.token, "untrusted": untrusted, "trusted_associations": sorted(trusted),
-            "trusted_refs": sorted({k for m in months.values() for k in m}), "owner_refs": [],
+            "trusted_refs": sorted({k for m in months.values() for k in m}), "catch_refs": [], "people": people,
             "prs": facts_for([k for m in months.values() for k in m])}
 
 
@@ -892,7 +936,37 @@ def collect_backfill(ctx):
 # record
 # ---------------------------------------------------------------------------
 
-# ---- review-eval: memory on vs memory off ----
+# ---- the hold-out ledger: which PRs calibration and backfill trained on ----
+
+def ledger_path():
+    return os.path.join(cache_dir(), "trained.json")
+
+
+def ledger_load():
+    try:
+        with open(ledger_path()) as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def ledger_add(refs, mode):
+    """Record refs as trained on (by `mode`); returns how many the ledger holds."""
+    d, t = ledger_load(), iso_str(now())
+    for ref in refs:
+        m = REF_RE.fullmatch(str(ref or ""))
+        if not m or not valid_repo(m.group(1)):
+            continue
+        e = d.setdefault("%s#%d" % (m.group(1), int(m.group(2))), {"first": t, "by": []})
+        e["last"] = t
+        if mode not in e["by"]:
+            e["by"].append(mode)
+    write_json_atomic(ledger_path(), d)
+    return len(d)
+
+
+# ---- review-eval: memory on vs memory off, or the reviewer vs the team ----
 
 EVAL_COUNT = 5
 EVAL_MAX = 50
@@ -910,8 +984,13 @@ def eval_pick(ctx):
     if not raw_count.isdigit() or not 0 < int(raw_count) <= EVAL_MAX:
         raise SystemExit("review-eval: --input count= takes a number from 1 to %d, got %r" % (EVAL_MAX, raw_count))
     count = int(raw_count)
+    mode = str(inputs.get("baseline") or "memory").strip().lower()
+    if mode not in ("memory", "team"):
+        raise SystemExit("review-eval: --input baseline= takes memory or team, got %r" % inputs.get("baseline"))
     named = [x for x in re.split(r"[\s,]+", str(inputs.get("prs") or "")) if x]
     refs = []
+    if mode == "team":
+        return eval_pick_team(inputs, repos, count, named)
     if named:
         for x in named:
             m = REF_RE.fullmatch(x)
@@ -936,7 +1015,95 @@ def eval_pick(ctx):
     for ref in refs:
         repo, n = ref.rsplit("#", 1)
         runs += [{"repo": repo, "pr": int(n), "memory": "off"}, {"repo": repo, "pr": int(n), "memory": "on"}]
-    return {"prs": refs, "runs": runs, "count": len(refs), "scope_key": str(inputs.get("scope_key") or "").strip()}
+    return {"mode": "memory", "prs": refs, "runs": runs, "count": len(refs), "humans": {}, "trained": [], "held_out": [],
+            "scope_key": str(inputs.get("scope_key") or "").strip()}
+
+
+EVAL_TEAM_PAGES = 5   # pages (100 each) of a repo's review comments scanned for candidate PRs
+
+
+def team_comments(repo, pr, me, trusted, posts):
+    """The inline review comments trusted engineers left on repo#pr — top-level, with a
+    path and line — minus anything this pack posted under the reviewer's account (the
+    audit log says which; without it, none of that account's comments count)."""
+    ids = pack_review_ids(repo, pr, me, posts, {})[0] if posts else set()
+    audited = set().union(*[p["comments"] for p in posts]) if posts else set()
+    out = []
+    for c in gh_list("repos/%s/pulls/%d/comments" % (repo, pr)):
+        u = c.get("user") or {}
+        login = u.get("login") or ""
+        if c.get("in_reply_to_id") or u.get("type") == "Bot" or login.endswith("[bot]"):
+            continue
+        if login == me:
+            if not audit_start() or c.get("pull_request_review_id") in ids or norm(c.get("body")) in audited:
+                continue
+        elif str(c.get("author_association") or "") not in trusted:
+            continue
+        line = c.get("line") or c.get("original_line")
+        if not c.get("path") or not line:
+            continue
+        out.append({"path": c["path"], "line": int(line), "by": login, "body": norm(c.get("body"))[:600]})
+    return out
+
+
+def eval_pick_team(inputs, repos, count, named):
+    """The team baseline: PRs trusted engineers reviewed, each with the inline comments
+    they left. PRs calibration or backfill trained on (the ledger) are held out —
+    named ones refused — unless `trained=flag`, which scores them and flags them."""
+    trained_opt = str(inputs.get("trained") or "skip").strip().lower()
+    if trained_opt not in ("skip", "flag"):
+        raise SystemExit("review-eval: --input trained= takes skip or flag, got %r" % inputs.get("trained"))
+    trusted, me = trusted_associations(), gh_login()
+    posts_by_pr, ledger = pack_posts(), ledger_load()
+    cands = []
+    if named:
+        for x in named:
+            m = REF_RE.fullmatch(x)
+            if not m or not valid_repo(m.group(1)) or int(m.group(2)) <= 0:
+                raise SystemExit("review-eval: --input prs= takes owner/name#N refs, got %r" % x)
+            ref = "%s#%d" % (m.group(1), int(m.group(2)))
+            if ref in ledger and trained_opt == "skip":
+                raise SystemExit("review-eval: %s was trained on (calibration or backfill showed it to the agents), so "
+                                 "scoring it measures memory, not review — pick a held-out PR, or add "
+                                 "--input trained=flag to score it anyway, flagged" % ref)
+            if ref not in cands:
+                cands.append(ref)
+    else:
+        if not repos:
+            raise SystemExit("review-eval: name the repos (--input repos=owner/app) or the PRs (--input prs=owner/app#12)")
+        epoch = dt.datetime(1970, 1, 1, tzinfo=dt.timezone.utc)
+        for repo in repos:
+            for _, _, c in human_comments(repo, epoch, EVAL_TEAM_PAGES, trusted=trusted, owner=me):
+                ref = "%s#%s" % (repo, c["pull_request_url"].rsplit("/", 1)[-1])
+                if ref not in cands:
+                    cands.append(ref)
+    prs, humans, flagged, held_out = [], {}, [], []
+    for ref in cands:
+        if len(prs) >= count:
+            break
+        if ref in ledger:
+            if trained_opt == "skip":
+                held_out.append(ref)
+                continue
+        repo, n = ref.rsplit("#", 1)
+        got = team_comments(repo, int(n), me, trusted, posts_by_pr.get(ref) or [])
+        if not got:
+            if named:
+                raise SystemExit("review-eval: %s has no inline comment by a trusted engineer to score against" % ref)
+            continue
+        if ref in ledger:
+            flagged.append(ref)
+        prs.append(ref)
+        humans[ref] = got
+    if not prs:
+        raise SystemExit("review-eval: found no held-out PR with inline comments by trusted engineers in %s%s" % (
+            ",".join(repos) or "the named PRs", (" (%d trained on, held out)" % len(held_out)) if held_out else ""))
+    runs = []
+    for ref in prs:
+        repo, n = ref.rsplit("#", 1)
+        runs += [{"repo": repo, "pr": int(n), "memory": "off"}, {"repo": repo, "pr": int(n), "memory": "on"}]
+    return {"mode": "team", "prs": prs, "runs": runs, "count": len(prs), "humans": humans,
+            "trained": flagged, "held_out": held_out, "scope_key": str(inputs.get("scope_key") or "").strip()}
 
 
 def eval_dir():
@@ -957,12 +1124,68 @@ def eval_summary(t, scope_key):
                 (" [scope_key %s]" % scope_key) if scope_key else ""))
 
 
+def pct(x):
+    return "%d%%" % round(100 * (x or 0))
+
+
+def team_summary(t, pick):
+    return ("review-eval (team baseline): %d PR(s), %d comment(s) by trusted engineers; recall %s without memory, %s with; "
+            "noise %s without, %s with%s%s%s" % (
+                t.get("prs", 0), t.get("humans", 0), pct((t.get("off") or {}).get("recall")), pct((t.get("on") or {}).get("recall")),
+                pct((t.get("off") or {}).get("noise")), pct((t.get("on") or {}).get("noise")),
+                ("; %d trained-on PR(s) held out" % len(pick.get("held_out") or [])) if pick.get("held_out") else "",
+                ("; %d trained-on PR(s) scored anyway, flagged" % len(pick.get("trained") or [])) if pick.get("trained") else "",
+                (" [scope_key %s]" % pick.get("scope_key")) if pick.get("scope_key") else ""))
+
+
+def team_report_lines(t, prs, pick, summary, stamp):
+    fmt = lambda f: "%s:%s — %s" % (f.get("path"), f.get("line"), " ".join(str(f.get("body") or "").split())[:300])
+    side = lambda x: x or {}
+    lines = ["# review-eval, team baseline — %s" % stamp, "",
+             "Each PR was reviewed twice by the lens panel — memory off, then memory on — with nothing posted "
+             "and nothing written to memory, as if it had no comments yet, and its findings were matched against "
+             "the inline comments trusted engineers actually left (same file, lines at most 5 apart, and the "
+             "light judge's same-issue call).", "",
+             "Recall: the share of the engineers' comments the reviewer also raised. Noise: the share of the "
+             "reviewer's findings no engineer raised — not always wrong, but nobody asked for them. PRs "
+             "calibration or backfill trained on are held out unless flagged below, so the score is not "
+             "memorization.", "",
+             "## Overall", "", summary, "",
+             "| | without memory | with memory |", "|---|---|---|",
+             "| engineers' comments | %d | %d |" % (t.get("humans", 0), t.get("humans", 0)),
+             "| reviewer findings | %d | %d |" % (side(t.get("off")).get("findings", 0), side(t.get("on")).get("findings", 0)),
+             "| matched | %d | %d |" % (side(t.get("off")).get("matched", 0), side(t.get("on")).get("matched", 0)),
+             "| recall | %s | %s |" % (pct(side(t.get("off")).get("recall")), pct(side(t.get("on")).get("recall"))),
+             "| noise | %s | %s |" % (pct(side(t.get("off")).get("noise")), pct(side(t.get("on")).get("noise"))),
+             "| scope_key | %s | |" % (pick.get("scope_key") or "(the setting)"), ""]
+    if pick.get("held_out"):
+        lines += ["Held out (trained on): " + ", ".join(pick["held_out"]), ""]
+    for pr in prs:
+        flag = " — TRAINED ON (flagged)" if pr.get("trained") else ""
+        lines += ["## %s%s" % (pr.get("ref"), flag), "",
+                  "%d comment(s) by trusted engineers; %d note(s) read with memory." % (pr.get("humans", 0), pr.get("notes", 0)), ""]
+        for name, key in (("Without memory", "off"), ("With memory", "on")):
+            r = side(pr.get(key))
+            lines.append("%s: %d finding(s), %d matched — recall %s, noise %s." % (
+                name, r.get("findings", 0), r.get("matched", 0), pct(r.get("recall")), pct(r.get("noise"))))
+            if r.get("missed"):
+                lines.append("  Missed (an engineer raised it, the reviewer didn't):")
+                lines += ["  - %s [%s]" % (fmt(f), f.get("by") or "?") for f in r["missed"]]
+            if r.get("extra"):
+                lines.append("  Extra (no engineer raised it):")
+                lines += ["  - " + fmt(f) for f in r["extra"]]
+        lines.append("")
+    return lines
+
+
 def eval_report(ctx):
     """Write <cache>/eval/<date>.md and latest.json; return the summary."""
     cmp = ctx.get("compare") or {}
     totals, prs = cmp.get("totals") or {}, cmp.get("prs") or []
-    scope_key = (ctx.get("pick") or {}).get("scope_key") or ""
-    summary = eval_summary(totals, scope_key)
+    pick = ctx.get("pick") or {}
+    scope_key = pick.get("scope_key") or ""
+    team = cmp.get("mode") == "team"
+    summary = team_summary(totals, pick) if team else eval_summary(totals, scope_key)
     t = now()
     d = eval_dir()
     path = os.path.join(d, t.strftime("%Y-%m-%d") + ".md")
@@ -970,6 +1193,13 @@ def eval_report(ctx):
     while os.path.exists(path):
         path = os.path.join(d, "%s-%d.md" % (t.strftime("%Y-%m-%d"), n))
         n += 1
+    if team:
+        with open(path, "w") as f:
+            f.write("\n".join(team_report_lines(totals, prs, pick, summary, t.strftime("%Y-%m-%d %H:%M UTC"))) + "\n")
+        write_json_atomic(os.path.join(d, "latest.json"), {"ts": iso_str(t), "summary": summary, "path": path, "totals": totals,
+                                                           "mode": "team"})
+        print(summary, file=sys.stderr)
+        return {"summary": summary, "path": path, "totals": totals, "mode": "team"}
     fmt = lambda f: "%s:%s — %s" % (f.get("path"), f.get("line"), " ".join(str(f.get("body") or "").split())[:300])
     lines = ["# review-eval — %s" % t.strftime("%Y-%m-%d %H:%M UTC"), "",
              "Each PR was reviewed twice by the lens panel — memory off (the baseline), then memory on — "
@@ -1105,7 +1335,11 @@ def record(ctx):
         if os.path.exists(nxt):
             os.replace(nxt, os.path.join(cache, "calibration.json"))
             promoted = True
+    # the hold-out ledger: every PR this run showed the agents is trained on, and
+    # review-eval's team baseline leaves it out unless told otherwise
+    ledger = ledger_add([p.get("ref") for p in (collect.get("prs") or []) if isinstance(p, dict)], mode)
     return {"written": len(writes) - len(held), "quarantined": len(held), "rejected": len(plan.get("rejected") or []),
+            "ledger": ledger,
             "downgraded": len(plan.get("downgraded") or []),
             "archived": len(archived), "truncated": trunc,
             "dropped": len(plan.get("dropped") or []), "promoted": promoted,

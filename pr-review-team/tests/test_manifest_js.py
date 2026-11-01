@@ -62,9 +62,17 @@ const keyDouble = function (t, facts) {
 """
 
 
-def run_js(code, ctx, settings=None, binding=True):
+def with_settings(code, settings=None):
+    """The step's code with ${settings.x} filled in: the given values, else the manifest's defaults."""
     for k, v in (settings or {}).items():
         code = code.replace("${settings.%s}" % k, v)
+    for k, spec in (load().get("settings") or {}).items():
+        code = code.replace("${settings.%s}" % k, str(spec.get("default", "")))
+    return code
+
+
+def run_js(code, ctx, settings=None, binding=True):
+    code = with_settings(code, settings)
     src = ("const ctx = %s;\n" % json.dumps(ctx) + KEY_DOUBLE +
            ("ctx.memory = Object.assign({ key: keyDouble }, ctx.memory || {});\n" if binding else "") +
            "const out = (function () {\n%s\n})();\nprocess.stdout.write(JSON.stringify(out));" % code)
@@ -91,6 +99,7 @@ ctx.memory = {
 
 def run_js_mem(code, ctx, store):
     """Run a step with an in-memory ctx.memory; returns (output, the store afterwards)."""
+    code = with_settings(code)
     src = ("const ctx = %s;\n" % json.dumps(ctx) + KEY_DOUBLE + FAKE_MEMORY % json.dumps(store) +
            "const out = (function () {\n%s\n})();\nprocess.stdout.write(JSON.stringify({out: out, store: store}));" % code)
     res = subprocess.run(["node", "-e", src], capture_output=True, text=True)
@@ -137,8 +146,8 @@ def keys_for(refs, template="{{.repo}}"):
 RUN = ("acme/api#1", "acme/api#2", "acme/api#3", "acme/api#4", "acme/api#5", "acme/api#6", "acme/api#7", "acme/api#9",
        "acme/web#1", "acme/web#2", "acme/web#3", "other/svc#3")
 FENCE = "ev0123456789abcdef"
-# collect's output as the plan sees it: every PR carries trusted evidence, none an owner catch
-COLLECTED = {"fence": FENCE, "trusted_refs": list(RUN), "owner_refs": []}
+# collect's output as the plan sees it: every PR carries trusted evidence, none a catch
+COLLECTED = {"fence": FENCE, "trusted_refs": list(RUN), "catch_refs": []}
 
 
 class PlanTest(unittest.TestCase):

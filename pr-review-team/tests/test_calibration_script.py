@@ -297,11 +297,11 @@ class OwnerCatchTest(unittest.TestCase):
             inline=[cm(101, "rev", t0 + d(days=1), "the nil check here is wrong", review=14, reply_to=100)],
             conversation=[{"user": {"login": "rev"}, "created_at": iso(t0 + d(days=2)), "body": "missed the migration"}])
         out = self.collect()
-        self.assertEqual((out["owner_count"], out["owner_prs"]), (3, 1))
-        owner = out["owner"]
+        self.assertEqual((out["owner_count"], out["catch_prs"]), (3, 1))
+        owner = out["catches"]
         self.assertIn("acme/api#1 (reviewed", owner)                         # the pack's review, for context
-        self.assertRegex(owner, r"OWNER \(\d{4}-\d\d-\d\d\): <<<(ev[0-9a-f]{16}) REVIEW CHANGES_REQUESTED: this breaks the deploy job \1>>>")
-        self.assertRegex(owner, r"OWNER \(\d{4}-\d\d-\d\d\): <<<(ev[0-9a-f]{16}) INLINE handler.go:3 "
+        self.assertRegex(owner, r"CATCH by rev \(owner\) \(\d{4}-\d\d-\d\d\): <<<(ev[0-9a-f]{16}) REVIEW CHANGES_REQUESTED: this breaks the deploy job \1>>>")
+        self.assertRegex(owner, r"CATCH by rev \(owner\) \(\d{4}-\d\d-\d\d\): <<<(ev[0-9a-f]{16}) INLINE handler.go:3 "
                                 r"\(reply to the pack's comment: pack inline note\): the nil check here is wrong \1>>>")
         self.assertIn("COMMENT: missed the migration", unfence(owner))
         self.assertNotIn("REVIEW APPROVED", owner)                    # the pack's own approval
@@ -315,13 +315,13 @@ class OwnerCatchTest(unittest.TestCase):
                  conversation=[{"user": {"login": "rev"}, "created_at": iso(t0 - d(hours=6)), "body": "pre-review chat"}])
         out = self.collect()
         self.assertEqual(out["owner_count"], 0)
-        self.assertNotIn("early note", out["owner"])
+        self.assertNotIn("early note", out["catches"])
 
     def test_a_pack_review_is_not_mistaken_for_the_owner_when_only_time_matches(self):
         # same account, a minute after the pack posted, but a different body: the owner's
         t0, d = self.t0, dt.timedelta
         self.api(extra_reviews=[rv(12, "rev", t0 + d(minutes=1), "COMMENTED", "wait, one more thing")])
-        self.assertIn("wait, one more thing", self.collect()["owner"])
+        self.assertIn("wait, one more thing", self.collect()["catches"])
 
     def test_the_owner_repeating_the_pack_s_words_later_is_a_catch(self):
         # same account and the same body as the pack's review, but a day later: not the post
@@ -329,7 +329,7 @@ class OwnerCatchTest(unittest.TestCase):
         self.api(extra_reviews=[rv(12, "rev", t0 + d(days=1), "CHANGES_REQUESTED", "looks good")])
         out = self.collect()
         self.assertEqual(out["owner_count"], 1)
-        self.assertIn("REVIEW CHANGES_REQUESTED: looks good", unfence(out["owner"]))
+        self.assertIn("REVIEW CHANGES_REQUESTED: looks good", unfence(out["catches"]))
 
     def test_pack_inline_comments_are_known_by_review_or_by_body(self):
         # one carries the pack review's id (its body since edited), one the audited body
@@ -339,12 +339,12 @@ class OwnerCatchTest(unittest.TestCase):
                          cm(102, "rev", t0 + d(seconds=40), "pack inline note", review=None, line=4)])
         out = self.collect()
         self.assertEqual(out["owner_count"], 0)
-        self.assertNotIn("INLINE", out["owner"])
+        self.assertNotIn("INLINE", out["catches"])
 
     def test_a_dismissed_pack_review_is_reported_once(self):
         self.api(pack_state="DISMISSED")
         out = self.collect()
-        self.assertIn("OWNER: DISMISSED the pack's review", unfence(out["owner"]))
+        self.assertIn("CATCH: DISMISSED the pack's review", unfence(out["catches"]))
         rec = self.f.run("record", stdin=json.dumps({"plan": {}, "write": {}}), MODE="calibration")
         self.assertEqual(rec.returncode, 0, rec.stderr)
         self.assertEqual(self.collect()["owner_count"], 0)

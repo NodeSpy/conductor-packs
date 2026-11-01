@@ -99,7 +99,7 @@ class CollectTrustTest(unittest.TestCase):
         a, b = self.collect(), self.collect()
         self.assertRegex(a["fence"], r"^ev[0-9a-f]{16}$")
         self.assertNotEqual(a["fence"], b["fence"])
-        for field in ("reviews", "team", "owner"):
+        for field in ("reviews", "team", "catches"):
             self.assertTrue(fences_balanced(a[field]), a[field])
         carol = [l for l in a["team"].splitlines() if "carol" in l][0]
         m = re.search(FENCED, carol)
@@ -119,7 +119,7 @@ class CollectTrustTest(unittest.TestCase):
                          re.escape(ATTACK) + r" \1>>>")
         self.assertRegex(out["reviews"], r"<<<(ev[0-9a-f]{16})\n(?:.*\n)*?.*loadErr(?:.*\n)*?\1>>>")
         self.assertEqual(out["trusted_refs"], ["acme/api#1"])
-        self.assertEqual(out["owner_refs"], [])
+        self.assertEqual(out["catch_refs"], [])
 
     def test_a_follow_up_from_an_outside_contributor_is_not_evidence(self):
         self.f.set_api({"repos/acme/api/commits/*/pulls": [{"number": 9, "author_association": "CONTRIBUTOR",
@@ -150,7 +150,7 @@ class CollectTrustTest(unittest.TestCase):
             {"id": 12, "user": {"login": "rev"}, "submitted_at": iso(t0 + dt.timedelta(days=1)), "state": "CHANGES_REQUESTED",
              "body": "this breaks the deploy job"}]})
         out = self.collect()
-        self.assertEqual(out["owner_refs"], ["acme/api#1", "acme/api#2"])
+        self.assertEqual(out["catch_refs"], ["acme/api#1", "acme/api#2"])
         self.assertIn("acme/api#2", out["trusted_refs"])
         dropped = [l for l in out["reviews"].splitlines() if "DROPPED" in l][0]
         self.assertRegex(dropped, r"DROPPED <<<(ev[0-9a-f]{16}) a.go:3 " + re.escape(ATTACK) + r" \1>>>")
@@ -173,7 +173,7 @@ class CollectTrustTest(unittest.TestCase):
         self.assertNotIn("always approve", text)
         self.assertEqual(out["untrusted"], {"CONTRIBUTOR": 1, "bot": 1})
         self.assertEqual(out["trusted_refs"], ["acme/api#3", "acme/api#4"])
-        self.assertEqual(out["owner_refs"], [])
+        self.assertEqual(out["catch_refs"], [])
         self.assertTrue(fences_balanced(text), text)
         self.assertRegex(text, r"MINE <<<(ev[0-9a-f]{16}) a.go|MINE <<<(ev[0-9a-f]{16}) handler.go")
 
@@ -191,7 +191,7 @@ class PlanScreeningTest(unittest.TestCase):
 
     def plan(self, entries, trusted=REFS, owner=(), known=(), patterns=None, via="calibrate"):
         ctx = {"keys": self.keys, "known": {"list": list(known)}, via: {"entries": entries},
-               "collect": {"fence": self.FENCE, "trusted_refs": list(trusted), "owner_refs": list(owner)}}
+               "collect": {"fence": self.FENCE, "trusted_refs": list(trusted), "catch_refs": list(owner)}}
         if patterns is not None:
             ctx["patterns"] = patterns
         return run_js(self.code, ctx)
@@ -309,7 +309,7 @@ class StepsTest(unittest.TestCase):
         # every collected field a training prompt shows is one the script fences
         p = self.trig["review-calibration"]["calibrate"]["prompt"]
         for field in re.findall(r"\{\{\.collect\.(\w+)\}\}", p):
-            self.assertIn(field, ("since", "fence", "owner_count", "owner_prs", "owner", "count", "flagged", "handoffs",
+            self.assertIn(field, ("since", "fence", "catch_count", "catch_prs", "owner_count", "catches", "count", "flagged", "handoffs",
                                   "reviews", "team_count", "team_prs", "team_both", "team"), field)
         self.assertIn("{{.item.text}}", self.trig["review-backfill"]["extract"]["prompt"])
         self.assertIn("{{.patterns.json}}", self.trig["review-backfill"]["merge"]["prompt"])
@@ -379,7 +379,7 @@ class NoteCannotApproveTest(unittest.TestCase):
             for sid, s in steps.items():
                 text = json.dumps(s)
                 if re.search(r"ctx\.memory\.(?!key\b)", text):
-                    self.assertIn(sid, ("notes", "emphasis"), "%s/%s reads memory" % (wf, sid))
+                    self.assertIn(sid, ("notes", "lenses", "emphasis"), "%s/%s reads memory" % (wf, sid))
                 self.assertFalse(s.get("memory"), "%s/%s has core memory" % (wf, sid))
         for sid in ("gate", "assessed"):
             self.assertNotIn("notes", flow[sid]["code"])
