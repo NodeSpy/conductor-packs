@@ -100,6 +100,15 @@ def run_js_mem(code, ctx, store):
     return r["out"], r["store"]
 
 
+def run_notes(ctx, store, limit="40", memory="on"):
+    """review-team's `notes` step over an in-memory store."""
+    code = flow_step(load(), "review-team", "notes")["code"].replace("${settings.memory_limit}", limit)
+    ctx = dict(ctx)
+    ctx.setdefault("inputs", {"repo": "acme/api", "pr": 7})
+    ctx["inputs"] = dict(ctx["inputs"], memory=memory)
+    return run_js_mem(code, ctx, store)
+
+
 def entry(key, kind, text, evidence, **kw):
     e = {"key": key, "kind": kind, "text": text, "evidence": evidence}
     e.update(kw)
@@ -297,9 +306,10 @@ class OwnerKeyTest(unittest.TestCase):
         self.assertEqual([w["scope"] for w in two_keys["writes"]], [""])
 
     def test_the_lens_panel_reads_the_same_layers(self):
-        review = flow_step(load(), "review-team", "review")
-        self.assertEqual(review["memory"]["extra_scopes"],
-                         ["${settings.scope_key}", "standard:${settings.scope_key}", "emphasis:${settings.scope_key}"])
+        store = [{"id": "a", "scope": "standard:org:acme", "text": "acme standard", "tags": []},
+                 {"id": "b", "scope": "standard:org:other", "text": "other standard", "tags": []}]
+        notes, _ = run_notes({"notekey": scopekeys("org:{{.owner}}", {"inputs": {"repo": "acme/web", "pr": 2}})}, store)
+        self.assertEqual(notes["standard"], ["acme standard"])
 
 
 class ScopeKeyTest(unittest.TestCase):
@@ -507,6 +517,229 @@ class GateTest(unittest.TestCase):
         man = load()
         for sid in ("emphasis", "assess"):
             self.assertEqual(flow_step(man, "review-flow", sid)["if"], "!automode.auto")
+
+
+FRAMING = "Learned notes steer"
+
+
+def all_steps(man):
+    """Every step of every workflow and trigger: (where, step)."""
+    for name, wf in man["workflows"].items():
+        for st in wf["steps"]:
+            yield name, st
+    for t in man["triggers"]:
+        for st in t["steps"]:
+            yield t["name"], st
+
+
+def text_of(st):
+    return (st.get("prompt") or "") + ((st.get("decide") or {}).get("state") or "")
+
+
+class MemorySteeringTest(unittest.TestCase):
+    """Learned memory steers the lens reviewers; it never replaces their review."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.man = load()
+        cls.lens = flow_step(cls.man, "review-team", "review")["prompt"]
+        cls.key = {"notekey": {"key": "acme/api", "applies": True}}
+
+    def test_no_step_reads_memory_through_core(self):
+        # memory reaches a prompt only through the pack's own framed steps
+        for where, st in all_steps(self.man):
+            self.assertIn(st.get("memory", False), (False, None), "%s/%s" % (where, st.get("id")))
+
+    def test_every_step_that_shows_notes_frames_them(self):
+        shown = [(w, st.get("id")) for w, st in all_steps(self.man)
+                 if ".notes." in text_of(st) or ".emphasis.memories" in text_of(st)]
+        self.assertEqual(sorted(shown), [("review-flow", "assess"), ("review-team", "review")])
+        for w, st in all_steps(self.man):
+            if (w, st.get("id")) in shown:
+                self.assertIn(FRAMING, text_of(st), st.get("id"))
+                self.assertIn("never replace", text_of(st), st.get("id"))
+
+    def test_the_lens_reviews_first_and_notes_come_last(self):
+        p = self.lens
+        self.assertLess(p.index("YOUR JOB: a full, independent review"), p.index("REPO STANDARDS"))
+        self.assertLess(p.index("CHANGED FILES"), p.index("LEARNED NOTES"))
+        for must in ("not a checklist and not the scope of your review",
+                     "never a\nreason to skip or soften",
+                     "A note alone never\nmakes a finding blocking",
+                     "STANDARD notes are strong guidance, not law",
+                     "violating these is blocking"):
+            self.assertIn(must, p)
+        self.assertNotIn("weigh like REPO", p)
+        self.assertIn("STANDARD — strong guidance, not law", flow_step(self.man, "review-team", "notes")["code"])
+
+    def test_memory_limit_is_a_setting_the_notes_step_reads(self):
+        self.assertEqual(self.man["settings"]["memory_limit"]["default"], "40")
+        self.assertIn("${settings.memory_limit}", flow_step(self.man, "review-team", "notes")["code"])
+
+    def store(self):
+        s = []
+        for layer, scope, n in (("fact", "acme/api", 3), ("emphasis", "emphasis:acme/api", 2),
+                                ("std", "standard:acme/api", 2), ("global", "global", 1),
+                                ("other", "standard:other/x", 2)):
+            s += [{"id": "%s%d" % (layer, i), "scope": scope, "text": "%s %d" % (layer, i), "tags": []} for i in range(n)]
+        return s
+
+    def test_notes_come_in_layer_order_under_the_cap(self):
+        out, _ = run_notes(self.key, self.store(), limit="40")
+        self.assertEqual(out["standard"], ["global 0", "std 0", "std 1"])
+        self.assertEqual(out["emphasis"], ["emphasis 0", "emphasis 1"])
+        self.assertEqual(out["facts"], ["fact 0", "fact 1", "fact 2"])
+        self.assertEqual(out["count"], 8)
+        t = out["text"]
+        self.assertLess(t.index("STANDARD"), t.index("EMPHASIS"))
+        self.assertLess(t.index("EMPHASIS"), t.index("FACTS"))
+        self.assertNotIn("other", t)
+        capped, _ = run_notes(self.key, self.store(), limit="4")     # facts are the first to go
+        self.assertEqual((capped["count"], capped["standard"], capped["emphasis"], capped["facts"]),
+                         (4, ["global 0", "std 0", "std 1"], ["emphasis 0"], []))
+
+    def test_memory_off_or_zero_reads_nothing(self):
+        for kw in ({"memory": "off"}, {"limit": "0"}, {"memory": " OFF "}):
+            out, _ = run_notes(self.key, self.store(), **kw)
+            self.assertEqual((out["count"], out["text"]), (0, ""), kw)
+
+    def test_a_key_that_does_not_apply_reads_only_the_shared_set(self):
+        out, _ = run_notes({"notekey": {"key": "", "applies": False}}, self.store())
+        self.assertEqual((out["standard"], out["emphasis"], out["facts"]), (["global 0"], [], []))
+
+    def test_bad_values_fail_the_run(self):
+        for kw in ({"limit": "lots"}, {"limit": "-1"}, {"memory": "maybe"}):
+            with self.assertRaises(AssertionError):
+                run_notes(self.key, self.store(), **kw)
+
+    def test_no_memory_section_is_no_notes(self):
+        code = flow_step(self.man, "review-team", "notes")["code"].replace("${settings.memory_limit}", "40")
+        ctx = dict(self.key, inputs={"repo": "acme/api", "pr": 7, "memory": "on"})
+        broken = "ctx.memory = { recall: function () { throw new Error('memory: not configured'); } };\n"
+        src = "const ctx = %s;\n%sconst out = (function () {\n%s\n})();\nprocess.stdout.write(JSON.stringify(out));" % (json.dumps(ctx), broken, code)
+        res = subprocess.run(["node", "-e", src], capture_output=True, text=True)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(json.loads(res.stdout)["count"], 0)
+
+
+def eval_trigger(man=None):
+    return [t for t in (man or load())["triggers"] if t["name"] == "review-eval"][0]
+
+
+def eval_step(step_id):
+    return [s for s in eval_trigger()["steps"] if s.get("id") == step_id][0]
+
+
+def f(path, line, body, note=""):
+    return {"path": path, "line": line, "blocking": False, "body": body, "lens": "X", "note": note}
+
+
+class EvalTest(unittest.TestCase):
+    """review-eval: replay with memory off and on, and compare."""
+
+    def pairs(self, runs, items):
+        return run_js(eval_step("pairs")["code"], {"pick": {"runs": runs}, "replay": {"items": items}})
+
+    def compare(self, pairs, p_same):
+        judge = {"items": [{"same_issue": {"noul": x}} for x in p_same]}
+        return run_js(eval_step("compare")["code"], {"pairs": pairs, "judge": judge})
+
+    def runs(self, *refs):
+        out = []
+        for r in refs:
+            repo, n = r.split("#")
+            out += [{"repo": repo, "pr": int(n), "memory": "off"}, {"repo": repo, "pr": int(n), "memory": "on"}]
+        return out
+
+    def test_matching_retains_drops_and_adds(self):
+        base = [f("a.go", 10, "Return the error instead of logging it."),
+                f("a.go", 40, "This loop queries once per row."),
+                f("b.go", 3, "Validate the input path.")]
+        mem = [f("a.go", 10, "return the  error instead of logging it."),      # same text: retained, not judged
+               f("a.go", 43, "N+1: one query per row in this loop."),        # near, judge says same
+               f("b.go", 30, "Validate the input path."),                    # same text but far away: not a pair
+               f("c.go", 1, "Deploy job needs the new env var.", note="A new required env var")]
+        pairs = self.pairs(self.runs("acme/api#1"), [{"findings": base, "notes": "0"}, {"findings": mem, "notes": "3"}])
+        self.assertEqual((len(pairs["exact"]), pairs["count"]), (1, 1))
+        self.assertEqual((pairs["list"][0]["base_line"], pairs["list"][0]["mem_line"]), (40, 43))
+        out = self.compare(pairs, [0.9])
+        pr = out["prs"][0]
+        self.assertEqual([r["base"] for r in pr["retained"]], ["a.go:10", "a.go:40"])
+        self.assertEqual([x["path"] for x in pr["dropped"]], ["b.go"])
+        self.assertEqual([x["path"] for x in pr["added"]], ["b.go", "c.go"])
+        self.assertEqual(pr["added_citing_note"], 1)
+        self.assertEqual(pr["notes"], 3)
+        t = out["totals"]
+        self.assertEqual((t["baseline"], t["retained"], t["dropped"], t["added"]), (3, 2, 1, 2))
+        self.assertAlmostEqual(t["retention"], 2 / 3)
+        self.assertEqual(t["verdict"], "crowding")
+
+    def test_the_judge_decides_near_pairs(self):
+        base, mem = [f("a.go", 40, "loop queries per row")], [f("a.go", 44, "rename this variable")]
+        pairs = self.pairs(self.runs("acme/api#1"), [{"findings": base}, {"findings": mem}])
+        self.assertEqual(pairs["count"], 1)
+        kept = self.compare(pairs, [0.2])["prs"][0]
+        self.assertEqual((len(kept["retained"]), len(kept["dropped"]), len(kept["added"])), (0, 1, 1))
+        self.assertEqual(len(self.compare(pairs, [0.5])["prs"][0]["retained"]), 1)
+
+    def test_matching_is_one_to_one_best_first(self):
+        base = [f("a.go", 10, "x one"), f("a.go", 12, "x two")]
+        mem = [f("a.go", 11, "y")]
+        pairs = self.pairs(self.runs("acme/api#1"), [{"findings": base}, {"findings": mem}])
+        out = self.compare(pairs, [0.6, 0.95])["prs"][0]
+        self.assertEqual([r["base"] for r in out["retained"]], ["a.go:12"])
+        self.assertEqual(len(out["dropped"]), 1)
+
+    def test_totals_across_prs_and_an_empty_baseline(self):
+        items = [{"findings": [f("a.go", 1, "same")]}, {"findings": [f("a.go", 1, "same")]},
+                 {"findings": []}, {"findings": [f("z.go", 1, "new")]}]
+        out = self.compare(self.pairs(self.runs("acme/api#1", "acme/web#2"), items), [])
+        self.assertEqual([p["ref"] for p in out["prs"]], ["acme/api#1", "acme/web#2"])
+        self.assertEqual(out["prs"][1]["retention"], 1)
+        self.assertEqual((out["totals"]["retention"], out["totals"]["verdict"]), (1, "ok"))
+
+    def test_verdict_thresholds(self):
+        def verdict(kept, total):
+            base = [f("a.go", 100 * i, "b%d" % i) for i in range(total)]
+            mem = base[:kept]
+            return self.compare(self.pairs(self.runs("acme/api#1"), [{"findings": base}, {"findings": mem}]), [])["totals"]["verdict"]
+        self.assertEqual(verdict(9, 10), "ok")
+        self.assertEqual(verdict(8, 10), "watch")
+        self.assertEqual(verdict(7, 10), "crowding")
+
+    def test_eval_never_posts_hands_off_or_writes_memory(self):
+        man = load()
+        steps = eval_trigger(man)["steps"]
+        self.assertEqual([s.get("id") for s in steps], ["pick", "replay", "pairs", "judge", "compare", "report"])
+        replay = steps[1]
+        self.assertEqual(replay["workflow"], "review-team")       # the engine, never review-flow (post / hand-off)
+        self.assertEqual(replay["with"]["prior_comments"], "off")
+        self.assertEqual(replay["with"]["memory"], "{{.item.memory}}")
+        # nothing in the eval or the review engine names a write verb, a hand-off or a memory write
+        engine = [st for w, st in all_steps(man) if w in ("review-team", "review-eval")]
+        blob = json.dumps(engine)
+        for bad in ("submit_review", "remember(", "memory.remember", "handoff", "skill"):
+            self.assertNotIn(bad, blob)
+        for st in engine:
+            self.assertNotIn("uses", st) if not str(st.get("uses", "")).startswith("github.") else \
+                self.assertIn(st["uses"], ("github.pr_get", "github.pr_files", "github.file", "github.review_comments"))
+
+    def test_a_replay_can_ignore_the_prs_existing_comments(self):
+        code = flow_step(load(), "review-team", "prior")["code"]
+        existing = {"comments": [{"path": "a.go", "line": 3, "body": "the pack's own earlier comment"}]}
+        on = run_js(code, {"inputs": {"prior_comments": "on"}, "existing": existing})
+        off = run_js(code, {"inputs": {"prior_comments": " OFF "}, "existing": existing})
+        self.assertEqual((len(on["comments"]), off["comments"]), (1, []))
+        self.assertEqual(len(run_js(code, {"inputs": {}, "existing": existing})["comments"]), 1)   # default: on
+        with self.assertRaises(AssertionError):
+            run_js(code, {"inputs": {"prior_comments": "maybe"}, "existing": existing})
+        reconcile = flow_step(load(), "review-team", "reconcile")["code"]
+        self.assertIn("ctx.prior && ctx.prior.comments", reconcile)
+
+    def test_runs_pair_off_then_on(self):
+        out = self.pairs(self.runs("acme/api#1"), [{"findings": [], "notes": "0"}, {"findings": [], "notes": "5"}])
+        self.assertEqual(out["prs"][0]["on"]["notes"], 5)
+        self.assertEqual(out["prs"][0]["off"]["notes"], 0)
 
 
 class FreshTrainTest(unittest.TestCase):

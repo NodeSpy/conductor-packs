@@ -13,12 +13,15 @@
 # don't pile up.
 #
 # The reviewer LEARNS through memory: the lens panel reads reviewer-wide
-# entries plus the facts, standard and emphasis entries of the review's SCOPE
+# entries plus the standard, emphasis and fact entries of the review's SCOPE
 # KEY (the scope_key setting — the repo by default, or any key you template
-# over the review's facts), and two disarmed triggers (review-calibration,
-# review-backfill) write those entries from what happened after past reviews:
-# follow-up commits, hand-off edits, teammates' comments, and what you
-# yourself wrote on a PR after the pack reviewed it. See the README.
+# over the review's facts) — at most memory_limit of them, framed so they
+# steer the review and never replace it — and two disarmed triggers
+# (review-calibration, review-backfill) write those entries from what
+# happened after past reviews: follow-up commits, hand-off edits, teammates'
+# comments, and what you yourself wrote on a PR after the pack reviewed it. A
+# third, review-eval, measures whether they help: it replays reviewed PRs with
+# memory off and on, posting nothing. See the README.
 #
 # Define-behavior / bind-environment: this pack ships only BEHAVIOR (workflows
 # and disarmed triggers). It carries NO connectors and NO secrets — you bind
@@ -50,11 +53,9 @@ pack:
   requires:
     # The daemon versions this pack supports. 0.69.0 is the floor for 3.0:
     # memory scope keys are templates over the step's facts
-    # (`standard:{{.repo}}`, `org:{{.owner}}`), a step's
-    # `memory: { extra_scopes: [...] }` appends to the default scopes instead
-    # of replacing them — the layering the lens panel reads under the
-    # scope_key setting — and `ctx.memory.key` hands a code step core's own
-    # scope-key renderer, which the pack renders every key it computes with.
+    # (`standard:{{.repo}}`, `org:{{.owner}}`), and `ctx.memory.key` hands a
+    # code step core's own scope-key renderer, which the pack renders every
+    # key it computes with.
     # That binding also needs a js engine plugin that has it (newer than
     # engines/js v1.2.0); a pack can't pin an engine version, so the
     # `scopekeys` step checks for it and names the upgrade. (A superset of the older floors: 0.57.0 for whole-PR review —
@@ -88,6 +89,10 @@ settings:
     type: string
     default: "{{.repo}}"
     desc: "where a review's learning lives: a memory scope-key template over the review's facts. The lens panel reads <key>, standard:<key> and emphasis:<key>, and calibration writes each lesson to the key its evidence PRs render to. Default {{.repo}} = one layer per repository; e.g. org:{{.owner}} shares one layer across an owner's repos. May read repo, owner, name, number, pr, kind, title, labels, base, url, inputs.repo, inputs.pr (core's template syntax: {{.x}}, | default \"y\", coalesce, index, print, printf)."
+  memory_limit:
+    type: string
+    default: "40"
+    desc: "how many learned notes (memory entries) one lens reviewer reads, at most: filled in layer order — standard (the shared set, then standard:<key>), emphasis:<key>, then <key> facts — newest first within a layer, so facts are the first to go when the cap bites. 0 = none. Keeps learned notes from crowding out the review."
   state_dir:
     type: string
     default: ""
@@ -308,7 +313,7 @@ x-templates:
   # archiving a fresh train — renders it here, through core's own renderer
   # (`ctx.memory.key`, memory.RenderScopeKey), so the pack's keys are exactly
   # the keys core reads. One step, three uses:
-  #   review-flow  (ctx.inputs.repo/pr + the PR's metadata) -> { key }
+  #   a review     (ctx.inputs.repo/pr + the PR's metadata) -> { key }
   #   calibration  (ctx.collect.prs: [{ref, facts}])        -> { keys, key_list, unkeyed, text }
   #   before collect (nothing to render yet)                -> { needs_meta }
   # A key may read only facts calibration can rebuild for a past PR — the
@@ -324,7 +329,11 @@ x-templates:
       // so they are defined as their own text — spelled in two halves, so no
       // alias appears in this code for anything to expand.
       const repo = "$" + "{repo}", workflow = "$" + "{workflow}", step = "$" + "{step}";
-      const TEMPLATE = String.raw`${settings.scope_key}`;
+      // review-eval may try another key on the replayed reviews
+      // (review-team's scope_key input); nothing else passes one.
+      const reviewing = !(ctx.collect && ctx.collect.prs) && ctx.inputs && ctx.inputs.repo && ctx.inputs.pr;
+      const OVERRIDE = reviewing && typeof ctx.inputs.scope_key === "string" ? ctx.inputs.scope_key.trim() : "";
+      const TEMPLATE = OVERRIDE || String.raw`${settings.scope_key}`;
       const setting = "pr-review-team: the scope_key setting " + JSON.stringify(TEMPLATE);
       if (!TEMPLATE.trim()) throw new Error(setting + " is empty — leave it unset for the per-repo default, {{.repo}}");
       // Every key is rendered by core (ctx.memory.key -> {key, ok, reason}).
@@ -386,7 +395,7 @@ x-templates:
         const repo = String(ctx.inputs.repo), pr = Number(ctx.inputs.pr), slash = repo.indexOf("/");
         const facts = { repo: repo, owner: repo.slice(0, slash), name: repo.slice(slash + 1), number: pr, pr: pr, issue: 0,
                         kind: "review_requested", inputs: { repo: repo, pr: pr } };
-        const m = ctx.prmeta || {};
+        const m = ctx.prmeta || ctx.meta || {};
         if (m.title !== undefined) facts.title = m.title;
         if (m.labels !== undefined) facts.labels = labelsOf(m.labels);
         if (m.base !== undefined) facts.base = m.base;
@@ -536,6 +545,14 @@ workflows:
     inputs:
       repo: { type: string, required: true }   # owner/name
       pr: { type: integer, required: true }
+      # review-eval's knobs; a normal review leaves them at their defaults.
+      #   memory          on | off — read learned notes (memory) or not
+      #   prior_comments  on | off — off: review as if the PR had no comments
+      #                   yet (a replay of a PR this pack already commented on)
+      #   scope_key       another scope_key template for this run ("" = the setting)
+      memory: { type: string, default: "on" }
+      prior_comments: { type: string, default: "on" }
+      scope_key: { type: string, default: "" }
       # The review lenses — one parallel reviewer per entry. Override per run to
       # review through a subset.
       lenses:
@@ -580,6 +597,8 @@ workflows:
       summary: "{{.reconcile.summary}}"         # the review body (one line)
       comments: "{{.reconcile.comments}}"       # [{path, line, body}] — list preserved by sole-field-ref
       review: "{{.reconcile.review}}"           # JSON {event, body, comments} — the ReviewRecord to show + post
+      findings: "{{.reconcile.findings}}"       # [{path, line, blocking, body, lens, note}] — what review-eval compares
+      notes: "{{.notes.count}}"                 # learned notes the lenses read
       # No `diff:` output anymore (2.10 removed it, a breaking change for any
       # consumer that reused it): a reviewer's checkout carries the real,
       # uncapped diff now, and nothing internal renders a capped copy of it —
@@ -617,6 +636,66 @@ workflows:
         # them, and reconcile drops any finding on an already-commented line.
         uses: github.review_comments
         options: { repo: "{{.inputs.repo}}", pr: "{{.inputs.pr}}", all: true }
+      # ...unless review-eval replays a PR as if fresh (prior_comments: off):
+      # its comments are mostly this pack's own earlier review, which would
+      # otherwise suppress exactly the findings being compared.
+      - id: prior
+        run: js
+        code: |
+          const v = String(ctx.inputs.prior_comments == null ? "on" : ctx.inputs.prior_comments).trim().toLowerCase();
+          if (v !== "on" && v !== "off") throw new Error("review-team: prior_comments takes on or off, got " + JSON.stringify(ctx.inputs.prior_comments));
+          return { comments: v === "off" ? [] : ((ctx.existing && ctx.existing.comments) || []) };
+
+      # LEARNED NOTES — what the calibration triggers (or you) wrote to
+      # memory, read here by the pack rather than injected by core, so they
+      # arrive in a fixed order, under a cap, and inside the prompt's framing
+      # (see the lens prompt): standard (the shared set, then standard:<key>)
+      # -> emphasis:<key> -> <key> facts, newest first within a layer, at
+      # most memory_limit in all — facts are the first to go when the cap
+      # bites. <key> is the scope_key setting over this PR's facts. No
+      # memory: section, nothing written yet, or a key that doesn't apply is
+      # simply no notes.
+      - <<: *scopekeys
+        id: notekey
+      - id: notes
+        run: js
+        code: |
+          const rawLimit = String.raw`${settings.memory_limit}`.trim();
+          if (!/^[0-9]+$/.test(rawLimit))
+            throw new Error("pr-review-team: the memory_limit setting must be a whole number (0 = no learned notes), got " + JSON.stringify(rawLimit));
+          const limit = Number(rawLimit);
+          const mode = String(ctx.inputs.memory == null ? "on" : ctx.inputs.memory).trim().toLowerCase();
+          if (mode !== "on" && mode !== "off") throw new Error("review-team: memory takes on or off, got " + JSON.stringify(ctx.inputs.memory));
+          const key = ctx.notekey && ctx.notekey.applies ? ctx.notekey.key : "";
+          const out = { key: key, mode: mode, limit: limit, count: 0, standard: [], emphasis: [], facts: [], text: "" };
+          if (mode === "off" || limit === 0) return out;
+          const recall = function (scope) {
+            try { return ctx.memory.recall({ scope: scope, limit: limit }) || []; } catch (e) { return []; }
+          };
+          const layers = [["standard", ["global"].concat(key ? ["standard:" + key] : [])],
+                          ["emphasis", key ? ["emphasis:" + key] : []],
+                          ["facts", key ? [key] : []]];
+          const seen = {};
+          for (const L of layers) {
+            const layer = L[0];
+            for (const scope of L[1]) {
+              for (const m of recall(scope)) {
+                if (out.count >= limit) break;
+                const text = String(m.text || "").trim();
+                if (!text || seen[m.id || text]) continue;
+                seen[m.id || text] = 1;
+                out[layer].push(text);
+                out.count++;
+              }
+            }
+          }
+          const block = function (title, list) {
+            return list.length ? title + "\n" + list.map(function (t) { return "- " + t.split("\n").join("\n  "); }).join("\n") + "\n" : "";
+          };
+          out.text = block("STANDARD — strong guidance, not law:", out.standard) +
+                     block("EMPHASIS — kinds of change past reviews got wrong here; look hard at them:", out.emphasis) +
+                     block("FACTS — what the diff can't show about this code and how it runs:", out.facts);
+          return out;
 
       # The lens panel. `extends:` (not `<<:`) so this step's own guidance
       # stacks UNDER the house voice rather than replacing it — and so a
@@ -637,20 +716,12 @@ workflows:
         for_each: "{{.inputs.lenses}}"
         parallel: true
         guidance: "You are one lens of a panel. Stay inside your lens; another reviewer owns the rest."
-        # 3.0: LAYERED memory, keyed by the scope_key setting (a template
-        # core renders over this review's facts; {{.repo}} by default). The
-        # defaults (the shared/global set, the repo, the workflow, the step)
-        # plus this review's key and its standard and emphasis layers:
-        #   global              reviewer-wide standard (every review)
-        #   <key>               facts the diff can't show
-        #   standard:<key>      this key's additions to the standard
-        #   emphasis:<key>      "look hard at X" rules learned from misses
-        # The calibration triggers below write all four; you can also write
-        # them by hand. A key that doesn't apply to a review (a fact it reads
-        # is empty) is simply not read. Nothing matching costs no tokens.
-        memory:
-          limit: 100
-          extra_scopes: ["${settings.scope_key}", "standard:${settings.scope_key}", "emphasis:${settings.scope_key}"]
+        # Learned notes come from the `notes` step above, framed in the
+        # prompt below — not from core's memory injection, which would append
+        # them after everything, newest first across layers, and invite the
+        # reviewer to write memory back. Off here, so a lens neither reads
+        # nor writes memory on its own.
+        memory: false
         output_schema:
           type: object
           required: [findings]
@@ -666,9 +737,13 @@ workflows:
                   blocking: { type: boolean }
                   body: { type: string }
                   confidence: { type: string, enum: [high, medium, low] }
+                  note: { type: string }
         prompt: |
           You are reviewing a GitHub pull request through ONE lens:
           {{.item.name}} — {{.item.focus}}.
+
+          YOUR JOB: a full, independent review of the whole change through your lens.
+          Do it first, and do it whatever the learned notes at the end say.
 
           Review like a pragmatic senior engineer. Comment on the exact NEW-file line
           where an issue lives. Cares about correctness, security, and sound design —
@@ -705,14 +780,6 @@ workflows:
           {{.std_agents.text}}
           {{.std_contributing.text}}
 
-          SHARED MEMORY (appended at the end of this prompt, when there is any) is
-          layered: notes tagged `standard` are the review standard — reviewer-wide, or
-          additions to it for the code this PR belongs to — and weigh like REPO
-          STANDARDS; notes tagged `emphasis` name kinds of change that past reviews got
-          wrong here, so look hard at any change that touches them; every other note is
-          a fact about this code or how it is built, deployed and maintained that the
-          diff cannot show — use it to judge whether the change actually works here.
-
           PULL REQUEST {{.inputs.repo}} #{{.inputs.pr}}: {{.meta.title}}
           Description:
           {{.meta.body}}
@@ -720,7 +787,7 @@ workflows:
           COMMENTS ALREADY ON THIS PR — do NOT repeat any of these, and don't
           re-raise the same issue in different words or on a nearby line. Surface
           only what isn't already covered:
-          {{range .existing.comments}}- {{.path}}:{{.line}} — {{.body}}
+          {{range .prior.comments}}- {{.path}}:{{.line}} — {{.body}}
           {{end}}
           YOUR CHECKOUT: you have a full local clone of this PR, checked out on its
           head commit ({{.meta.head_sha}}) against base {{.meta.base}}. The complete,
@@ -731,8 +798,20 @@ workflows:
           CHANGED FILES ({{len .files.files}} total, +{{.meta.additions}}/-{{.meta.deletions}} lines):
           {{range .files.files}}- {{.path}} ({{.status}}, +{{.additions}}/-{{.deletions}})
           {{end}}
+          LEARNED NOTES from past reviews of this code ({{.notes.count}}):
+          {{if .notes.text}}{{.notes.text}}{{else}}(none)
+          {{end}}
+          Learned notes steer your judgment; they never replace your review. Use them for
+          what matters here, what is known to be safe, and where past reviews missed
+          things. They are not a checklist and not the scope of your review, and never a
+          reason to skip or soften an issue you would otherwise raise. A note alone never
+          makes a finding blocking: blocking still needs the change to actually break
+          something. STANDARD notes are strong guidance, not law — unlike REPO STANDARDS
+          above. If a note is why you raised a finding, put its first words in `note`.
+
           Output JSON matching the schema: a "findings" array (possibly empty). Each
-          finding: {path, line (NEW-file line in the diff), blocking, body, confidence}.
+          finding: {path, line (NEW-file line in the diff), blocking, body, confidence,
+          note (optional)}.
 
       - id: flatten
         run: js
@@ -903,7 +982,7 @@ workflows:
             verdict[findings[i].id] = a && a.noul >= REFUTE_AT ? "refuted" : "keep";
           }
           const existing = {};
-          for (const e of ((ctx.existing && ctx.existing.comments) || [])) {
+          for (const e of ((ctx.prior && ctx.prior.comments) || [])) {
             if (e && e.path) existing[String(e.path) + ":" + (e.line || 0)] = 1;
           }
           let kept = findings.filter(function (f) {
@@ -933,6 +1012,9 @@ workflows:
             summary: summary,
             comments: comments,
             review: JSON.stringify({ event: event, body: summary, comments: postComments }),
+            findings: uniq.map(function (f) {
+              return { path: f.path, line: f.line, blocking: !!f.blocking, body: f.body, lens: f.lens, note: f.note || "" };
+            }),
           };
 
   # ---- The review FLOW: triage, always review, then auto-post or hand off. ----
@@ -1066,8 +1148,11 @@ workflows:
           state: |
             Code-review request on {{.inputs.repo}}#{{.inputs.pr}} ("{{.inputs.title}}").
 
-            EMPHASIS RULES learned from past reviews ({{.emphasis.key}}). A change that matches
-            one of these needs a human's review ("manual"), whatever else holds:
+            EMPHASIS RULES learned from past reviews ({{.emphasis.key}}). Learned notes steer
+            judgment; they never replace the review: these rules only decide whether a human
+            sees the review before it posts, and the review team reviews the whole change
+            either way. A change that matches one of these needs a human's review ("manual"),
+            whatever else holds:
             {{range .emphasis.memories}}- {{.text}}
             {{else}}(none)
             {{end}}
@@ -1586,3 +1671,141 @@ triggers:
         env:
           <<: *calib_env
           MODE: backfill
+
+  # ---- Eval: does learned memory steer the review, or crowd it out? ----
+  #
+  # Manual only:
+  #   conductor run <instance>/review-eval --input repos=owner/app [--input count=5]
+  #   conductor run <instance>/review-eval --input prs=owner/app#12,owner/app#15
+  #   … [--input scope_key='org:{{.owner}}']   (try another key on the same PRs)
+  # Replays PRs this pack already reviewed (the audit log's submit_review
+  # records; count = the most recent N in the repos, default 5) through
+  # review-team twice — memory off, then memory on: the same steps and model
+  # tiers — as if the PR had no comments yet, and compares what each run
+  # would have posted. It POSTS NOTHING (review-team never posts and nothing
+  # here hands off), WRITES NO MEMORY (the lenses' memory is off; the notes
+  # step only reads), and writes only its report:
+  # <state_dir>/pr-review-team/eval/<date>.md. Grant review-eval/pick and
+  # review-eval/report `trust: full` (they read the audit log and write the
+  # report) and arm it (`enabled: true`).
+  - name: review-eval
+    on: [manual]
+    steps:
+      - <<: *calib_script
+        id: pick
+        args: [eval-pick]
+        env: { STATE_DIR: "${settings.state_dir}", AUDIT_LOG: "${settings.audit_log}" }
+      - id: replay
+        for_each: "{{.pick.runs}}"
+        workflow: review-team
+        with:
+          repo: "{{.item.repo}}"
+          pr: "{{.item.pr}}"
+          memory: "{{.item.memory}}"
+          prior_comments: "off"
+          scope_key: "{{.pick.scope_key}}"
+      # Which findings of the two runs could be the same one: same file,
+      # lines at most NEAR apart. Identical text is the same finding outright;
+      # every other candidate pair goes to the judge.
+      - id: pairs
+        run: js
+        code: |
+          const NEAR = 5;
+          const runs = (ctx.pick && ctx.pick.runs) || [];
+          const items = (ctx.replay && ctx.replay.items) || [];
+          const norm = function (t) { return String(t || "").split(/\s+/).join(" ").trim().toLowerCase(); };
+          const prs = [], byRef = {};
+          for (let i = 0; i < runs.length; i++) {
+            const run = runs[i], got = items[i] || {}, ref = run.repo + "#" + run.pr;
+            if (!byRef[ref]) { byRef[ref] = { ref: ref, off: { findings: [], notes: 0 }, on: { findings: [], notes: 0 } }; prs.push(byRef[ref]); }
+            byRef[ref][run.memory] = { findings: Array.isArray(got.findings) ? got.findings : [], notes: Number(got.notes || 0) };
+          }
+          const list = [], exact = [];
+          for (const p of prs) {
+            p.off.findings.forEach(function (b, bi) {
+              p.on.findings.forEach(function (m, mi) {
+                if (String(b.path) !== String(m.path) || Math.abs((b.line || 0) - (m.line || 0)) > NEAR) return;
+                const pair = { ref: p.ref, b: bi, m: mi, path: String(b.path), base_line: b.line || 0, mem_line: m.line || 0,
+                               base_body: String(b.body || ""), mem_body: String(m.body || "") };
+                (norm(b.body) === norm(m.body) ? exact : list).push(pair);
+              });
+            });
+          }
+          return { prs: prs, list: list, exact: exact, count: list.length };
+      - id: judge
+        if: "pairs.count > 0"
+        for_each: "{{.pairs.list}}"
+        parallel: true
+        model: light
+        retry: { max: 6, backoff: 30s }
+        decide:
+          state: |
+            Two automated review comments on {{.item.ref}}, both on {{.item.path}}
+            (lines {{.item.base_line}} and {{.item.mem_line}}).
+
+            A: {{.item.base_body}}
+
+            B: {{.item.mem_body}}
+          questions:
+            same_issue:
+              type: noul
+              instructions: >-
+                Do A and B raise the SAME underlying issue — the same problem in the same
+                code — even if worded differently or anchored a few lines apart? Two
+                different problems that happen to sit close together are not the same
+                issue.
+              criteria:
+                true: A and B point at the same problem.
+                false: They are different problems.
+      # One-to-one matching: the most likely pairs first (identical text,
+      # then the judge's P(same issue) >= 0.5, closer lines breaking ties).
+      # A baseline (memory-off) finding with no match was DROPPED with
+      # memory; a memory-on finding with no match was ADDED.
+      - id: compare
+        run: js
+        code: |
+          const SAME_AT = 0.5;
+          const prs = (ctx.pairs && ctx.pairs.prs) || [];
+          const list = (ctx.pairs && ctx.pairs.list) || [];
+          const answers = (ctx.judge && ctx.judge.items) || [];
+          const cands = {};
+          const add = function (pair, p) { (cands[pair.ref] = cands[pair.ref] || []).push(Object.assign({ p: p }, pair)); };
+          for (const pair of ((ctx.pairs && ctx.pairs.exact) || [])) add(pair, 1);
+          list.forEach(function (pair, k) {
+            const a = answers[k] && answers[k].same_issue;
+            const p = a && typeof a.noul === "number" ? a.noul : 0;
+            if (p >= SAME_AT) add(pair, p);
+          });
+          const at = function (f) { return String(f.path) + ":" + (f.line || 0); };
+          const totals = { prs: prs.length, baseline: 0, with_memory: 0, retained: 0, dropped: 0, added: 0, added_citing_note: 0, notes: 0 };
+          const out = [];
+          for (const pr of prs) {
+            const base = pr.off.findings, mem = pr.on.findings;
+            const c = (cands[pr.ref] || []).slice().sort(function (x, y) {
+              return (y.p - x.p) || (Math.abs(x.base_line - x.mem_line) - Math.abs(y.base_line - y.mem_line));
+            });
+            const usedB = {}, usedM = {}, retained = [];
+            for (const x of c) {
+              if (usedB[x.b] || usedM[x.m]) continue;
+              usedB[x.b] = usedM[x.m] = 1;
+              retained.push({ base: at(base[x.b]), memory: at(mem[x.m]), p: x.p, body: String(base[x.b].body || "") });
+            }
+            const dropped = base.filter(function (f, i) { return !usedB[i]; });
+            const added = mem.filter(function (f, i) { return !usedM[i]; });
+            const row = { ref: pr.ref, notes: pr.on.notes, baseline: base.length, with_memory: mem.length,
+                          retained: retained, dropped: dropped, added: added,
+                          added_citing_note: added.filter(function (f) { return !!f.note; }).length,
+                          retention: base.length ? retained.length / base.length : 1 };
+            out.push(row);
+            totals.baseline += base.length; totals.with_memory += mem.length; totals.retained += retained.length;
+            totals.dropped += dropped.length; totals.added += added.length; totals.added_citing_note += row.added_citing_note;
+            totals.notes += pr.on.notes;
+          }
+          totals.retention = totals.baseline ? totals.retained / totals.baseline : 1;
+          // the documented target: memory-on keeps nearly every baseline finding
+          totals.verdict = totals.retention >= 0.9 ? "ok" : totals.retention >= 0.75 ? "watch" : "crowding";
+          return { prs: out, totals: totals };
+      - <<: *calib_script
+        id: report
+        args: [eval-report]
+        env: { STATE_DIR: "${settings.state_dir}", AUDIT_LOG: "${settings.audit_log}" }

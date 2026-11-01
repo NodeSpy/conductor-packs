@@ -761,6 +761,142 @@ def collect_backfill(ctx):
 # record
 # ---------------------------------------------------------------------------
 
+# ---- review-eval: memory on vs memory off ----
+
+EVAL_COUNT = 5
+EVAL_MAX = 50
+EVAL_TARGET = 0.9   # memory-on should keep at least this share of the baseline findings
+REF_RE = re.compile(r"([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#([0-9]+)")
+
+
+def eval_pick(ctx):
+    """Which PRs review-eval replays: the ones named (prs=), else the most recent
+    `count` this pack reviewed in `repos` (the audit log's submit_review records).
+    Each becomes two runs, memory off then on."""
+    inputs = ctx.get("inputs") or {}
+    repos = parse_repos(inputs.get("repos") or "")
+    raw_count = str(inputs.get("count") or EVAL_COUNT).strip()
+    if not raw_count.isdigit() or not 0 < int(raw_count) <= EVAL_MAX:
+        raise SystemExit("review-eval: --input count= takes a number from 1 to %d, got %r" % (EVAL_MAX, raw_count))
+    count = int(raw_count)
+    named = [x for x in re.split(r"[\s,]+", str(inputs.get("prs") or "")) if x]
+    refs = []
+    if named:
+        for x in named:
+            m = REF_RE.fullmatch(x)
+            if not m or not valid_repo(m.group(1)) or int(m.group(2)) <= 0:
+                raise SystemExit("review-eval: --input prs= takes owner/name#N refs, got %r" % x)
+            if repos and m.group(1) not in repos:
+                raise SystemExit("review-eval: %s is not in --input repos=%s" % (x, ",".join(repos)))
+            ref = "%s#%d" % (m.group(1), int(m.group(2)))
+            if ref not in refs:
+                refs.append(ref)
+    else:
+        if not repos:
+            raise SystemExit("review-eval: name the repos (--input repos=owner/app) or the PRs (--input prs=owner/app#12)")
+        require_audit()
+        latest = sorted(((max(p["ts"] for p in posts), key) for key, posts in pack_posts().items()
+                         if key.rsplit("#", 1)[0] in repos), reverse=True)
+        refs = [key for _, key in latest[:count]]
+        if not refs:
+            raise SystemExit("review-eval: the audit log names no review this pack posted in %s — "
+                             "name PRs with --input prs=" % ",".join(repos))
+    runs = []
+    for ref in refs:
+        repo, n = ref.rsplit("#", 1)
+        runs += [{"repo": repo, "pr": int(n), "memory": "off"}, {"repo": repo, "pr": int(n), "memory": "on"}]
+    return {"prs": refs, "runs": runs, "count": len(refs), "scope_key": str(inputs.get("scope_key") or "").strip()}
+
+
+def eval_dir():
+    d = os.path.join(cache_dir(), "eval")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def eval_summary(t, scope_key):
+    pct = "%d%%" % round(100 * t.get("retention", 1))
+    return ("review-eval: %d PR(s), %d learned note(s) read; baseline %d finding(s), %d retained with memory (%s), "
+            "%d dropped, %d added (%d citing a note) — %s%s" % (
+                t.get("prs", 0), t.get("notes", 0), t.get("baseline", 0), t.get("retained", 0), pct,
+                t.get("dropped", 0), t.get("added", 0), t.get("added_citing_note", 0),
+                {"ok": "notes steer, the review stands",
+                 "watch": "some baseline findings lost — watch",
+                 "crowding": "many baseline findings lost: the notes are crowding out the review"}.get(t.get("verdict"), "?"),
+                (" [scope_key %s]" % scope_key) if scope_key else ""))
+
+
+def eval_report(ctx):
+    """Write <cache>/eval/<date>.md and latest.json; return the summary."""
+    cmp = ctx.get("compare") or {}
+    totals, prs = cmp.get("totals") or {}, cmp.get("prs") or []
+    scope_key = (ctx.get("pick") or {}).get("scope_key") or ""
+    summary = eval_summary(totals, scope_key)
+    t = now()
+    d = eval_dir()
+    path = os.path.join(d, t.strftime("%Y-%m-%d") + ".md")
+    n = 2
+    while os.path.exists(path):
+        path = os.path.join(d, "%s-%d.md" % (t.strftime("%Y-%m-%d"), n))
+        n += 1
+    fmt = lambda f: "%s:%s — %s" % (f.get("path"), f.get("line"), " ".join(str(f.get("body") or "").split())[:300])
+    lines = ["# review-eval — %s" % t.strftime("%Y-%m-%d %H:%M UTC"), "",
+             "Each PR was reviewed twice by the lens panel — memory off (the baseline), then memory on — "
+             "with nothing posted and nothing written to memory.", "",
+             "Target: memory-on retains nearly all baseline findings (%d%% or more). A large drop means the "
+             "learned notes are crowding out the review. Model runs vary, so read a handful of PRs, "
+             "not one." % round(100 * EVAL_TARGET), "",
+             "## Overall", "", summary, "",
+             "| | |", "|---|---|",
+             "| PRs | %d |" % totals.get("prs", 0),
+             "| learned notes read (memory on) | %d |" % totals.get("notes", 0),
+             "| baseline findings (memory off) | %d |" % totals.get("baseline", 0),
+             "| findings with memory | %d |" % totals.get("with_memory", 0),
+             "| retained | %d (%d%%) |" % (totals.get("retained", 0), round(100 * totals.get("retention", 1))),
+             "| dropped with memory | %d |" % totals.get("dropped", 0),
+             "| added with memory | %d (%d citing a note) |" % (totals.get("added", 0), totals.get("added_citing_note", 0)),
+             "| scope_key | %s |" % (scope_key or "(the setting)"), ""]
+    for pr in prs:
+        lines += ["## %s" % pr.get("ref"), "",
+                  "%d note(s) read; baseline %d, with memory %d; retained %d (%d%%), dropped %d, added %d." % (
+                      pr.get("notes", 0), pr.get("baseline", 0), pr.get("with_memory", 0), len(pr.get("retained") or []),
+                      round(100 * pr.get("retention", 1)), len(pr.get("dropped") or []), len(pr.get("added") or [])), ""]
+        if pr.get("dropped"):
+            lines.append("Dropped with memory (the baseline raised these; memory-on did not):")
+            lines += ["- " + fmt(f) for f in pr["dropped"]]
+        if pr.get("added"):
+            lines.append("Added with memory:")
+            lines += ["- " + fmt(f) + ((" [note: %s]" % " ".join(str(f["note"]).split())[:120]) if f.get("note") else "")
+                      for f in pr["added"]]
+        if pr.get("retained"):
+            lines.append("Retained:")
+            lines += ["- %s -> %s (p=%.2f) — %s" % (r.get("base"), r.get("memory"), r.get("p", 0),
+                                                      " ".join(str(r.get("body") or "").split())[:200]) for r in pr["retained"]]
+        lines.append("")
+    with open(path, "w") as f:
+        f.write("\n".join(lines) + "\n")
+    write_json_atomic(os.path.join(d, "latest.json"), {"ts": iso_str(t), "summary": summary, "path": path, "totals": totals})
+    print(summary, file=sys.stderr)
+    return {"summary": summary, "path": path, "totals": totals}
+
+
+def iso_str(t):
+    return t.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def latest_eval_since(last_run):
+    """The latest review-eval summary, when one ran after `last_run` (or ever, with none)."""
+    try:
+        with open(os.path.join(cache_dir(), "eval", "latest.json")) as f:
+            e = json.load(f)
+        ts = iso(e["ts"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    if last_run is not None and ts <= last_run:
+        return None
+    return e
+
+
 def record(ctx):
     """Promote calibration's next state (calibration mode) and append the run's
     section to <cache>/calibration-log.md."""
@@ -791,6 +927,17 @@ def record(ctx):
     summary = (ctx.get("calibrate") or ctx.get("merge") or {}).get("summary") or ""
     if summary:
         lines += ["", summary.strip()]
+    if mode == "calibration":
+        # A review-eval since the last calibration: its summary goes in the log
+        # beside what was learned (a note to read — it gates nothing).
+        try:
+            with open(os.path.join(cache, "calibration.json")) as f:
+                last = iso(json.load(f).get("last_run"))
+        except (OSError, ValueError, TypeError, AttributeError):
+            last = None
+        ev = latest_eval_since(last)
+        if ev:
+            lines += ["", "Latest review-eval (%s): %s (report: %s)" % (ev.get("ts"), ev.get("summary"), ev.get("path"))]
     with open(os.path.join(cache, "calibration-log.md"), "a") as f:
         f.write("\n".join(lines) + "\n")
     promoted = False
@@ -819,8 +966,12 @@ def main(argv):
             out = collect_backfill(ctx)
         elif cmd == "record":
             out = record(ctx)
+        elif cmd == "eval-pick":
+            out = eval_pick(ctx)
+        elif cmd == "eval-report":
+            out = eval_report(ctx)
         else:
-            raise SystemExit("usage: calibration.py collect-calibration | collect-backfill | record")
+            raise SystemExit("usage: calibration.py collect-calibration | collect-backfill | record | eval-pick | eval-report")
     except NeedsGrant as e:
         print("pr-review-team: " + str(e), file=sys.stderr)
         return 3

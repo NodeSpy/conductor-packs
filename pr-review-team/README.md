@@ -54,11 +54,9 @@ connectors and no secrets — posting uses your connector's own write identity.
 ## What it needs (`requires:`)
 
 - **`conductor: >=0.69.0`** — memory scope keys that are templates over the
-  step's facts (`standard:{{.repo}}`, `org:{{.owner}}`), a step's
-  `memory: { extra_scopes: [...] }`, which the lens panel's layering under
-  `scope_key` uses, and `ctx.memory.key` — core's scope-key renderer, which
-  the pack renders every key it computes with (so its keys are exactly the
-  keys core reads).
+  step's facts (`standard:{{.repo}}`, `org:{{.owner}}`), and `ctx.memory.key`
+  — core's scope-key renderer, which the pack renders every key it computes
+  with (so its keys are exactly the keys core reads).
 - **A js engine plugin with `ctx.memory.key`** — newer than `engines/js`
   v1.2.0. `conductor init` / `conductor plugin update` fetch it; with an older
   engine every run stops at the `scopekey`/`keys` step with a message saying
@@ -79,6 +77,7 @@ Every setting is optional. Set them under `packs.<instance>.settings`.
 |---|---|---|
 | `auto` | `false` | `true`: never hand off. Every review posts with the team's verdict (`APPROVE` or `REQUEST_CHANGES`); `assess` doesn't run; emphasis entries only sharpen the review. `false`: `assess` may route a PR to a human hand-off, and a PR matching an emphasis entry leans to that hand-off. |
 | `scope_key` | `{{.repo}}` | Where a review's learning lives: a memory scope-key template over the review's facts. See [Scope keys](#scope-keys). |
+| `memory_limit` | `40` | At most this many learned notes per lens reviewer, filled standard → emphasis → facts (facts go first when the cap bites). `0` = none. A whole number; anything else fails the review run. |
 | `state_dir` | `""` | conductor's state directory, for the calibration triggers. Empty: `$XDG_STATE_HOME/conductor`, else `~/.local/state/conductor`. Set it if your daemon runs with another state directory — code steps don't inherit `XDG_STATE_HOME`. |
 | `audit_log` | `""` | The audit log calibration reads reviews from. Empty: `<state_dir>/audit.jsonl` (its rotated `.1` is read too). Set it if your config moves `store.audit_log`. |
 | `git_base` | `https://github.com` | Where calibration clones reviewed repos from (`<git_base>/<owner>/<repo>.git`). https clones authenticate through the `gh` CLI's login. |
@@ -112,33 +111,45 @@ reviewer your trust.
 
 ## Memory: how the reviewer learns
 
-The lens reviewers read conductor's shared memory, layered by a **scope key**
-— the `scope_key` setting. Each review renders the key over its own facts and
-recalls, newest first and up to 100 entries across all of them:
+The lens reviewers read **learned notes** — conductor memory written by the
+calibration triggers (or by you) — layered by a **scope key**, the
+`scope_key` setting:
 
-| Scope | What lives there |
-|---|---|
-| `global` (the shared set) | The reviewer-wide standard — rules that apply everywhere. |
-| `<key>` | Facts the diff can't show: how the code is built, deployed, operated, used. |
-| `standard:<key>` | This key's additions to the review standard. |
-| `emphasis:<key>` | "Look hard at X" rules: kinds of change that past reviews got wrong. |
+| Scope | Layer | What lives there |
+|---|---|---|
+| `global` (the shared set) | standard | The reviewer-wide standard — rules that apply everywhere. |
+| `standard:<key>` | standard | This key's additions to the review standard. |
+| `emphasis:<key>` | emphasis | "Look hard at X" rules: kinds of change that past reviews got wrong. |
+| `<key>` | facts | Facts the diff can't show: how the code is built, deployed, operated, used. |
 
-Entries written by calibration are tagged with their layer (`standard`,
-`emphasis`, `fact`) and `review-tuning`, and the lens prompt explains the
-tags: `standard` notes weigh like the repo's own CLAUDE.md/AGENTS.md/
-CONTRIBUTING, `emphasis` notes mark areas to look at hard, everything else is
-context.
+**Notes steer the review; they never replace it.** Each lens reviewer is told
+to do a full, independent review of the whole change through its lens first,
+whatever the notes say. The notes come after everything else in the prompt,
+framed as judgment aids: what matters here, what is known to be safe, where
+past reviews missed things. They are not a checklist, not the scope of the
+review, and never a reason to skip or soften an issue. A note alone never
+makes a finding blocking — that still takes the change actually breaking
+something. Your repo's own CLAUDE.md/AGENTS.md/CONTRIBUTING keep their
+blocking weight; learned `standard` notes are strong guidance, not law.
+
+The pack reads the notes itself (the review's `notes` step) rather than having
+conductor inject them, so they arrive in a fixed order — standard (the shared
+set, then `standard:<key>`), then emphasis, then facts, newest first within a
+layer — and under a cap: **`memory_limit`** notes per review (default 40;
+`0` turns them off). When the cap bites, facts go first. A lens that raised a
+finding because of a note says so (the finding's `note`), which `review-eval`
+counts. The lens step itself has conductor memory turned off, so it neither
+reads memory on its own nor writes any back.
 
 `emphasis:<key>` also feeds `assess`: with `auto: false`, a PR that matches
-an emphasis rule leans to the hand-off. With `auto: true` the rules only add
-review emphasis.
+an emphasis rule leans to the hand-off — routing only; the review team reviews
+the whole change either way. With `auto: true` the rules only add review
+emphasis.
 
 You can write entries by hand too — with the `dir:` backend each one is a
 Markdown file in your memory directory, and the `scope:` line picks its
-layer. To change how many entries a review reads, override the step and keep
-the three layers:
-`steps: { review-team/review: { memory: { limit: 40, extra_scopes: ["{{.repo}}", "standard:{{.repo}}", "emphasis:{{.repo}}"] } } }`
-(with your own `scope_key` in place of `{{.repo}}`).
+layer. To check that the notes help rather than crowd out the review, run
+[`review-eval`](#measuring-it-review-eval).
 
 ### Scope keys
 
@@ -332,6 +343,55 @@ Everything calibration keeps is under `<state_dir>/pr-review-team/`: its
 position (`calibration.json`), clones, and the log. Delete a memory entry to
 undo it.
 
+## Measuring it: review-eval
+
+Does memory sharpen the review, or crowd it out? `review-eval` replays PRs
+this pack already reviewed through the lens panel twice — **memory off** (the
+baseline), then **memory on**, with the same steps and model tiers — and
+compares what each would have posted:
+
+```
+conductor run review/review-eval --input repos=owner/app                 # the 5 most recent it reviewed
+conductor run review/review-eval --input repos=owner/app --input count=10
+conductor run review/review-eval --input prs=owner/app#12,owner/app#15
+conductor run review/review-eval --input repos=owner/app --input scope_key='org:{{.owner}}'   # try another key
+```
+
+It **posts nothing** (it runs the review engine, never the posting flow or
+the hand-off), **writes no memory** (notes are only read), and replays each PR
+as if it had no comments yet — the pack's own earlier comments would
+otherwise hide exactly the findings being compared. Its one write is the
+report, `<state_dir>/pr-review-team/eval/<date>.md`; the summary line is the
+`report` step's output and goes to the daemon log.
+
+Findings are matched one-to-one across the two runs: same file, lines at most
+5 apart, and either identical text or a light-model judge saying they raise
+the same issue. Per PR and overall it reports:
+
+- **retained** — baseline findings memory-on also raised;
+- **dropped** — baseline findings memory-on did not raise;
+- **added** — memory-on findings the baseline did not have, and how many cite a note.
+
+**Target: memory-on retains nearly all baseline findings** — 90% or more reads
+`ok`, 75–90% `watch`, below that `crowding`: the notes are pulling the review
+away from what it would otherwise catch. Look at what was dropped, and prune or
+reword the notes behind it (or lower `memory_limit`). Model runs vary from one
+run to the next, so judge over a handful of PRs, not one.
+
+Arm it like the calibration triggers (its `pick` step reads the audit log and
+`report` writes the report):
+
+```yaml
+    steps:
+      review-eval/pick:   { trust: full }
+      review-eval/report: { trust: full }
+    triggers:
+      review-eval: { enabled: true }
+```
+
+When an eval ran since the last calibration, `review-calibration` adds its
+summary to the calibration log — a note to read, not a gate.
+
 ## Sharing what it learned
 
 Memory stays on the box that wrote it. To give teammates the same reviewer,
@@ -371,9 +431,13 @@ Re-export and push to update it.
   delete that override; it also references the `diffcap` step 2.10 removed.
   Move routing entries to the new scope — with the `dir:` backend, change
   each file's `scope: routing:<repo>` line to `scope: emphasis:<repo>`.
-- **The lens panel reads memory by default** (limit 100, the layers of
-  `scope_key` above). A `review-team/review: { memory: … }` override is no
-  longer needed; if you keep one, include all three `extra_scopes`.
+- **The lens panel reads learned notes by default** — at most `memory_limit`
+  (40), in layer order, framed so they steer the review rather than replace
+  it. They come from the pack's `notes` step, not conductor's memory
+  injection: **remove any `review-team/review: { memory: … }` override** —
+  it would inject the notes a second time, unframed. Only the shared set and
+  the key's three layers are read (not the workflow or step scopes conductor's
+  default injection added).
 - **Your own comments teach it.** Calibration used to skip everything your
   account wrote; it now reads what you wrote after the pack's review as owner
   catches, and backfill counts your pack-era comments unless the audit log

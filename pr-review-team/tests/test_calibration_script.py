@@ -355,6 +355,89 @@ class OwnerCatchTest(unittest.TestCase):
         self.assertEqual(self.collect()["owner_count"], 0)
 
 
+class EvalScriptTest(unittest.TestCase):
+    """review-eval's deterministic half: which PRs it replays, and the report it writes."""
+
+    def setUp(self):
+        self.f = Fixture()
+        n = self.f.now
+        self.f.audit(post(n - dt.timedelta(days=5), "acme/api", 1), post(n - dt.timedelta(days=4), "acme/api", 2),
+                     post(n - dt.timedelta(days=3), "acme/web", 7), post(n - dt.timedelta(days=2), "acme/api", 3),
+                     post(n - dt.timedelta(days=1), "other/svc", 9))
+
+    def tearDown(self):
+        self.f.close()
+
+    def pick(self, **inputs):
+        return self.f.run("eval-pick", stdin=json.dumps({"inputs": inputs}))
+
+    def test_the_most_recent_reviewed_prs_in_the_repos(self):
+        res = self.pick(repos="acme/api,acme/web", count="3")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        out = json.loads(res.stdout)
+        self.assertEqual(out["prs"], ["acme/api#3", "acme/web#7", "acme/api#2"])
+        self.assertEqual(out["runs"][:2], [{"repo": "acme/api", "pr": 3, "memory": "off"},
+                                           {"repo": "acme/api", "pr": 3, "memory": "on"}])
+        self.assertEqual((len(out["runs"]), out["scope_key"]), (6, ""))
+        self.assertEqual(json.loads(self.pick(repos="acme/api").stdout)["count"], 3)   # default 5, only 3 exist
+
+    def test_named_prs_and_a_scope_key(self):
+        out = json.loads(self.pick(prs="acme/api#12, acme/web#3 acme/api#12", scope_key=" org:{{.owner}} ").stdout)
+        self.assertEqual((out["prs"], out["scope_key"]), (["acme/api#12", "acme/web#3"], "org:{{.owner}}"))
+
+    def test_bad_inputs_fail_plainly(self):
+        for inputs, says in (({}, "name the repos"), ({"repos": "acme/api", "count": "0"}, "count="),
+                             ({"repos": "acme/api", "count": "many"}, "count="),
+                             ({"prs": "acme/api#x"}, "owner/name#N"), ({"prs": "../x#1"}, "owner/name#N"),
+                             ({"repos": "acme/api", "prs": "acme/web#1"}, "is not in"),
+                             ({"repos": "nobody/here"}, "names no review")):
+            res = self.pick(**inputs)
+            self.assertNotEqual(res.returncode, 0, inputs)
+            self.assertIn(says, res.stderr, inputs)
+
+    def compare(self):
+        return {"totals": {"prs": 1, "notes": 4, "baseline": 4, "with_memory": 4, "retained": 3, "dropped": 1, "added": 1,
+                           "added_citing_note": 1, "retention": 0.75, "verdict": "watch"},
+                "prs": [{"ref": "acme/api#3", "notes": 4, "baseline": 4, "with_memory": 4, "retention": 0.75,
+                         "retained": [{"base": "a.go:1", "memory": "a.go:2", "p": 0.9, "body": "kept"}] * 3,
+                         "dropped": [{"path": "b.go", "line": 4, "body": "the dropped one"}],
+                         "added": [{"path": "c.go", "line": 9, "body": "the added one", "note": "Deploy job needs"}]}]}
+
+    def test_the_report(self):
+        res = self.f.run("eval-report", stdin=json.dumps({"compare": self.compare(), "pick": {"scope_key": ""}}))
+        self.assertEqual(res.returncode, 0, res.stderr)
+        out = json.loads(res.stdout)
+        d = os.path.join(self.f.state, "pr-review-team", "eval")
+        self.assertEqual(out["path"], os.path.join(d, self.f.now.strftime("%Y-%m-%d") + ".md"))
+        text = open(out["path"]).read()
+        for must in ("# review-eval", "## Overall", "| retained | 3 (75%) |", "| added with memory | 1 (1 citing a note) |",
+                     "## acme/api#3", "Dropped with memory", "b.go:4 — the dropped one",
+                     "c.go:9 — the added one [note: Deploy job needs]", "Target: memory-on retains nearly all baseline findings"):
+            self.assertIn(must, text)
+        self.assertIn("3 retained with memory (75%)", out["summary"])
+        self.assertIn("watch", out["summary"])
+        self.assertIn(out["summary"], res.stderr)                       # printed
+        latest = json.load(open(os.path.join(d, "latest.json")))
+        self.assertEqual((latest["summary"], latest["path"]), (out["summary"], out["path"]))
+        again = json.loads(self.f.run("eval-report", stdin=json.dumps({"compare": self.compare()})).stdout)
+        self.assertTrue(again["path"].endswith("-2.md"))                # a second run the same day keeps the first
+
+    def test_calibration_logs_an_eval_run_since_its_last_run(self):
+        cache = os.path.join(self.f.state, "pr-review-team")
+        os.makedirs(cache, exist_ok=True)
+        log = os.path.join(cache, "calibration-log.md")
+        def calibrate(last_run):
+            with open(os.path.join(cache, "calibration.json"), "w") as f:
+                json.dump({"last_run": iso(last_run)}, f)
+            res = self.f.run("record", stdin=json.dumps({"plan": {}, "write": {}}), MODE="calibration")
+            self.assertEqual(res.returncode, 0, res.stderr)
+            return open(log).read().split("## ")[-1]
+        self.assertNotIn("review-eval", calibrate(self.f.now - dt.timedelta(days=1)))   # no eval yet
+        self.f.run("eval-report", stdin=json.dumps({"compare": self.compare()}))
+        self.assertIn("Latest review-eval", calibrate(self.f.now - dt.timedelta(days=1)))
+        self.assertNotIn("review-eval", calibrate(self.f.now + dt.timedelta(minutes=5)))  # nothing new since
+
+
 class RepoGuardTest(unittest.TestCase):
     """The innermost guards, called directly: whatever a caller hands them, a
     malformed repo is neither cloned nor sent to gh."""
