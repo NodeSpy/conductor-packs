@@ -29,11 +29,45 @@ def flow_step(man, workflow, step_id):
     raise KeyError(step_id)
 
 
-def run_js(code, ctx, settings=None):
+# A TEST DOUBLE for core's ctx.memory.key (memory.RenderScopeKey), so the
+# pack's own logic runs under node: plain fields, `index .x N` and
+# `printf "…%s…" args` — only what these tests write — with core's rule that a
+# fact with no value ("", missing, 0, a blank list element) means the key
+# doesn't apply. The real renderer is asserted against core's vectors through
+# the real binding on a core build: test_scope_key_binding.py.
+KEY_DOUBLE = r"""
+const keyDouble = function (t, facts) {
+  if (typeof t !== "string") throw new Error("memory.key: template must be a string");
+  facts = facts || {};
+  const src = t.split("$" + "{repo}").join("{{.repo}}").split("$" + "{workflow}").join("{{.workflow}}").split("$" + "{step}").join("{{.step}}");
+  const no = function (why) { return { key: "", ok: false, reason: "scope key " + JSON.stringify(t) + " " + why }; };
+  if (src.split("{{").length !== src.split("}}").length) return no("does not parse");
+  if (/\{\{-?\s*(if|range|with|define|template|end)\b/.test(src)) return no("uses a construct a scope key may not");
+  const empty = function (v) { return v === undefined || v === null || v === "" || v === 0; };
+  let missing = false;
+  const arg = function (tok) {
+    let m;
+    if ((m = /^"(.*)"$/.exec(tok))) return m[1];
+    if ((m = /^\(?index \.(\w+) (\d+)\)?$/.exec(tok))) { const l = facts[m[1]] || []; const v = l[+m[2]]; if (empty(v)) missing = true; return v; }
+    if ((m = /^\.([\w.]+)$/.exec(tok))) { let v = facts; for (const k of m[1].split(".")) v = v == null ? undefined : v[k]; if (empty(v)) missing = true; return v; }
+    throw new Error("the key double can't evaluate " + tok);
+  };
+  const out = src.replace(/\{\{([\s\S]*?)\}\}/g, function (_, body) {
+    const toks = body.trim().match(/"[^"]*"|\([^)]*\)|[^\s()]+(?: \.\w+ \d+)?/g) || [];
+    if (toks[0] === "printf") { const args = toks.slice(1).map(arg); const f = args.shift(); let i = 0; return f.replace(/%s/g, function () { return String(args[i++]); }); }
+    return String(arg(body.trim()));
+  }).trim();
+  return missing || !out ? no("reads a fact this step has no value for") : { key: out, ok: true, reason: "" };
+};
+"""
+
+
+def run_js(code, ctx, settings=None, binding=True):
     for k, v in (settings or {}).items():
         code = code.replace("${settings.%s}" % k, v)
-    src = "const ctx = %s;\nconst out = (function () {\n%s\n})();\nprocess.stdout.write(JSON.stringify(out));" % (
-        json.dumps(ctx), code)
+    src = ("const ctx = %s;\n" % json.dumps(ctx) + KEY_DOUBLE +
+           ("ctx.memory = Object.assign({ key: keyDouble }, ctx.memory || {});\n" if binding else "") +
+           "const out = (function () {\n%s\n})();\nprocess.stdout.write(JSON.stringify(out));" % code)
     res = subprocess.run(["node", "-e", src], capture_output=True, text=True)
     if res.returncode != 0:
         raise AssertionError(res.stderr)
@@ -50,13 +84,14 @@ ctx.memory = {
                                            store.push(m); return m; },
   forget: function (id) { const i = store.findIndex(function (m) { return m.id === id; });
                           if (i < 0) return false; store.splice(i, 1); return true; },
+  key: keyDouble,
 };
 """
 
 
 def run_js_mem(code, ctx, store):
     """Run a step with an in-memory ctx.memory; returns (output, the store afterwards)."""
-    src = ("const ctx = %s;\n" % json.dumps(ctx) + FAKE_MEMORY % json.dumps(store) +
+    src = ("const ctx = %s;\n" % json.dumps(ctx) + KEY_DOUBLE + FAKE_MEMORY % json.dumps(store) +
            "const out = (function () {\n%s\n})();\nprocess.stdout.write(JSON.stringify({out: out, store: store}));" % code)
     res = subprocess.run(["node", "-e", src], capture_output=True, text=True)
     if res.returncode != 0:
@@ -81,8 +116,8 @@ def pr_facts(ref, **meta):
     return f
 
 
-def scopekeys(template, ctx):
-    return run_js(load()["x-templates"]["scopekeys"]["code"], ctx, {"scope_key": template})
+def scopekeys(template, ctx, binding=True):
+    return run_js(load()["x-templates"]["scopekeys"]["code"], ctx, {"scope_key": template}, binding=binding)
 
 
 def keys_for(refs, template="{{.repo}}"):
@@ -268,30 +303,11 @@ class OwnerKeyTest(unittest.TestCase):
 
 
 class ScopeKeyTest(unittest.TestCase):
-    """The pack's js port of core's scope-key renderer, and the scope_key rules."""
+    """The scope_key rules. Keys are rendered by core (ctx.memory.key); here by its test double."""
 
     @classmethod
     def setUpClass(cls):
         cls.code = load()["x-templates"]["scopekeys"]["code"]
-
-    def vectors(self, name):
-        with open(os.path.join(HERE, "testdata", name)) as f:
-            v = json.load(f)
-        # render every case through the step's renderer, in one node run
-        src = self.code[self.code.index("// ---- the scope-key renderer"):self.code.index("// ---- end of the renderer ----")]
-        prog = "const ctx = {};\n" + src + "\nconst v = %s;\nprocess.stdout.write(JSON.stringify(v.cases.map(function (c) { return renderKey(c.template, v.facts); })));" % json.dumps(v)
-        res = subprocess.run(["node", "-e", prog], capture_output=True, text=True)
-        self.assertEqual(res.returncode, 0, res.stderr)
-        got = json.loads(res.stdout)
-        for c, g in zip(v["cases"], got):
-            self.assertEqual(g, None if c.get("drop") else c["want"], c["template"])
-        return len(got)
-
-    def test_cores_vectors(self):
-        self.assertEqual(self.vectors("scope_key_vectors.json"), 37)
-
-    def test_extra_cases_rendered_by_core(self):
-        self.assertEqual(self.vectors("scope_key_vectors_extra.json"), 48)
 
     def test_the_aliases_pass_through_the_setting(self):
         ctx = {"inputs": {"repo": "acme/api", "pr": 7}}
@@ -328,7 +344,7 @@ class ScopeKeyTest(unittest.TestCase):
 
     def test_unrebuildable_facts_fail_loudly(self):
         for t in ("team:{{.inputs.team}}", "{{.steps.triage.outputs.area}}", "{{.head}}", "{{.me.login}}",
-                  "{{.workflow}}", "{{index .inputs \"team\"}}", "{{.}}", "x:${step}"):
+                  "{{.workflow}}", "{{index .inputs \"team\"}}", "{{.}}", "x:${step}", "{{.repo.x}}", "{{.inputs.repo.x}}"):
             with self.assertRaises(AssertionError) as cm:
                 scopekeys(t, {"inputs": {"repo": "acme/api", "pr": 7}})
             self.assertIn("a key may read only", str(cm.exception), t)
@@ -336,6 +352,37 @@ class ScopeKeyTest(unittest.TestCase):
             with self.assertRaises(AssertionError) as cm:
                 scopekeys(t, {})
             self.assertIn("the scope_key setting", str(cm.exception), t)
+
+    def test_text_in_quotes_is_not_a_fact(self):
+        ctx = {"inputs": {"repo": "acme/api", "pr": 7}}
+        self.assertEqual(scopekeys('{{printf "%s@.v1" .repo}}', ctx)["key"], "acme/api@.v1")
+
+    def test_a_key_core_will_not_render_fails_with_cores_reason(self):
+        with self.assertRaises(AssertionError) as cm:
+            scopekeys("{{if .owner}}x{{end}}", {})
+        self.assertIn("does not render: scope key", str(cm.exception))
+
+    def test_no_binding_names_what_to_upgrade(self):
+        with self.assertRaises(AssertionError) as cm:
+            scopekeys("{{.repo}}", {"inputs": {"repo": "acme/api", "pr": 7}}, binding=False)
+        self.assertIn("no ctx.memory.key", str(cm.exception))
+        self.assertIn("conductor >= 0.69.0", str(cm.exception))
+
+    def test_an_old_daemon_refusing_the_call_names_the_version(self):
+        code = load()["x-templates"]["scopekeys"]["code"].replace("${settings.scope_key}", "{{.repo}}")
+        ctx = {"inputs": {"repo": "acme/api", "pr": 7}}
+        old = ("ctx.memory = { key: function () { throw new Error('memory: no operation \"key\"'); } };\n")
+        src = "const ctx = %s;\n%sconst out = (function () {\n%s\n})();" % (json.dumps(ctx), old, code)
+        res = subprocess.run(["node", "-e", src], capture_output=True, text=True)
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn('ctx.memory.key failed (memory: no operation "key")', res.stderr)
+        self.assertIn("conductor >= 0.69.0", res.stderr)
+
+    def test_keys_are_rendered_by_core_not_the_pack(self):
+        code = load()["x-templates"]["scopekeys"]["code"]
+        self.assertIn("ctx.memory.key(TEMPLATE, facts)", code)
+        for gone in ("renderKey", "PROBE", "parsePipe", "lexAction"):
+            self.assertNotIn(gone, code)
 
     def test_keyspec_says_when_collect_must_fetch_pr_metadata(self):
         self.assertEqual(scopekeys("org:{{.owner}}", {}), {"needs_meta": False})

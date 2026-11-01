@@ -1,5 +1,5 @@
 {
- "_comment": "Copied from conductor core (internal/memory/testdata/scope_key_vectors.json, feat/memory-layers @ea47e7a0). Scope-key template vectors (memory.RenderScopeKey). facts is one step's fact set; each case renders template over it and expects either want (the key) or drop (the key does not apply: recall drops it, a grant entry admits nothing, a write is refused). Shared by the Go tests and `conductor memory key`; a re-implementation can test against this file.",
+ "_comment": "Copied from conductor core (internal/memory/testdata/scope_key_vectors.json, feat/memory-layers @d1933af0). Scope-key template vectors (memory.RenderScopeKey). facts is one step's fact set; each case renders template over it and expects either want (the key) or drop (the key does not apply: recall drops it, a grant entry admits nothing, a write is refused). Shared by the Go tests and `conductor memory key`; a re-implementation can test against this file.",
  "facts": {
   "repo": "acme/api",
   "owner": "acme",
@@ -14,6 +14,9 @@
   "labels": [
    "backend",
    "needs-review"
+  ],
+  "blank_labels": [
+   ""
   ],
   "base": "main",
   "workflow": "review",
@@ -102,6 +105,14 @@
    "want": "branch:feature/*"
   },
   {
+   "template": "issue:{{.issue | default \"none\"}}",
+   "want": "issue:none"
+  },
+  {
+   "template": "n:{{coalesce .issue .number}}",
+   "want": "n:42"
+  },
+  {
    "template": "title:{{.title}}",
    "want": "title:Fix the {{.repo}} parser"
   },
@@ -171,6 +182,10 @@
   },
   {
    "template": "{{print \" \"}}",
+   "drop": true
+  },
+  {
+   "template": "label:{{index .blank_labels 0}}",
    "drop": true
   },
   {

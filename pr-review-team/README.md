@@ -54,9 +54,15 @@ connectors and no secrets — posting uses your connector's own write identity.
 ## What it needs (`requires:`)
 
 - **`conductor: >=0.69.0`** — memory scope keys that are templates over the
-  step's facts (`standard:{{.repo}}`, `org:{{.owner}}`) and a step's
+  step's facts (`standard:{{.repo}}`, `org:{{.owner}}`), a step's
   `memory: { extra_scopes: [...] }`, which the lens panel's layering under
-  `scope_key` uses. It covers the older floors too:
+  `scope_key` uses, and `ctx.memory.key` — core's scope-key renderer, which
+  the pack renders every key it computes with (so its keys are exactly the
+  keys core reads).
+- **A js engine plugin with `ctx.memory.key`** — newer than `engines/js`
+  v1.2.0. `conductor init` / `conductor plugin update` fetch it; with an older
+  engine every run stops at the `scopekey`/`keys` step with a message saying
+  so. It covers the older floors too:
   0.57.0 for whole-PR review (the agent workspace jail and
   `github.pr_files[].patch`), 0.54.0 for `decide:` steps, 0.33.0 for the
   reactive hand-off.
@@ -355,7 +361,8 @@ Re-export and push to update it.
 
 3.0.0 is a major version: a `~> 2.x` pin won't pick it up.
 
-- **Needs conductor >= 0.69.0.**
+- **Needs conductor >= 0.69.0** and a js engine plugin with `ctx.memory.key`
+  (newer than `engines/js` v1.2.0) — run `conductor plugin update`.
 - **Learning has a scope key.** `scope_key` defaults to `{{.repo}}`, so the
   layers are `<repo>`, `standard:<repo>` and `emphasis:<repo>` — entries you
   already keep per repo are read as before.
@@ -428,4 +435,16 @@ calibration triggers' deterministic half. Before publishing:
 ```
 conductor pack lint .
 python3 -m unittest discover -s tests      # needs node and PyYAML
+```
+
+The unit tests run the pack's js steps under node, with a test double for
+`ctx.memory.key`. `tests/test_scope_key_binding.py` checks the real thing: it
+starts a throwaway daemon (its own HOME and XDG directories) and renders
+core's scope-key vectors and the pack's `scopekeys` step through the binding.
+It is skipped unless you point it at a conductor build:
+
+```
+CONDUCTOR_BIN=$(command -v conductor) python3 -m unittest tests.test_scope_key_binding
+# a local js engine build, until a release has ctx.memory.key:
+CONDUCTOR_BIN=… CONDUCTOR_JS_ENGINE=…/conductor-js python3 -m unittest tests.test_scope_key_binding
 ```

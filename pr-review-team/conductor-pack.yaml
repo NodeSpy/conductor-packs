@@ -50,10 +50,14 @@ pack:
   requires:
     # The daemon versions this pack supports. 0.69.0 is the floor for 3.0:
     # memory scope keys are templates over the step's facts
-    # (`standard:{{.repo}}`, `org:{{.owner}}`), and a step's
+    # (`standard:{{.repo}}`, `org:{{.owner}}`), a step's
     # `memory: { extra_scopes: [...] }` appends to the default scopes instead
     # of replacing them — the layering the lens panel reads under the
-    # scope_key setting. (A superset of the older floors: 0.57.0 for whole-PR review —
+    # scope_key setting — and `ctx.memory.key` hands a code step core's own
+    # scope-key renderer, which the pack renders every key it computes with.
+    # That binding also needs a js engine plugin that has it (newer than
+    # engines/js v1.2.0); a pack can't pin an engine version, so the
+    # `scopekeys` step checks for it and names the upgrade. (A superset of the older floors: 0.57.0 for whole-PR review —
     # the `checkout: checkout-pr` workspace jail and `github.pr_files`
     # patches — 0.54.0 for `decide:` steps, and 0.33.0 for the reactive
     # hand-off surface.)
@@ -301,9 +305,9 @@ x-templates:
   # lens panel reads <key>, standard:<key> and emphasis:<key> (core renders
   # the template for the review), and everything the pack does with a key
   # itself — emphasis for assess, mapping calibration's evidence PRs to keys,
-  # archiving a fresh train — renders it here, with one js port of core's
-  # renderer. Core has no js binding for it; this port is tested against
-  # core's own vectors. One step, three uses:
+  # archiving a fresh train — renders it here, through core's own renderer
+  # (`ctx.memory.key`, memory.RenderScopeKey), so the pack's keys are exactly
+  # the keys core reads. One step, three uses:
   #   review-flow  (ctx.inputs.repo/pr + the PR's metadata) -> { key }
   #   calibration  (ctx.collect.prs: [{ref, facts}])        -> { keys, key_list, unkeyed, text }
   #   before collect (nothing to render yet)                -> { needs_meta }
@@ -321,219 +325,57 @@ x-templates:
       // alias appears in this code for anything to expand.
       const repo = "$" + "{repo}", workflow = "$" + "{workflow}", step = "$" + "{step}";
       const TEMPLATE = String.raw`${settings.scope_key}`;
-      // ---- the scope-key renderer: core's memory.RenderScopeKey, in js ----
-      // A pipeline-only subset of Go text/template (default, coalesce, index,
-      // print, printf), rendered twice like core does — once for real, once
-      // with every empty fact replaced by a probe — so a key that reads a
-      // fact with no value ("", missing, a zero number) does not render.
-      // Tested against core's own vectors (tests/testdata/scope_key_vectors*.json).
-      const PROBE = "\u0000empty-fact\u0000";
-      const FUNCS = { "default": 1, coalesce: 1, index: 1, print: 1, printf: 1 };
-      const KEYWORDS = { "if": 1, range: 1, "with": 1, "else": 1, end: 1, define: 1, template: 1, block: 1, "break": 1, "continue": 1 };
-      const control = function (s) { return /[\u0000-\u001f\u007f-\u009f]/.test(s); };
-      const isMap = function (v) { return v !== null && typeof v === "object" && !Array.isArray(v); };
-      const empty = function (v) { return v === null || v === undefined || v === "" || v === PROBE; };
-      const NOVALUE = {};
-      const fmtv = function (v) {
-        if (v === undefined || v === null || v === NOVALUE) return "<no value>";
-        if (typeof v === "string") return v;
-        if (typeof v === "number" || typeof v === "boolean") return String(v);
-        if (Array.isArray(v)) return "[" + v.map(fmtv).join(" ") + "]";
-        return "map[" + Object.keys(v).sort().map(function (k) { return k + ":" + fmtv(v[k]); }).join(" ") + "]";
+      const setting = "pr-review-team: the scope_key setting " + JSON.stringify(TEMPLATE);
+      if (!TEMPLATE.trim()) throw new Error(setting + " is empty — leave it unset for the per-repo default, {{.repo}}");
+      // Every key is rendered by core (ctx.memory.key -> {key, ok, reason}).
+      // It needs no memory: section; it needs conductor >= 0.69.0 and a js
+      // engine that has the binding.
+      if (!ctx.memory || typeof ctx.memory.key !== "function")
+        throw new Error("pr-review-team: this conductor's js engine has no ctx.memory.key (core's scope-key renderer) — " +
+          "it needs conductor >= 0.69.0 and a js engine plugin that has the binding (newer than engines/js v1.2.0): run `conductor init` or `conductor plugin update`");
+      const render = function (facts) {
+        let r;
+        try { r = ctx.memory.key(TEMPLATE, facts); }
+        catch (e) { throw new Error("pr-review-team: ctx.memory.key failed (" + e.message + ") — the daemon needs conductor >= 0.69.0"); }
+        return r;
       };
-      const lexAction = function (src) {
-        const toks = []; let i = 0;
-        while (i < src.length) {
-          const c = src[i];
-          if (/\s/.test(c)) { i++; continue; }
-          if (c === "(" || c === ")" || c === "|") { toks.push({ t: c }); i++; continue; }
-          if (c === '"') {
-            let j = i + 1, s = "";
-            while (j < src.length && src[j] !== '"') {
-              if (src[j] === "\\") { const n = src[j + 1]; s += n === "n" ? "\n" : n === "t" ? "\t" : n; j += 2; } else s += src[j++];
-            }
-            if (j >= src.length) throw new Error("unterminated string");
-            toks.push({ t: "lit", v: s }); i = j + 1; continue;
-          }
-          if (c === "`") {
-            const j = src.indexOf("`", i + 1);
-            if (j < 0) throw new Error("unterminated raw string");
-            toks.push({ t: "lit", v: src.slice(i + 1, j) }); i = j + 1; continue;
-          }
-          let m = /^\.([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*)?/.exec(src.slice(i));
-          if (m) { toks.push({ t: "field", path: m[1] ? m[1].split(".") : [] }); i += m[0].length; continue; }
-          m = /^-?\d+(?:\.\d+)?/.exec(src.slice(i));
-          if (m) { toks.push({ t: "lit", v: Number(m[0]) }); i += m[0].length; continue; }
-          m = /^[A-Za-z_]\w*/.exec(src.slice(i));
-          if (m) {
-            const w = m[0];
-            if (KEYWORDS[w]) throw new Error(w + " is not allowed in a scope key");
-            if (w === "true" || w === "false") toks.push({ t: "lit", v: w === "true" });
-            else if (w === "nil") toks.push({ t: "lit", v: null });
-            else if (FUNCS[w]) toks.push({ t: "fn", v: w });
-            else throw new Error("function " + w + " is not allowed in a scope key");
-            i += w.length; continue;
-          }
-          throw new Error("unexpected " + JSON.stringify(c) + " in a scope key (no variables)");
-        }
-        return toks;
-      };
-      const parsePipe = function (toks, pos, close) {
-        const cmds = [[]];
-        while (pos < toks.length) {
-          const k = toks[pos];
-          if (k.t === ")") { if (!close) throw new Error("unexpected )"); return [cmds, pos + 1]; }
-          if (k.t === "|") { if (cmds[cmds.length - 1].length === 0) throw new Error("empty command"); cmds.push([]); pos++; continue; }
-          if (k.t === "(") { const r = parsePipe(toks, pos + 1, true); cmds[cmds.length - 1].push({ t: "pipe", cmds: r[0] }); pos = r[1]; continue; }
-          cmds[cmds.length - 1].push(k); pos++;
-        }
-        if (close) throw new Error("unclosed (");
-        if (cmds[cmds.length - 1].length === 0) throw new Error("empty pipeline");
-        return [cmds, pos];
-      };
-      const parseKey = function (key) {
-        let src = key;
-        for (const a of ["repo", "workflow", "step"]) src = src.split("$" + "{" + a + "}").join("{{." + a + "}}");
-        if (src.indexOf("{{") < 0) return null;
-        const nodes = []; let i = 0;
-        while (i < src.length) {
-          const o = src.indexOf("{{", i);
-          if (o < 0) { nodes.push({ text: src.slice(i) }); break; }
-          let text = src.slice(i, o), j = o + 2, trimRight = false;
-          if (src.slice(j, j + 2) === "- ") { text = text.replace(/\s+$/, ""); j += 2; }
-          if (text) nodes.push({ text: text });
-          let q = null, k = j;
-          for (; k < src.length; k++) {
-            const ch = src[k];
-            if (q) { if (ch === "\\" && q === '"') { k++; continue; } if (ch === q) q = null; continue; }
-            if (ch === '"' || ch === "`") { q = ch; continue; }
-            if (src.slice(k, k + 2) === "}}") break;
-          }
-          if (k >= src.length) throw new Error("unclosed action");
-          let body = src.slice(j, k);
-          if (/\s-$/.test(body)) { body = body.slice(0, -2); trimRight = true; }
-          i = k + 2;
-          if (trimRight) while (i < src.length && /\s/.test(src[i])) i++;
-          if (/^\/\*[\s\S]*\*\/$/.test(body.trim())) continue;
-          nodes.push({ pipe: parsePipe(lexAction(body), 0, false)[0] });
-        }
-        return nodes;
-      };
-      const field = function (facts, path) {
-        let cur = facts;
-        for (const seg of path) {
-          if (!isMap(cur)) throw new Error("can't evaluate field " + seg);
-          cur = Object.prototype.hasOwnProperty.call(cur, seg) ? cur[seg] : NOVALUE;
-          if (cur === null || cur === undefined) cur = NOVALUE;
-        }
-        return cur;
-      };
-      const arg = function (a, facts) {
-        if (a.t === "lit") return a.v;
-        if (a.t === "field") return field(facts, a.path);
-        if (a.t === "pipe") return runPipe(a.cmds, facts);
-        throw new Error("bad argument");
-      };
-      const unwrap = function (v) { return v === NOVALUE ? null : v; };
-      const call = function (fn, args) {
-        args = args.map(unwrap);
-        if (fn === "default") return (args.length < 2 || empty(args[1])) ? args[0] : args[1];
-        if (fn === "coalesce") { for (const v of args) if (!empty(v)) return v; return ""; }
-        if (fn === "index") {
-          let x = args[0];
-          if (x === null) throw new Error("index of untyped nil");
-          for (const k of args.slice(1)) {
-            if (Array.isArray(x)) { if (typeof k !== "number" || k < 0 || k >= x.length) throw new Error("index out of range"); x = x[k]; }
-            else if (isMap(x)) x = Object.prototype.hasOwnProperty.call(x, k) ? x[k] : null;
-            else throw new Error("can't index item");
-          }
-          return x;
-        }
-        const sv = function (v) { return v === null ? "<nil>" : fmtv(v); };
-        if (fn === "print") {
-          let out = "";
-          args.forEach(function (v, n) { if (n > 0 && typeof v !== "string" && typeof args[n - 1] !== "string") out += " "; out += sv(v); });
-          return out;
-        }
-        const f = String(args[0] == null ? "" : args[0]); let n = 1;
-        return f.replace(/%([%svdq])/g, function (m, c) {
-          if (c === "%") return "%";
-          if (n >= args.length) return "%!" + c + "(MISSING)";
-          const v = args[n++];
-          return c === "q" ? JSON.stringify(sv(v)) : sv(v);
-        });
-      };
-      const runPipe = function (cmds, facts) {
-        let val, piped = false;
-        for (const cmd of cmds) {
-          const head = cmd[0];
-          if (head.t === "fn") {
-            const args = cmd.slice(1).map(function (a) { return arg(a, facts); });
-            if (piped) args.push(val);
-            val = call(head.v, args);
-          } else {
-            if (cmd.length > 1 || piped) throw new Error("can't give argument to non-function");
-            val = arg(head, facts);
-          }
-          piped = true;
-        }
-        return val;
-      };
-      const exec = function (nodes, facts) {
-        return nodes.map(function (n) { return n.text !== undefined ? n.text : fmtv(runPipe(n.pipe, facts)); }).join("");
-      };
-      const probe = function (facts) {
-        const out = {};
-        for (const k of Object.keys(facts)) {
-          const v = facts[k];
-          out[k] = (v === null || v === undefined || v === "" || v === 0) ? PROBE : isMap(v) ? probe(v) : v;
-        }
-        return out;
-      };
-      // renderKey(key, facts) -> the key, or null when it does not apply.
-      const renderKey = function (key, facts) {
-        if (control(key)) return null;
-        let nodes;
-        try { nodes = parseKey(key); } catch (e) { return null; }
-        if (nodes === null) return key;
-        let out;
-        try { out = exec(nodes, facts); } catch (e) { return null; }
-        if (out.indexOf("<no value>") >= 0) return null;
-        try { if (exec(nodes, probe(facts)).indexOf(PROBE) >= 0) return null; } catch (e) { return null; }
-        out = out.trim();
-        if (out === "" || control(out)) return null;
-        return out;
-      };
-      // ---- end of the renderer ----
+      // WHICH facts the key reads — a lint, not a renderer: every field
+      // reference ({{.x}}, {{.inputs.x}}) outside quoted strings, after the
+      // aliases. Rendering itself is core's.
       const SUPPORTED = { repo: 1, owner: 1, name: 1, number: 1, pr: 1, kind: 1, title: 1, labels: 1, base: 1, url: 1 };
       const INPUTS = { repo: 1, pr: 1 };
       const META = { title: 1, labels: 1, base: 1, url: 1 };
-      const setting = "pr-review-team: the scope_key setting " + JSON.stringify(TEMPLATE);
-      if (!TEMPLATE.trim()) throw new Error(setting + " is empty — leave it unset for the per-repo default, {{.repo}}");
-      let nodes;
-      try { nodes = parseKey(TEMPLATE); } catch (e) { throw new Error(setting + " does not parse: " + e.message); }
+      const src = TEMPLATE.split(repo).join("{{.repo}}").split(workflow).join("{{.workflow}}").split(step).join("{{.step}}");
       const bad = []; let needsMeta = false;
-      const walk = function (cmds) {
-        for (const c of cmds) for (const a of c) {
-          if (a.t === "pipe") { walk(a.cmds); continue; }
-          if (a.t !== "field") continue;
-          const p = a.path;
-          const ok = p.length > 0 && (p[0] === "inputs" ? (p.length > 1 && INPUTS[p[1]] === 1) : SUPPORTED[p[0]] === 1);
-          if (!ok) bad.push("." + p.join("."));
+      const actions = src.match(/\{\{[\s\S]*?\}\}/g) || [];
+      for (const a of actions) {
+        const body = a.slice(2, -2).replace(/"(?:[^"\\]|\\.)*"|`[^`]*`/g, " ");
+        const refs = body.match(/(^|[^\w.)\]])\.[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*|(^|[^\w.)\]])\.(?![\w])/g) || [];
+        for (const raw of refs) {
+          const ref = raw.replace(/^[^.]/, "");
+          const p = ref === "." ? [] : ref.slice(1).split(".");
+          const ok = p.length > 0 && (p[0] === "inputs" ? (p.length === 2 && INPUTS[p[1]] === 1) : (p.length === 1 && SUPPORTED[p[0]] === 1));
+          if (!ok) bad.push(ref === "." ? "{{.}}" : ref);
           if (p.length > 0 && META[p[0]]) needsMeta = true;
         }
-      };
-      for (const n of (nodes || [])) if (n.pipe) walk(n.pipe);
+      }
       if (bad.length) throw new Error(setting + " reads " + bad.join(", ") + " — a key may read only repo, owner, name, number, pr, kind, title, " +
         "labels, base, url, inputs.repo and inputs.pr: calibration rebuilds those for a past PR, and learning keyed on anything else could never land where reviews read it");
+      // ...and it must render once every fact it may read has a value: core
+      // refuses a malformed key or a construct a key may not use ({{if}}, a
+      // variable) the same way, so the operator hears it now, not as a
+      // review that silently reads nothing.
+      const full = render({ repo: "o/n", owner: "o", name: "n", number: 1, pr: 1, kind: "review_requested", title: "t",
+                            labels: ["l", "l", "l", "l", "l", "l", "l", "l"], base: "b", url: "u", inputs: { repo: "o/n", pr: 1 } });
+      if (!full.ok) throw new Error(setting + " does not render: " + full.reason);
       const labelsOf = function (ls) { return (ls || []).map(function (l) { return typeof l === "string" ? l : (l && l.name) || ""; }).filter(Boolean); };
       if (ctx.collect && ctx.collect.prs) {
         const keys = {}, byKey = {}, unkeyed = [];
         for (const p of ctx.collect.prs) {
-          const k = renderKey(TEMPLATE, p.facts || {});
-          if (k === null) { unkeyed.push(p.ref); continue; }
-          keys[p.ref] = k;
-          (byKey[k] = byKey[k] || []).push(p.ref);
+          const r = render(p.facts || {});
+          if (!r.ok) { unkeyed.push(p.ref); continue; }
+          keys[p.ref] = r.key;
+          (byKey[r.key] = byKey[r.key] || []).push(p.ref);
         }
         const list = Object.keys(byKey).sort();
         const text = list.map(function (k) { return "- " + k + ": " + byKey[k].join(", "); }).join("\n") +
@@ -549,8 +391,8 @@ x-templates:
         if (m.labels !== undefined) facts.labels = labelsOf(m.labels);
         if (m.base !== undefined) facts.base = m.base;
         if (m.url !== undefined) facts.url = m.url;
-        const k = renderKey(TEMPLATE, facts);
-        return { key: k === null ? "" : k, applies: k !== null };
+        const r = render(facts);
+        return { key: r.ok ? r.key : "", applies: r.ok };
       }
       return { needs_meta: needsMeta };
 
