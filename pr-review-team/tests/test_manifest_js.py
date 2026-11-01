@@ -136,6 +136,9 @@ def keys_for(refs, template="{{.repo}}"):
 
 RUN = ("acme/api#1", "acme/api#2", "acme/api#3", "acme/api#4", "acme/api#5", "acme/api#6", "acme/api#7", "acme/api#9",
        "acme/web#1", "acme/web#2", "acme/web#3", "other/svc#3")
+FENCE = "ev0123456789abcdef"
+# collect's output as the plan sees it: every PR carries trusted evidence, none an owner catch
+COLLECTED = {"fence": FENCE, "trusted_refs": list(RUN), "owner_refs": []}
 
 
 class PlanTest(unittest.TestCase):
@@ -149,7 +152,7 @@ class PlanTest(unittest.TestCase):
         cls.repo_keys = keys_for(RUN)
 
     def plan(self, entries, keys=None, known=(), via="calibrate"):
-        ctx = {"keys": keys or self.repo_keys, "known": {"list": list(known)}, via: {"entries": entries}}
+        ctx = {"keys": keys or self.repo_keys, "known": {"list": list(known)}, via: {"entries": entries}, "collect": COLLECTED}
         return run_js(self.code, ctx)
 
     def test_each_kind_lands_in_its_own_scope(self):
@@ -278,7 +281,7 @@ class OwnerKeyTest(unittest.TestCase):
         cls.keys = keys_for(RUN, "org:{{.owner}}")
 
     def plan(self, entries):
-        return run_js(self.plan_code, {"keys": self.keys, "known": {"list": []}, "calibrate": {"entries": entries}})
+        return run_js(self.plan_code, {"keys": self.keys, "known": {"list": []}, "calibrate": {"entries": entries}, "collect": COLLECTED})
 
     def test_prs_of_one_owner_map_to_one_key(self):
         k = self.keys
@@ -791,7 +794,7 @@ class FreshTrainTest(unittest.TestCase):
 
     def test_plan_does_not_dedup_against_what_was_archived(self):
         known = [{"id": "a2", "scope": "standard:acme/api", "text": "learned standard"}]
-        ctx = {"keys": keys_for(["acme/api#1"]), "known": {"list": known}, "archive": {"ids": ["a2"]},
+        ctx = {"keys": keys_for(["acme/api#1"]), "known": {"list": known}, "archive": {"ids": ["a2"]}, "collect": COLLECTED,
                "merge": {"entries": [entry("acme/api", "standard", "learned standard", ["acme/api#1"], supersedes="a2")]}}
         out = run_js(self.plan, ctx)
         self.assertEqual([w["scope"] for w in out["writes"]], ["standard:acme/api"])   # re-learned, not "already recorded"

@@ -15,6 +15,7 @@ import datetime as dt
 import json
 import os
 import re
+import secrets
 import subprocess
 import sys
 
@@ -173,10 +174,14 @@ def clone(repo, fetched):
     return fetched[repo]
 
 
-def human_comments(repo, since, max_pages, skip_login=None, truncated=None):
+def human_comments(repo, since, max_pages, skip_login=None, truncated=None, trusted=None, dropped=None, owner=None):
     """Top-level inline review comments on repo's PRs created after `since`, newest first,
-    by humans (bots and replies dropped; skip_login's dropped too when given). When the
-    page cap ends the read before `since` is reached, repo is appended to `truncated`."""
+    by humans (bots and replies dropped; skip_login's dropped too when given). With
+    `trusted` (a set of author_association values), a comment counts only when its
+    author's association is in it — or its author is `owner`, the reviewer's own
+    account; everything else (bots included) is dropped and counted in `dropped`
+    by reason. When the page cap ends the read before `since` is reached, repo is
+    appended to `truncated`."""
     if not valid_repo(repo):
         return
     for page in range(1, max_pages + 1):
@@ -187,17 +192,111 @@ def human_comments(repo, since, max_pages, skip_login=None, truncated=None):
             ts = iso(c["created_at"])
             if ts <= since:
                 return
+            if c.get("in_reply_to_id"):
+                continue
             u = c.get("user") or {}
             login = u.get("login", "")
-            if u.get("type") == "Bot" or login.endswith("[bot]") or c.get("in_reply_to_id"):
+            if u.get("type") == "Bot" or login.endswith("[bot]"):
+                if dropped is not None:
+                    dropped["bot"] = dropped.get("bot", 0) + 1
                 continue
             if skip_login and login == skip_login:
                 continue
+            if trusted is not None and not (owner and login == owner):
+                assoc = str(c.get("author_association") or "unknown")
+                if assoc not in trusted:
+                    if dropped is not None:
+                        dropped[assoc] = dropped.get(assoc, 0) + 1
+                    continue
             yield ts, login, c
         if len(batch) < 100:
             return
     if truncated is not None:
         truncated.append(repo)
+
+
+# ---------------------------------------------------------------------------
+# Training-data hygiene. What calibration and backfill read — PR titles and
+# bodies, commit messages, patches, comments — is written by people the
+# reviewer doesn't answer to, and whatever it learns is read by every later
+# review. So: comments count only from trusted authors (the
+# trusted_associations setting, by GitHub author_association), and every
+# piece of that text reaches an agent fenced as data — control characters
+# stripped, long items cut, inside <<<TOKEN … TOKEN>>> with a token drawn
+# fresh each run, so text written before the run can't close the fence.
+# ---------------------------------------------------------------------------
+
+ASSOCIATIONS = ("OWNER", "MEMBER", "COLLABORATOR", "CONTRIBUTOR", "FIRST_TIME_CONTRIBUTOR", "FIRST_TIMER", "MANNEQUIN", "NONE")
+TRUSTED_DEFAULT = "OWNER,MEMBER,COLLABORATOR"
+ITEM_CAP = 600          # chars of one fenced item
+CTRL_RE = re.compile("[\x00-\x08\x0b-\x1f\x7f-\x9f\u200b-\u200f\u2028-\u202e\u2060-\u2069\ufeff]")
+TOKEN_RE = re.compile(r"ev[0-9a-f]{16}", re.I)
+
+
+def trusted_associations():
+    raw = (os.environ.get("TRUSTED_ASSOCIATIONS") or "").strip() or TRUSTED_DEFAULT
+    if raw.lower() == "none":
+        return set()
+    out = set()
+    for a in re.split(r"[\s,]+", raw.upper()):
+        if not a:
+            continue
+        if a not in ASSOCIATIONS:
+            raise SystemExit("pr-review-team: the trusted_associations setting takes GitHub author associations (%s) "
+                             "or none, got %r" % (", ".join(ASSOCIATIONS), a))
+        out.add(a)
+    return out
+
+
+class Fence:
+    """Untrusted text as data: fence(text) -> "<<<TOKEN text TOKEN>>>" (lines=True keeps
+    line breaks and puts the markers on lines of their own)."""
+
+    def __init__(self, token=None):
+        self.token = token or "ev" + secrets.token_hex(8)
+
+    def clean(self, text, limit=ITEM_CAP, lines=False):
+        t = CTRL_RE.sub(" ", str(text or ""))
+        t = TOKEN_RE.sub("[fence]", t)   # this run's token, or one guessed or seen before
+        t = t.replace("<<<", "<< <").replace(">>>", "> >>")
+        t = "\n".join(l.rstrip() for l in t.splitlines()) if lines else " ".join(t.split())
+        if len(t) > limit:
+            t = t[:limit] + " …[cut at %d chars]" % limit
+        return t
+
+    def __call__(self, text, limit=ITEM_CAP, lines=False):
+        t = self.clean(text, limit, lines)
+        if lines:
+            return "<<<%s\n%s\n%s>>>" % (self.token, t, self.token)
+        return "<<<%s %s %s>>>" % (self.token, t, self.token)
+
+
+def commit_trust(repo, sha, trusted, me):
+    """Who a follow-up commit came from: the PR GitHub associates it with, judged by its
+    author's association (or the reviewer's own account). A commit with no PR was pushed
+    straight to the branch, which takes write access. -> (trusted?, reason)."""
+    prs = gh_json("repos/%s/commits/%s/pulls" % (repo, sha)) if valid_repo(repo) and re.fullmatch(r"[0-9a-f]{7,40}", sha) else None
+    if not isinstance(prs, list):
+        return False, "unknown"
+    if not prs:
+        return True, "push"
+    for p in prs:
+        if (p.get("user") or {}).get("login") == me or str(p.get("author_association") or "") in trusted:
+            return True, "pr"
+    return False, str(prs[0].get("author_association") or "unknown")
+
+
+def cap_items(items, limit, what):
+    """Join items (each a line, or a fenced multi-line block) up to `limit` chars,
+    dropping whole items past it — a fence is never cut in half."""
+    out, size = [], 0
+    for i, it in enumerate(items):
+        if size + len(it) + 1 > limit:
+            out.append("…[%d more item(s) cut: %s over %d chars]" % (len(items) - i, what, limit))
+            break
+        out.append(it)
+        size += len(it) + 1
+    return "\n".join(out) + "\n"
 
 
 def norm(text):
@@ -412,7 +511,9 @@ def collect_calibration():
     TEAM_PAGES = env_int("TEAM_PAGES", 15)
 
     require_audit()
+    trusted = trusted_associations()
     me = gh_login()
+    fence, untrusted = Fence(), {}
     cache = cache_dir()
     mark = os.path.join(cache, "calibration.json")
     t_now = now()
@@ -499,12 +600,20 @@ def collect_calibration():
             n = len(added_lines(d, h, "-") & added)
             if n >= MIN_LINES:
                 touched = sorted({f for f, _ in added_lines(d, h, "-") & added})
-                hits.append({"sha": h[:10], "lines": n,
+                hits.append({"sha": h[:10], "full": h, "lines": n,
                              "message": git(d, "log", "-1", "--format=%s%n%n%b", h).strip()[:600],
                              "patch": cap(git(d, "show", "-U3", "--format=", h, "--", *touched), PATCH_CAP, "patch")})
-        if hits:
+        kept = []
+        for hit in sorted(hits, key=lambda x: -x["lines"])[:4]:
+            ok, why = commit_trust(r["repo"], hit.pop("full"), trusted, me)
+            if ok:
+                kept.append(hit)
+            else:   # learn only from trusted authors: a commit from an outside PR is not evidence
+                k = "follow-up commit (%s)" % why
+                untrusted[k] = untrusted.get(k, 0) + 1
+        if kept:
             r_subjects = [git(d, "log", "-1", "--format=%h %s", h).strip() for h in r["own"][:5]]
-            followups[key] = {"own": r_subjects, "hits": sorted(hits, key=lambda x: -x["lines"])[:4]}
+            followups[key] = {"own": r_subjects, "hits": kept}
 
     # 2b. Hand-off outcomes: a draft handed to a human instead of posted,
     #     compared with what was actually posted (or not, within DISCARD_DAYS).
@@ -533,6 +642,7 @@ def collect_calibration():
         if key not in pending or pending[key]["at"] < h["at"]:
             pending[key] = h
     outcomes, handoff_repos = [], set()
+    outcome_refs, owner_outcomes = set(), set()   # every outcome is the owner's call; edits and discards correct the draft
     for key, h in sorted(pending.items()):
         if not valid_repo(key.rsplit("#", 1)[0]):
             invalid.add(key.rsplit("#", 1)[0])
@@ -542,31 +652,35 @@ def collect_calibration():
         if not after:
             if iso(h["at"]) < t_now - dt.timedelta(days=DISCARD_DAYS):
                 outcomes.append("%s (handed off %s): DISCARDED — not posted within %d days" % (key, h["at"][:10], DISCARD_DAYS))
+                outcome_refs.add(key)
+                owner_outcomes.add(key)
                 handoff_repos.add(key.split("#")[0])
                 del pending[key]
             continue
         del pending[key]
         handoff_repos.add(key.split("#")[0])
+        outcome_refs.add(key)
         d, posted = h.get("draft") or {}, after[0]
         dc, pc = norm_comments(d.get("comments")), norm_comments(posted.get("comments"))
         diff = []
         if (d.get("event") or "") != (posted.get("event") or ""):
-            diff.append("verdict %s -> %s" % (d.get("event"), posted.get("event")))
+            diff.append("verdict %s -> %s" % (fence.clean(d.get("event"), 40), fence.clean(posted.get("event"), 40)))
         if " ".join((d.get("body") or "").split()) != " ".join((posted.get("body") or "").split()):
-            diff.append("body: %r -> %r" % ((d.get("body") or "")[:200], (posted.get("body") or "")[:200]))
+            diff.append("body: %s -> %s" % (fence(d.get("body"), 200), fence(posted.get("body"), 200)))
         for k in dc.keys() - pc.keys():
-            diff.append("DROPPED %s:%s %s" % (k[0], k[1], dc[k][:300]))
+            diff.append("DROPPED %s" % fence("%s:%s %s" % (k[0], k[1], dc[k]), 400))
         for k in pc.keys() - dc.keys():
-            diff.append("ADDED %s:%s %s" % (k[0], k[1], pc[k][:300]))
+            diff.append("ADDED %s" % fence("%s:%s %s" % (k[0], k[1], pc[k]), 400))
         for k in dc.keys() & pc.keys():
             if dc[k] != pc[k]:
-                diff.append("REWORDED %s:%s %r -> %r" % (k[0], k[1], dc[k][:200], pc[k][:200]))
+                diff.append("REWORDED %s -> %s" % (fence("%s:%s %s" % (k[0], k[1], dc[k]), 300), fence(pc[k], 300)))
         if not d:
             outcomes.append("%s (handed off %s): posted, draft not recorded" % (key, h["at"][:10]))
         elif not diff:
             outcomes.append("%s (handed off %s): POSTED AS-IS" % (key, h["at"][:10]))
         else:
             outcomes.append("%s (handed off %s): EDITED before posting" % (key, h["at"][:10]))
+            owner_outcomes.add(key)
             outcomes += ["    - " + x for x in diff]
 
     # 2c. OWNER CATCHES. Reviews post as the reviewer's own account, so what that account
@@ -594,7 +708,8 @@ def collect_calibration():
                 seen_dismissed.add(text)
             elif not (ts > first and ts > last and ts <= end):
                 continue
-            got.append("    - OWNER %s%s: %s" % (label, "" if ts is None else " (" + ts.strftime("%Y-%m-%d") + ")", text))
+            got.append("    - OWNER%s: %s" % ("" if ts is None else " (" + ts.strftime("%Y-%m-%d") + ")",
+                                              fence("%s: %s" % (label, text), 900)))
         r["dismissed"] = sorted(seen_dismissed)
         if got:
             catches[key] = got
@@ -603,25 +718,25 @@ def collect_calibration():
     repos = sorted({r["repo"] for r in tracked.values()} | handoff_repos)
     team = {}
     for repo in repos:
-        for _, login, c in human_comments(repo, last, TEAM_PAGES, skip_login=me):
+        for _, login, c in human_comments(repo, last, TEAM_PAGES, skip_login=me, trusted=trusted, dropped=untrusted):
             pr = int(c["pull_request_url"].rsplit("/", 1)[-1])
             team.setdefault("%s#%d" % (repo, pr), []).append({
-                "by": login, "path": c.get("path"), "body": " ".join((c.get("body") or "").split())[:300]})
+                "by": fence.clean(login, 60), "path": c.get("path"), "body": c.get("body") or ""})
 
     def review_lines(key, head):
         r = tracked.get(key)
         if not r:
             return [head]
-        out = ["%s (reviewed %s, %s): %s" % (head, r["at"], r["event"], r["body"])]
-        out += ["    - %s:%s %s" % (c["path"], c["line"], c["body"]) for c in r["comments"]]
+        out = ["%s (reviewed %s, %s): %s" % (head, r["at"], fence.clean(r["event"], 40), fence(r["body"], 300))]
+        out += ["    - " + fence("%s:%s %s" % (c["path"], c["line"], c["body"]), 400) for c in r["comments"]]
         return out
 
     def followup_lines(key):
         fu = followups[key]
-        out = ["    PR commits: " + "; ".join(fu["own"])]
+        out = ["    PR commits: " + fence("; ".join(fu["own"]), 600)]
         for h in fu["hits"]:
-            out.append("    FOLLOW-UP %s changed %d of its lines: %s" % (h["sha"], h["lines"], h["message"].replace("\n", " / ")))
-            out += ["      " + x for x in h["patch"].splitlines()]
+            out.append("    FOLLOW-UP %s changed %d of its lines: %s" % (h["sha"], h["lines"], fence(h["message"].replace("\n", " / "), 600)))
+            out.append(fence(h["patch"], PATCH_CAP + 200, lines=True))
         return out
 
     out = ["# NEW REVIEWS since the last run"]
@@ -648,7 +763,7 @@ def collect_calibration():
             team_lines += review_lines(key, key + " [ALSO REVIEWED BY THE BOT — compare]")
         else:
             team_lines.append(key)
-        team_lines += ["    - TEAM %s %s: %s" % (c["by"], c["path"], c["body"]) for c in cs[:6]]
+        team_lines += ["    - TEAM %s %s" % (c["by"], fence("%s: %s" % (c["path"], c["body"]), 400)) for c in cs[:6]]
 
     # The next state is promoted by `record` only once the memory writes have
     # landed, so a failed calibration re-reads the same window next time.
@@ -658,12 +773,20 @@ def collect_calibration():
         "count": len(new_keys), "flagged": len(followups), "since": last.date().isoformat(),
         "handoffs": sum(1 for o in outcomes if not o.startswith("    ")),
         "repos": repos, "reviewer": me,
-        "reviews": cap("\n".join(out) + "\n", REVIEWS_CAP, "reviews"),
-        "owner": cap("\n".join(owner_lines) + "\n", OWNER_CAP, "owner catches"),
+        "reviews": cap_items(out, REVIEWS_CAP, "reviews"),
+        "owner": cap_items(owner_lines, OWNER_CAP, "owner catches"),
         "owner_count": sum(len(v) for v in catches.values()), "owner_prs": len(catches),
-        "team": cap("\n".join(team_lines) + "\n", TEAM_CAP, "team comments"),
+        "team": cap_items(team_lines, TEAM_CAP, "team comments"),
         "team_count": sum(len(v) for v in team.values()), "team_prs": len(team), "team_both": both,
         "invalid_repos": sorted(invalid),
+        # the fence token the evidence above is wrapped in, what was dropped as
+        # untrusted (by reason), and which PRs carry trusted evidence: a learned
+        # entry must cite one of trusted_refs, and only owner_refs (an owner catch,
+        # or a hand-off the owner edited or discarded) let one that would make the
+        # reviewer go easier on something be read by reviews (the pack's plan step)
+        "fence": fence.token, "untrusted": untrusted, "trusted_associations": sorted(trusted),
+        "trusted_refs": sorted(set(followups) | set(catches) | set(team) | set(owner_outcomes) | set(outcome_refs)),
+        "owner_refs": sorted(set(catches) | set(owner_outcomes)),
         # every PR the agent is shown, with its facts, for the pack's `keys` step
         "prs": facts_for(list(new_keys) + list(followups) + list(catches) + list(team)
                          + [o.split(" ", 1)[0] for o in outcomes if not o.startswith(" ")]),
@@ -710,7 +833,9 @@ def collect_backfill(ctx):
     days = int(raw_days) if raw_days.isdigit() else 365
     max_pages = env_int("MAX_PAGES", 300)
     min_chars = env_int("MIN_CHARS", 40)
+    trusted = trusted_associations()
     me = gh_login()
+    fence, untrusted = Fence(), {}
     since_raw = (os.environ.get("REVIEWER_SINCE") or "").strip()
     pack_since = iso(since_raw + "T00:00:00+00:00") if since_raw else first_post_by_pack()
     # Your own comments from the pack's era are yours unless the pack posted them: the
@@ -722,7 +847,7 @@ def collect_backfill(ctx):
     since = dt.datetime(1970, 1, 1, tzinfo=dt.timezone.utc) if whole else t_now - dt.timedelta(days=days)
     months, counts, truncated, pack_dropped = {}, {}, [], 0
     for repo in repos:
-        for ts, login, c in human_comments(repo, since, max_pages, truncated=truncated):
+        for ts, login, c in human_comments(repo, since, max_pages, truncated=truncated, trusted=trusted, dropped=untrusted, owner=me):
             if login == me and pack_since and ts >= pack_since:
                 pr = int(c["pull_request_url"].rsplit("/", 1)[-1])
                 posts = posts_by_pr.get("%s#%d" % (repo, pr))
@@ -737,16 +862,17 @@ def collect_backfill(ctx):
             body = " ".join((c.get("body") or "").split())
             if len(body) < min_chars:
                 continue
-            who = "MINE" if login == me else "TEAM " + login
+            who = "MINE" if login == me else "TEAM " + fence.clean(login, 60)
             m = ts.strftime("%Y-%m")
             pr = c["pull_request_url"].rsplit("/", 1)[-1]
-            months.setdefault(m, {}).setdefault("%s#%s" % (repo, pr), []).append("    - %s %s: %s" % (who, c.get("path"), body[:400]))
+            months.setdefault(m, {}).setdefault("%s#%s" % (repo, pr), []).append(
+                "    - %s %s" % (who, fence("%s: %s" % (c.get("path"), body), 500)))
             k = counts.setdefault(m, {"mine": 0, "team": 0})
             k["mine" if login == me else "team"] += 1
     out = []
     for m in sorted(months):
-        text = "".join(key + "\n" + "\n".join(months[m][key]) + "\n" for key in sorted(months[m]))
-        out.append({"month": m, "text": cap(text, MONTH_CAP, "month"), "mine": counts[m]["mine"], "team": counts[m]["team"]})
+        items = [line for key in sorted(months[m]) for line in [key] + months[m][key]]
+        out.append({"month": m, "text": cap_items(items, MONTH_CAP, "month"), "mine": counts[m]["mine"], "team": counts[m]["team"]})
     if truncated:
         sys.stderr.write("pr-review-team: review-backfill read only %d pages for %s — older comments were NOT read. "
                          "Raise the backfill_max_pages setting to read the whole window.\n" % (max_pages, ", ".join(truncated)))
@@ -754,6 +880,11 @@ def collect_backfill(ctx):
             "since": "all" if whole else since.date().isoformat(),
             "mine": sum(o["mine"] for o in out), "team": sum(o["team"] for o in out),
             "truncated": truncated, "max_pages": max_pages, "pack_dropped": pack_dropped,
+            # see collect-calibration: every comment kept here is from a trusted author, so
+            # every PR it names is trusted evidence; none is an owner catch (backfill reads
+            # comments, not corrections of the pack's reviews)
+            "fence": fence.token, "untrusted": untrusted, "trusted_associations": sorted(trusted),
+            "trusted_refs": sorted({k for m in months.values() for k in m}), "owner_refs": [],
             "prs": facts_for([k for m in months.values() for k in m])}
 
 
@@ -880,6 +1011,10 @@ def eval_report(ctx):
     return {"summary": summary, "path": path, "totals": totals}
 
 
+def shell_quote(v):
+    return "'" + str(v or "").replace("'", "'\\''") + "'"
+
+
 def iso_str(t):
     return t.strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -906,10 +1041,34 @@ def record(ctx):
     written = ((ctx.get("write") or {}).get("items")) or []
     lines = ["", "## %s — review %s" % (now().strftime("%Y-%m-%d %H:%M UTC"), mode)]
     writes = plan.get("writes") or []
-    lines.append("Written (%d):" % len(writes))
+    held = [(i, w) for i, w in enumerate(writes) if w.get("quarantined")]
+    lines.append("Written (%d):" % (len(writes) - len(held)))
     for i, w in enumerate(writes):
+        if w.get("quarantined"):
+            continue
         got = written[i] if i < len(written) and isinstance(written[i], dict) else {}
         lines.append("- %s [%s] %s" % (got.get("id") or "?", w.get("label") or w.get("scope") or "global", w.get("text", "")))
+    if held:
+        # an entry that would make reviews go easier on something, with no owner
+        # catch behind it: written where no review reads it, for the owner to judge
+        lines.append("QUARANTINED (%d) — each would tell reviewers to go easier on something (approve, skip, ignore, "
+                     "trust, lower severity …) and no owner catch backs it, so it was written to quarantine:<key>, "
+                     "which no review reads. Read the exact text; to use one, move it by hand:" % len(held))
+        for i, w in held:
+            got = written[i] if i < len(written) and isinstance(written[i], dict) else {}
+            lines.append("- %s [%s, would be %s] %r" % (got.get("id") or "?", w.get("scope"), w.get("target"), w.get("text", "")))
+            lines.append("    conductor memory rescope --scope %s --tag %s --to %s --apply" % (
+                shell_quote(w.get("scope")), shell_quote(w.get("hold_tag")), shell_quote(w.get("target_scope") or "global")))
+    collect = ctx.get("collect") or {}
+    untrusted = collect.get("untrusted") or {}
+    if untrusted:
+        lines.append("Untrusted, not read (%d) — only %s count: %s" % (
+            sum(untrusted.values()), ", ".join(collect.get("trusted_associations") or []) or "your own account",
+            ", ".join("%s %d" % (k, v) for k, v in sorted(untrusted.items()))))
+    injections = plan.get("injections") if "injections" in plan else ((ctx.get("patterns") or {}).get("injections") or [])
+    if injections:
+        lines.append("Instructions found inside the evidence (%d) — reported, not learned:" % len(injections))
+        lines += ["- %r" % str(x) for x in injections]
     archived = ((ctx.get("archive") or {}).get("items")) or []
     if archived:
         lines.append("Archived (fresh train) (%d):" % len(archived))
@@ -919,7 +1078,7 @@ def record(ctx):
     if trunc:
         lines.append("TRUNCATED by backfill_max_pages (older comments not read): " + ", ".join(trunc))
     for key, title in (("downgraded", "Downgraded (global resting on one key)"), ("superseded", "Superseded"),
-                       ("rejected", "Rejected (out of scope)"), ("dropped", "Dropped")):
+                       ("rejected", "Rejected"), ("dropped", "Dropped")):
         items = plan.get(key) or []
         if items:
             lines.append("%s (%d):" % (title, len(items)))
@@ -946,7 +1105,7 @@ def record(ctx):
         if os.path.exists(nxt):
             os.replace(nxt, os.path.join(cache, "calibration.json"))
             promoted = True
-    return {"written": len(writes), "rejected": len(plan.get("rejected") or []),
+    return {"written": len(writes) - len(held), "quarantined": len(held), "rejected": len(plan.get("rejected") or []),
             "downgraded": len(plan.get("downgraded") or []),
             "archived": len(archived), "truncated": trunc,
             "dropped": len(plan.get("dropped") or []), "promoted": promoted,

@@ -161,7 +161,7 @@ class BindingTest(unittest.TestCase):
                 self.assertEqual((g["ok"], g["key"]), (True, c["want"]), c["template"])
 
     def test_cores_vectors(self):
-        self.check("scope_key_vectors.json", "core", 40)
+        self.check("scope_key_vectors.json", "core", 66)
 
     def test_extra_cases(self):
         self.check("scope_key_vectors_extra.json", "extra", 48)

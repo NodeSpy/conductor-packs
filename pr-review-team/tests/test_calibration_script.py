@@ -31,6 +31,9 @@ FAKE_GH = textwrap.dedent('''\
         if path.endswith("/pulls/comments"):
             print(open(os.environ["FAKE_COMMENTS"]).read() if page == "page=1" else "[]"); sys.exit(0)
         api = json.load(open(os.environ["FAKE_API"]))
+        parts = path.split("/")
+        if len(parts) == 6 and parts[3] == "commits" and parts[5] == "pulls" and path not in api:
+            path = "/".join(parts[:4] + ["*", "pulls"])   # one answer for every commit
         if path in api:
             print(json.dumps(api[path]) if page == "page=1" else "[]"); sys.exit(0)
     sys.exit(1)
@@ -39,6 +42,15 @@ FAKE_GH = textwrap.dedent('''\
 
 def iso(t):
     return t.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+FENCED = r"<<<(ev[0-9a-f]{16}) (.*?) \1>>>"
+
+
+def unfence(text):
+    """The evidence with its fences taken off (each item's text, in place)."""
+    import re
+    return re.sub(FENCED, r"\2", text)
 
 
 class Fixture:
@@ -63,6 +75,9 @@ class Fixture:
             json.dump(cs, f)
 
     def set_api(self, paths):
+        # a follow-up commit with no PR was pushed straight to the branch (trusted),
+        # unless a test says otherwise
+        paths = dict({"repos/acme/api/commits/*/pulls": []}, **paths)
         with open(self.api, "w") as f:
             json.dump(paths, f)
 
@@ -133,6 +148,7 @@ class CollectCalibrationTest(unittest.TestCase):
         )
         self.f.set_comments([
             {"created_at": iso(n - dt.timedelta(hours=5)), "user": {"login": "bob", "type": "User"}, "in_reply_to_id": None,
+             "author_association": "MEMBER",
              "path": "handler.go", "body": "the store error is swallowed here", "pull_request_url": "x/pulls/1"},
             {"created_at": iso(n - dt.timedelta(hours=5)), "user": {"login": "ci[bot]", "type": "Bot"}, "in_reply_to_id": None,
              "path": "x", "body": "bot noise", "pull_request_url": "x/pulls/1"},
@@ -156,9 +172,9 @@ class CollectCalibrationTest(unittest.TestCase):
         self.assertIn("loadErr", out["reviews"])              # the follow-up's patch is inline
         self.assertEqual(out["handoffs"], 1)
         self.assertIn("EDITED before posting", out["reviews"])
-        self.assertIn("DROPPED a.go:3 nit: rename", out["reviews"])
+        self.assertRegex(out["reviews"], r"DROPPED <<<(ev[0-9a-f]{16}) a.go:3 nit: rename \1>>>")
         self.assertEqual(out["team_count"], 1)                # bots and the reviewer excluded
-        self.assertIn("TEAM bob handler.go", out["team"])
+        self.assertRegex(out["team"], r"TEAM bob <<<(ev[0-9a-f]{16}) handler.go: the store error is swallowed here \1>>>")
         self.assertIn("[ALSO REVIEWED BY THE BOT", out["team"])
         cache = os.path.join(self.f.state, "pr-review-team")
         self.assertTrue(os.path.isdir(os.path.join(cache, "clones", "acme", "api", ".git")))
@@ -284,14 +300,12 @@ class OwnerCatchTest(unittest.TestCase):
         self.assertEqual((out["owner_count"], out["owner_prs"]), (3, 1))
         owner = out["owner"]
         self.assertIn("acme/api#1 (reviewed", owner)                         # the pack's review, for context
-        self.assertIn("OWNER REVIEW CHANGES_REQUESTED", owner)
-        self.assertIn("this breaks the deploy job", owner)
-        self.assertRegex(owner, r"OWNER INLINE handler.go:3 \(reply to the pack's comment: pack inline note\) "
-                                r"\(\d{4}-\d\d-\d\d\): the nil check here is wrong")
-        self.assertIn("OWNER COMMENT", owner)
-        self.assertIn("missed the migration", owner)
-        self.assertNotIn("OWNER REVIEW APPROVED", owner)                    # the pack's own approval
-        self.assertNotIn("OWNER INLINE handler.go:3: pack inline note", owner)   # the pack's own inline comment
+        self.assertRegex(owner, r"OWNER \(\d{4}-\d\d-\d\d\): <<<(ev[0-9a-f]{16}) REVIEW CHANGES_REQUESTED: this breaks the deploy job \1>>>")
+        self.assertRegex(owner, r"OWNER \(\d{4}-\d\d-\d\d\): <<<(ev[0-9a-f]{16}) INLINE handler.go:3 "
+                                r"\(reply to the pack's comment: pack inline note\): the nil check here is wrong \1>>>")
+        self.assertIn("COMMENT: missed the migration", unfence(owner))
+        self.assertNotIn("REVIEW APPROVED", owner)                    # the pack's own approval
+        self.assertNotIn("INLINE handler.go:3: pack inline note", owner)   # the pack's own inline comment
         self.assertNotIn("bob's own review", owner)
 
     def test_before_the_pack_reviewed_is_not_a_catch(self):
@@ -315,7 +329,7 @@ class OwnerCatchTest(unittest.TestCase):
         self.api(extra_reviews=[rv(12, "rev", t0 + d(days=1), "CHANGES_REQUESTED", "looks good")])
         out = self.collect()
         self.assertEqual(out["owner_count"], 1)
-        self.assertIn("OWNER REVIEW CHANGES_REQUESTED", out["owner"])
+        self.assertIn("REVIEW CHANGES_REQUESTED: looks good", unfence(out["owner"]))
 
     def test_pack_inline_comments_are_known_by_review_or_by_body(self):
         # one carries the pack review's id (its body since edited), one the audited body
@@ -325,12 +339,12 @@ class OwnerCatchTest(unittest.TestCase):
                          cm(102, "rev", t0 + d(seconds=40), "pack inline note", review=None, line=4)])
         out = self.collect()
         self.assertEqual(out["owner_count"], 0)
-        self.assertNotIn("OWNER INLINE", out["owner"])
+        self.assertNotIn("INLINE", out["owner"])
 
     def test_a_dismissed_pack_review_is_reported_once(self):
         self.api(pack_state="DISMISSED")
         out = self.collect()
-        self.assertIn("OWNER DISMISSED the pack's review", out["owner"])
+        self.assertIn("OWNER: DISMISSED the pack's review", unfence(out["owner"]))
         rec = self.f.run("record", stdin=json.dumps({"plan": {}, "write": {}}), MODE="calibration")
         self.assertEqual(rec.returncode, 0, rec.stderr)
         self.assertEqual(self.collect()["owner_count"], 0)
@@ -492,9 +506,9 @@ class CollectBackfillTest(unittest.TestCase):
             {"created_at": iso(n - dt.timedelta(days=40)), "user": {"login": "rev", "type": "User"}, "in_reply_to_id": None,
              "path": "a.go", "body": body, "pull_request_url": "x/pulls/3"},
             {"created_at": iso(n - dt.timedelta(days=41)), "user": {"login": "bob", "type": "User"}, "in_reply_to_id": None,
-             "path": "b.go", "body": body, "pull_request_url": "x/pulls/4"},
+             "author_association": "MEMBER", "path": "b.go", "body": body, "pull_request_url": "x/pulls/4"},
             {"created_at": iso(n - dt.timedelta(days=41)), "user": {"login": "bob", "type": "User"}, "in_reply_to_id": None,
-             "path": "b.go", "body": "lgtm", "pull_request_url": "x/pulls/4"},
+             "author_association": "MEMBER", "path": "b.go", "body": "lgtm", "pull_request_url": "x/pulls/4"},
         ])
         res = self.f.run("collect-backfill", stdin=json.dumps({"inputs": {"repos": "acme/api, bad repo, ../acme, acme/.., acme/api"}}),
                          BACKFILL_DAYS="90")
@@ -506,8 +520,8 @@ class CollectBackfillTest(unittest.TestCase):
         self.assertEqual(out["truncated"], [])
         self.assertEqual(out["month_count"], len(out["months"]))
         text = "".join(m["text"] for m in out["months"])
-        self.assertIn("MINE a.go", text)
-        self.assertIn("TEAM bob b.go", text)
+        self.assertIn("MINE a.go", unfence(text))
+        self.assertIn("TEAM bob b.go", unfence(text))
         self.assertNotIn("posted by the pack", text)
         self.assertIn("my own hand-written note after the pack started", text)
 
@@ -536,7 +550,7 @@ class CollectBackfillTest(unittest.TestCase):
         n = self.f.now
         old = "this is a comment from years ago about the deploy job"
         self.f.set_comments([{"created_at": iso(n - dt.timedelta(days=3000)), "user": {"login": "bob", "type": "User"},
-                              "in_reply_to_id": None, "path": "b.go", "body": old, "pull_request_url": "x/pulls/2"}])
+                              "in_reply_to_id": None, "author_association": "COLLABORATOR", "path": "b.go", "body": old, "pull_request_url": "x/pulls/2"}])
         inp = json.dumps({"inputs": {"repos": "acme/api"}})
         self.assertEqual(json.loads(self.f.run("collect-backfill", stdin=inp, BACKFILL_DAYS="365").stdout)["team"], 0)
         out = json.loads(self.f.run("collect-backfill", stdin=inp, BACKFILL_DAYS="all").stdout)

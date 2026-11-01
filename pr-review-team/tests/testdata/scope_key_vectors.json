@@ -1,200 +1,93 @@
 {
- "_comment": "Copied from conductor core (internal/memory/testdata/scope_key_vectors.json, feat/memory-layers @d1933af0). Scope-key template vectors (memory.RenderScopeKey). facts is one step's fact set; each case renders template over it and expects either want (the key) or drop (the key does not apply: recall drops it, a grant entry admits nothing, a write is refused). Shared by the Go tests and `conductor memory key`; a re-implementation can test against this file.",
- "facts": {
-  "repo": "acme/api",
-  "owner": "acme",
-  "name": "api",
-  "number": 42,
-  "pr": 42,
-  "issue": 0,
-  "kind": "review_requested",
-  "title": "Fix the {{.repo}} parser",
-  "head_ref": "feature/*",
-  "author": "octo-dev",
-  "labels": [
-   "backend",
-   "needs-review"
-  ],
-  "blank_labels": [
-   ""
-  ],
-  "base": "main",
-  "workflow": "review",
-  "step": "lens",
-  "empty": "",
-  "inputs": {
-   "team": "payments",
-   "area": "",
-   "tier": 2
+  "_comment": "Scope-key template vectors (memory.RenderScopeKey). facts is one step's fact set; each case renders template over it and expects either want (the key) or drop (the key does not apply: recall drops it, a grant entry admits nothing, a write is refused). Shared by the Go tests and `conductor memory key`; a re-implementation can test against this file.",
+  "facts": {
+    "repo": "acme/api",
+    "owner": "acme",
+    "name": "api",
+    "number": 42,
+    "pr": 42,
+    "issue": 0,
+    "kind": "review_requested",
+    "title": "Fix the {{.repo}} parser",
+    "head_ref": "feature/*",
+    "author": "octo-dev",
+    "labels": ["backend", "needs-review"],
+    "blank_labels": [""],
+    "nil_labels": [null],
+    "nothing": null,
+    "base": "main",
+    "workflow": "review",
+    "step": "lens",
+    "empty": "",
+    "inputs": { "team": "payments", "area": "", "tier": 2, "gone": null },
+    "steps": { "triage": { "outputs": { "area": "billing" } } }
   },
-  "steps": {
-   "triage": {
-    "outputs": {
-     "area": "billing"
-    }
-   }
-  }
- },
- "cases": [
-  {
-   "template": "acme/api",
-   "want": "acme/api"
-  },
-  {
-   "template": "",
-   "want": ""
-  },
-  {
-   "template": "${unknown}",
-   "want": "${unknown}"
-  },
-  {
-   "template": "{{.repo}}",
-   "want": "acme/api"
-  },
-  {
-   "template": "standard:{{.repo}}",
-   "want": "standard:acme/api"
-  },
-  {
-   "template": "standard:${repo}",
-   "want": "standard:acme/api"
-  },
-  {
-   "template": "${workflow}/${step}@${repo}",
-   "want": "review/lens@acme/api"
-  },
-  {
-   "template": "team:{{.inputs.team}}",
-   "want": "team:payments"
-  },
-  {
-   "template": "org:{{.owner}}",
-   "want": "org:acme"
-  },
-  {
-   "template": "label:{{index .labels 0}}",
-   "want": "label:backend"
-  },
-  {
-   "template": "area:{{.steps.triage.outputs.area}}",
-   "want": "area:billing"
-  },
-  {
-   "template": "tier:{{.inputs.tier}}",
-   "want": "tier:2"
-  },
-  {
-   "template": "pr:{{.number}}",
-   "want": "pr:42"
-  },
-  {
-   "template": "{{printf \"%s-%s\" .owner .name}}",
-   "want": "acme-api"
-  },
-  {
-   "template": "area:{{.inputs.area | default \"general\"}}",
-   "want": "area:general"
-  },
-  {
-   "template": "area:{{coalesce .inputs.area .inputs.team}}",
-   "want": "area:payments"
-  },
-  {
-   "template": "branch:{{.head_ref}}",
-   "want": "branch:feature/*"
-  },
-  {
-   "template": "issue:{{.issue | default \"none\"}}",
-   "want": "issue:none"
-  },
-  {
-   "template": "n:{{coalesce .issue .number}}",
-   "want": "n:42"
-  },
-  {
-   "template": "title:{{.title}}",
-   "want": "title:Fix the {{.repo}} parser"
-  },
-  {
-   "template": "  team:{{.inputs.team}}  ",
-   "want": "team:payments"
-  },
-  {
-   "template": "team:{{.inputs.missing}}",
-   "drop": true
-  },
-  {
-   "template": "area:{{.inputs.area}}",
-   "drop": true
-  },
-  {
-   "template": "x:{{.empty}}",
-   "drop": true
-  },
-  {
-   "template": "issue:{{.issue}}",
-   "drop": true
-  },
-  {
-   "template": "x:{{.nosuch}}",
-   "drop": true
-  },
-  {
-   "template": "x:{{.nosuch.deeper}}",
-   "drop": true
-  },
-  {
-   "template": "{{.empty}}",
-   "drop": true
-  },
-  {
-   "template": "label:{{index .labels 5}}",
-   "drop": true
-  },
-  {
-   "template": "{{if .owner}}x{{end}}",
-   "drop": true
-  },
-  {
-   "template": "{{range .labels}}{{.}}{{end}}",
-   "drop": true
-  },
-  {
-   "template": "{{with .owner}}{{.}}{{end}}",
-   "drop": true
-  },
-  {
-   "template": "{{$x := .owner}}{{$x}}",
-   "drop": true
-  },
-  {
-   "template": "{{kv \"s\" \"n\" \"k\"}}",
-   "drop": true
-  },
-  {
-   "template": "{{secret \"gh\"}}",
-   "drop": true
-  },
-  {
-   "template": "{{len .labels}}",
-   "drop": true
-  },
-  {
-   "template": "{{print \" \"}}",
-   "drop": true
-  },
-  {
-   "template": "label:{{index .blank_labels 0}}",
-   "drop": true
-  },
-  {
-   "template": "{{.inputs.area | default \"\"}}",
-   "drop": true
-  },
-  {
-   "template": "{{.owner",
-   "drop": true
-  }
- ]
+  "cases": [
+    { "template": "acme/api", "want": "acme/api" },
+    { "template": "", "want": "" },
+    { "template": "${unknown}", "want": "${unknown}" },
+    { "template": "{{.repo}}", "want": "acme/api" },
+    { "template": "standard:{{.repo}}", "want": "standard:acme/api" },
+    { "template": "standard:${repo}", "want": "standard:acme/api" },
+    { "template": "${workflow}/${step}@${repo}", "want": "review/lens@acme/api" },
+    { "template": "team:{{.inputs.team}}", "want": "team:payments" },
+    { "template": "org:{{.owner}}", "want": "org:acme" },
+    { "template": "label:{{index .labels 0}}", "want": "label:backend" },
+    { "template": "area:{{.steps.triage.outputs.area}}", "want": "area:billing" },
+    { "template": "tier:{{.inputs.tier}}", "want": "tier:2" },
+    { "template": "pr:{{.number}}", "want": "pr:42" },
+    { "template": "{{printf \"%s-%s\" .owner .name}}", "want": "acme-api" },
+    { "template": "area:{{.inputs.area | default \"general\"}}", "want": "area:general" },
+    { "template": "area:{{coalesce .inputs.area .inputs.team}}", "want": "area:payments" },
+    { "template": "branch:{{.head_ref}}", "want": "branch:feature/*" },
+    { "template": "issue:{{.issue | default \"none\"}}", "want": "issue:none" },
+    { "template": "n:{{coalesce .issue .number}}", "want": "n:42" },
+    { "template": "title:{{.title}}", "want": "title:Fix the {{.repo}} parser" },
+    { "template": "  team:{{.inputs.team}}  ", "want": "team:payments" },
+    { "template": "team:{{.inputs.missing}}", "drop": true },
+    { "template": "area:{{.inputs.area}}", "drop": true },
+    { "template": "x:{{.empty}}", "drop": true },
+    { "template": "issue:{{.issue}}", "drop": true },
+    { "template": "x:{{.nosuch}}", "drop": true },
+    { "template": "x:{{.nosuch.deeper}}", "drop": true },
+    { "template": "{{.empty}}", "drop": true },
+    { "template": "label:{{index .labels 5}}", "drop": true },
+    { "template": "{{if .owner}}x{{end}}", "drop": true },
+    { "template": "{{range .labels}}{{.}}{{end}}", "drop": true },
+    { "template": "{{with .owner}}{{.}}{{end}}", "drop": true },
+    { "template": "{{$x := .owner}}{{$x}}", "drop": true },
+    { "template": "{{kv \"s\" \"n\" \"k\"}}", "drop": true },
+    { "template": "{{secret \"gh\"}}", "drop": true },
+    { "template": "{{len .labels}}", "drop": true },
+    { "template": "{{print \" \"}}", "drop": true },
+    { "template": "label:{{index .blank_labels 0}}", "drop": true },
+    { "template": "{{.inputs.area | default \"\"}}", "drop": true },
+    { "template": "{{print .missing}}", "drop": true },
+    { "template": "{{printf \"%v\" .missing}}", "drop": true },
+    { "template": "{{printf \"%s\" .missing}}", "drop": true },
+    { "template": "n:{{printf \"%d\" .missing}}", "drop": true },
+    { "template": "team:{{printf \"%s\" .inputs.missing}}", "drop": true },
+    { "template": "team:{{.inputs.missing | printf \"%s\"}}", "drop": true },
+    { "template": "x:{{print .nothing}}", "drop": true },
+    { "template": "x:{{printf \"%s\" .inputs.gone}}", "drop": true },
+    { "template": "x:{{.inputs.gone}}", "drop": true },
+    { "template": "x:{{index .nil_labels 0}}", "drop": true },
+    { "template": "x:{{printf \"%v\" (index .nil_labels 0)}}", "drop": true },
+    { "template": "x:{{printf \"%v\" .nil_labels}}", "drop": true },
+    { "template": "x:{{printf \"%s\" (index .inputs \"nope\")}}", "drop": true },
+    { "template": "{{printf \"%s\"}}", "drop": true },
+    { "template": "n:{{printf \"%d\" .owner}}", "drop": true },
+    { "template": "{{printf \"%s\" .owner .name}}", "drop": true },
+    { "template": "pct:{{print \"50%!\"}}", "drop": true },
+    { "template": "team:{{coalesce (printf \"%s\" .missing) \"fallback\"}}", "want": "team:fallback"},
+    { "template": "team:{{printf \"%s\" .inputs.missing | default \"core\"}}", "want": "team:core"},
+    { "template": "x:{{.inputs.gone | default \"d\"}}", "want": "x:d"},
+    { "template": "x:{{coalesce .nothing .inputs.gone .owner}}", "want": "x:acme"},
+    { "template": "team:{{printf \"t-%s\" (coalesce .inputs.missing \"core\")}}", "want": "team:t-core"},
+    { "template": "n:{{printf \"%d\" .number}}", "want": "n:42"},
+    { "template": "x:{{coalesce .missing .nothing}}", "drop": true },
+    { "template": "x:{{.inputs.area | default \"\"}}", "drop": true },
+    { "template": "x:{{coalesce .inputs.area .issue}}", "drop": true },
+    { "template": "{{.owner", "drop": true }
+  ]
 }
