@@ -81,7 +81,7 @@ class CollectTrustTest(unittest.TestCase):
         self.assertIn("bob handler.go: the store error is swallowed here", team)
         self.assertIn("carol", team)
         for who in ("mallory", "eve", "first", "ghost", "ci[bot]"):
-            self.assertNotIn(who, out["team"])
+            self.assertNotIn(who, team)        # unfenced: the run's random token can spell a name
         self.assertEqual(out["team_count"], 2)
         self.assertEqual(out["untrusted"], {"CONTRIBUTOR": 1, "NONE": 1, "FIRST_TIME_CONTRIBUTOR": 1, "unknown": 1, "bot": 1})
         self.assertEqual(out["trusted_associations"], ["COLLABORATOR", "MEMBER", "OWNER"])
