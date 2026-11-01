@@ -25,9 +25,14 @@ FAKE_GH = textwrap.dedent('''\
         log.write(" ".join(a) + "\\n")
     if a[:2] == ["api", "user"]:
         print("rev"); sys.exit(0)
-    if a[:1] == ["api"] and "/pulls/comments?" in a[1]:
-        page = [p for p in a[1].split("?")[1].split("&") if p.startswith("page=")][0]
-        print(open(os.environ["FAKE_COMMENTS"]).read() if page == "page=1" else "[]"); sys.exit(0)
+    if a[:1] == ["api"]:
+        path, _, q = a[1].partition("?")
+        page = [p for p in q.split("&") if p.startswith("page=")][0]
+        if path.endswith("/pulls/comments"):
+            print(open(os.environ["FAKE_COMMENTS"]).read() if page == "page=1" else "[]"); sys.exit(0)
+        api = json.load(open(os.environ["FAKE_API"]))
+        if path in api:
+            print(json.dumps(api[path]) if page == "page=1" else "[]"); sys.exit(0)
     sys.exit(1)
 ''')
 
@@ -49,11 +54,17 @@ class Fixture:
         os.chmod(gh, 0o755)
         self.comments = os.path.join(self.root, "comments.json")
         self.set_comments([])
+        self.api = os.path.join(self.root, "api.json")
+        self.set_api({})
         self.now = dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
 
     def set_comments(self, cs):
         with open(self.comments, "w") as f:
             json.dump(cs, f)
+
+    def set_api(self, paths):
+        with open(self.api, "w") as f:
+            json.dump(paths, f)
 
     def audit(self, *events):
         with open(os.path.join(self.state, "audit.jsonl"), "a") as f:
@@ -79,7 +90,7 @@ class Fixture:
 
     def run(self, cmd, stdin="{}", **env):
         e = {"PATH": self.bin + ":" + os.environ["PATH"], "HOME": self.root, "STATE_DIR": self.state,
-             "GIT_BASE": "file://" + os.path.join(self.root, "forge"), "FAKE_COMMENTS": self.comments,
+             "GIT_BASE": "file://" + os.path.join(self.root, "forge"), "FAKE_COMMENTS": self.comments, "FAKE_API": self.api,
              "FAKE_GH_LOG": os.path.join(self.root, "gh.log")}
         e.update(env)
         return subprocess.run(["python3", SCRIPT, cmd], input=stdin, capture_output=True, text=True, env=e)
@@ -186,7 +197,7 @@ class CollectCalibrationTest(unittest.TestCase):
         for r in bad[:3] + ["../../escape2"]:
             self.assertIn(r, out["invalid_repos"])
         self.assertEqual(sorted(os.listdir(os.path.join(cache, "clones"))), ["acme"])
-        self.assertEqual(sorted(os.listdir(self.f.root)), sorted(["state", "bin", "comments.json", "work", "forge", "gh.log"]))
+        self.assertEqual(sorted(os.listdir(self.f.root)), sorted(["state", "bin", "comments.json", "api.json", "work", "forge", "gh.log"]))
         with open(os.path.join(self.f.root, "gh.log")) as f:
             calls = f.read()
         with open(os.path.join(cache, "calibration.next.json")) as f:
@@ -200,6 +211,111 @@ class CollectCalibrationTest(unittest.TestCase):
         res = self.f.run("collect-calibration")
         self.assertEqual(res.returncode, 3)
         self.assertIn("trust: full", res.stderr)
+
+
+def rv(id_, login, when, state, body):
+    return {"id": id_, "user": {"login": login}, "submitted_at": iso(when), "state": state, "body": body}
+
+
+def cm(id_, login, when, body, review=None, reply_to=None, path="handler.go", line=3):
+    return {"id": id_, "user": {"login": login}, "created_at": iso(when), "body": body, "path": path, "line": line,
+            "pull_request_review_id": review, "in_reply_to_id": reply_to}
+
+
+class OwnerCatchTest(unittest.TestCase):
+    """Reviews post AS the reviewer's account. What that account wrote by hand on a PR the
+    pack reviewed — told apart from the pack's posts by the audit log, not by author — is
+    the owner correcting the pack."""
+
+    def setUp(self):
+        self.f = Fixture()
+        n = self.f.now
+        self.t0 = n - dt.timedelta(days=3)
+        self.f.forge([
+            ("init", {"README.md": "api\n"}, n - dt.timedelta(days=10)),
+            ("add handler (#1)", {"handler.go": HANDLER}, n - dt.timedelta(days=2)),
+        ])
+        self.f.audit(post(self.t0, "acme/api", 1, comments=[{"path": "handler.go", "line": 3, "body": "pack inline note"}]))
+
+    def tearDown(self):
+        self.f.close()
+
+    def api(self, pack_state="APPROVED", extra_reviews=(), inline=(), conversation=()):
+        t0, d = self.t0, dt.timedelta
+        self.f.set_api({
+            "repos/acme/api/pulls/1/reviews": [rv(11, "rev", t0 + d(seconds=40), pack_state, "looks good"), *extra_reviews],
+            "repos/acme/api/pulls/1/comments": [cm(100, "rev", t0 + d(seconds=40), "pack inline note", review=11), *inline],
+            "repos/acme/api/issues/1/comments": list(conversation),
+        })
+
+    def collect(self):
+        res = self.f.run("collect-calibration")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        return json.loads(res.stdout)
+
+    def test_owner_after_the_pack_is_a_catch_and_the_pack_itself_is_not(self):
+        t0, d = self.t0, dt.timedelta
+        self.api(
+            extra_reviews=[rv(12, "rev", t0 + d(days=1), "CHANGES_REQUESTED", "this breaks the deploy job"),
+                           rv(13, "bob", t0 + d(days=1), "COMMENTED", "bob's own review"),
+                           rv(14, "rev", t0 + d(days=1), "COMMENTED", "")],
+            inline=[cm(101, "rev", t0 + d(days=1), "the nil check here is wrong", review=14, reply_to=100)],
+            conversation=[{"user": {"login": "rev"}, "created_at": iso(t0 + d(days=2)), "body": "missed the migration"}])
+        out = self.collect()
+        self.assertEqual((out["owner_count"], out["owner_prs"]), (3, 1))
+        owner = out["owner"]
+        self.assertIn("acme/api#1 (reviewed", owner)                         # the pack's review, for context
+        self.assertIn("OWNER REVIEW CHANGES_REQUESTED", owner)
+        self.assertIn("this breaks the deploy job", owner)
+        self.assertRegex(owner, r"OWNER INLINE handler.go:3 \(reply to the pack's comment: pack inline note\) "
+                                r"\(\d{4}-\d\d-\d\d\): the nil check here is wrong")
+        self.assertIn("OWNER COMMENT", owner)
+        self.assertIn("missed the migration", owner)
+        self.assertNotIn("OWNER REVIEW APPROVED", owner)                    # the pack's own approval
+        self.assertNotIn("OWNER INLINE handler.go:3: pack inline note", owner)   # the pack's own inline comment
+        self.assertNotIn("bob's own review", owner)
+
+    def test_before_the_pack_reviewed_is_not_a_catch(self):
+        t0, d = self.t0, dt.timedelta
+        self.api(extra_reviews=[rv(12, "rev", t0 - d(hours=5), "COMMENTED", "an early note of mine")],
+                 inline=[cm(102, "rev", t0 - d(hours=5), "before the review", review=12)],
+                 conversation=[{"user": {"login": "rev"}, "created_at": iso(t0 - d(hours=6)), "body": "pre-review chat"}])
+        out = self.collect()
+        self.assertEqual(out["owner_count"], 0)
+        self.assertNotIn("early note", out["owner"])
+
+    def test_a_pack_review_is_not_mistaken_for_the_owner_when_only_time_matches(self):
+        # same account, a minute after the pack posted, but a different body: the owner's
+        t0, d = self.t0, dt.timedelta
+        self.api(extra_reviews=[rv(12, "rev", t0 + d(minutes=1), "COMMENTED", "wait, one more thing")])
+        self.assertIn("wait, one more thing", self.collect()["owner"])
+
+    def test_a_dismissed_pack_review_is_reported_once(self):
+        self.api(pack_state="DISMISSED")
+        out = self.collect()
+        self.assertIn("OWNER DISMISSED the pack's review", out["owner"])
+        rec = self.f.run("record", stdin=json.dumps({"plan": {}, "write": {}}), MODE="calibration")
+        self.assertEqual(rec.returncode, 0, rec.stderr)
+        self.assertEqual(self.collect()["owner_count"], 0)
+
+    def test_after_the_follow_up_window_is_not_a_catch(self):
+        t0, d = self.t0, dt.timedelta
+        late = self.f.now + d(days=1)   # merged n-2d; with a 0-day window it closed then
+        self.api(conversation=[{"user": {"login": "rev"}, "created_at": iso(late), "body": "much later"}])
+        res = self.f.run("collect-calibration", WINDOW_DAYS="0")
+        self.assertEqual(json.loads(res.stdout)["owner_count"], 0)
+
+    def test_the_audit_log_rotated_away_means_no_guessing(self):
+        # tracked from an earlier run, but no audit record of the pack's post any more
+        os.remove(os.path.join(self.f.state, "audit.jsonl"))
+        self.f.audit({"event": "step", "step": "x", "ts": iso(self.f.now)})
+        cache = os.path.join(self.f.state, "pr-review-team")
+        os.makedirs(cache, exist_ok=True)
+        with open(os.path.join(cache, "calibration.json"), "w") as f:
+            json.dump({"last_run": iso(self.t0 - dt.timedelta(days=1)),
+                       "tracked": {"acme/api#1": {"repo": "acme/api", "pr": 1, "at": iso(self.t0)[:10]}}}, f)
+        self.api(extra_reviews=[rv(12, "rev", self.t0 + dt.timedelta(days=1), "COMMENTED", "x")])
+        self.assertEqual(self.collect()["owner_count"], 0)
 
 
 class RepoGuardTest(unittest.TestCase):
@@ -244,11 +360,15 @@ class CollectBackfillTest(unittest.TestCase):
 
     def test_months_mine_and_team(self):
         n = self.f.now
-        self.f.audit(post(n - dt.timedelta(days=10), "acme/api", 9))   # the pack's first post
         body = "please return the error instead of logging it here"
+        pack_note = "posted by the pack under the reviewer's name " + body
+        self.f.audit(post(n - dt.timedelta(days=10), "acme/api", 9,                   # the pack's first post
+                          comments=[{"path": "a.go", "line": 1, "body": pack_note}]))
         self.f.set_comments([
             {"created_at": iso(n - dt.timedelta(days=2)), "user": {"login": "rev", "type": "User"}, "in_reply_to_id": None,
-             "path": "a.go", "body": "posted by the pack under the reviewer's name " + body, "pull_request_url": "x/pulls/9"},
+             "path": "a.go", "body": pack_note, "pull_request_url": "x/pulls/9"},
+            {"created_at": iso(n - dt.timedelta(days=1)), "user": {"login": "rev", "type": "User"}, "in_reply_to_id": None,
+             "path": "a.go", "body": "my own hand-written note after the pack started " + body, "pull_request_url": "x/pulls/9"},
             {"created_at": iso(n - dt.timedelta(days=40)), "user": {"login": "rev", "type": "User"}, "in_reply_to_id": None,
              "path": "a.go", "body": body, "pull_request_url": "x/pulls/3"},
             {"created_at": iso(n - dt.timedelta(days=41)), "user": {"login": "bob", "type": "User"}, "in_reply_to_id": None,
@@ -261,12 +381,41 @@ class CollectBackfillTest(unittest.TestCase):
         self.assertEqual(res.returncode, 0, res.stderr)
         out = json.loads(res.stdout)
         self.assertEqual(out["repos"], ["acme/api"])
-        self.assertEqual((out["mine"], out["team"]), (1, 1))   # pack-era and short comments dropped
+        self.assertEqual((out["mine"], out["team"]), (2, 1))   # the pack's own and short comments dropped
+        self.assertEqual(out["pack_dropped"], 1)
+        self.assertEqual(out["truncated"], [])
         self.assertEqual(out["month_count"], len(out["months"]))
         text = "".join(m["text"] for m in out["months"])
         self.assertIn("MINE a.go", text)
         self.assertIn("TEAM bob b.go", text)
         self.assertNotIn("posted by the pack", text)
+        self.assertIn("my own hand-written note after the pack started", text)
+
+    def test_days_all_reads_the_whole_history(self):
+        n = self.f.now
+        old = "this is a comment from years ago about the deploy job"
+        self.f.set_comments([{"created_at": iso(n - dt.timedelta(days=3000)), "user": {"login": "bob", "type": "User"},
+                              "in_reply_to_id": None, "path": "b.go", "body": old, "pull_request_url": "x/pulls/2"}])
+        inp = json.dumps({"inputs": {"repos": "acme/api"}})
+        self.assertEqual(json.loads(self.f.run("collect-backfill", stdin=inp, BACKFILL_DAYS="365").stdout)["team"], 0)
+        out = json.loads(self.f.run("collect-backfill", stdin=inp, BACKFILL_DAYS="all").stdout)
+        self.assertEqual((out["team"], out["since"]), (1, "all"))
+        bad = self.f.run("collect-backfill", stdin=inp, BACKFILL_DAYS="forever")
+        self.assertNotEqual(bad.returncode, 0)
+        self.assertIn("`all`", bad.stderr)
+
+    def test_the_page_cap_reports_a_truncated_repo(self):
+        n = self.f.now
+        self.f.set_comments([{"created_at": iso(n - dt.timedelta(hours=i + 1)), "user": {"login": "bob", "type": "User"},
+                              "in_reply_to_id": None, "path": "b.go", "body": "comment number %d is long enough" % i,
+                              "pull_request_url": "x/pulls/2"} for i in range(100)])
+        inp = json.dumps({"inputs": {"repos": "acme/api"}})
+        res = self.f.run("collect-backfill", stdin=inp, BACKFILL_DAYS="all", MAX_PAGES="1")
+        out = json.loads(res.stdout)
+        self.assertEqual(out["truncated"], ["acme/api"])
+        self.assertIn("Raise the backfill_max_pages setting", res.stderr)
+        # a full page and then an empty one is the end of the history, not truncation
+        self.assertEqual(json.loads(self.f.run("collect-backfill", stdin=inp, BACKFILL_DAYS="all", MAX_PAGES="2").stdout)["truncated"], [])
 
     def test_needs_repos(self):
         res = self.f.run("collect-backfill", stdin=json.dumps({"inputs": {}}))

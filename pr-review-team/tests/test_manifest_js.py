@@ -40,6 +40,31 @@ def run_js(code, ctx, settings=None):
     return json.loads(res.stdout)
 
 
+FAKE_MEMORY = """
+const store = %s;
+let next = 1;
+ctx.memory = {
+  recall: function (o) { return store.filter(function (m) { return !o || o.scope == null || (m.scope || "") === o.scope; })
+                                      .map(function (m) { return Object.assign({}, m); }); },
+  remember: function (text, tags, scope) { const m = { id: "n" + (next++), text: text, tags: tags || [], scope: scope || "" };
+                                           store.push(m); return m; },
+  forget: function (id) { const i = store.findIndex(function (m) { return m.id === id; });
+                          if (i < 0) return false; store.splice(i, 1); return true; },
+};
+"""
+
+
+def run_js_mem(code, ctx, store):
+    """Run a step with an in-memory ctx.memory; returns (output, the store afterwards)."""
+    src = ("const ctx = %s;\n" % json.dumps(ctx) + FAKE_MEMORY % json.dumps(store) +
+           "const out = (function () {\n%s\n})();\nprocess.stdout.write(JSON.stringify({out: out, store: store}));" % code)
+    res = subprocess.run(["node", "-e", src], capture_output=True, text=True)
+    if res.returncode != 0:
+        raise AssertionError(res.stderr)
+    r = json.loads(res.stdout)
+    return r["out"], r["store"]
+
+
 def entry(repo, kind, text, evidence, **kw):
     e = {"repo": repo, "kind": kind, "text": text, "evidence": evidence}
     e.update(kw)
@@ -279,6 +304,69 @@ class GateTest(unittest.TestCase):
         man = load()
         for sid in ("emphasis", "assess"):
             self.assertEqual(flow_step(man, "review-flow", sid)["if"], "!automode.auto")
+
+
+class FreshTrainTest(unittest.TestCase):
+    """review-backfill --input fresh=true: learned entries of the trained keys move to
+    archive:<scope>; hand-written ones, the shared set and other keys stay."""
+
+    @classmethod
+    def setUpClass(cls):
+        t = load()["x-templates"]
+        cls.fresh, cls.archive, cls.plan = t["fresh"]["code"], t["archive"]["code"], t["plan"]["code"]
+
+    def test_fresh_spellings(self):
+        for raw, on in (("true", True), (" Yes ", True), ("1", True), ("false", False), ("", False), ("NO", False)):
+            self.assertEqual(run_js(self.fresh, {"inputs": {"fresh": raw}}), {"on": on}, raw)
+        self.assertEqual(run_js(self.fresh, {"inputs": {}}), {"on": False})
+        with self.assertRaises(AssertionError) as cm:
+            run_js(self.fresh, {"inputs": {"fresh": "please"}})
+        self.assertIn("fresh= takes true or false", str(cm.exception))
+
+    def store(self):
+        L = ["review-tuning", "backfill", "standard"]
+        return [
+            {"id": "a1", "scope": "acme/api", "text": "learned fact", "tags": ["review-tuning", "calibration", "fact"]},
+            {"id": "a2", "scope": "standard:acme/api", "text": "learned standard", "tags": L},
+            {"id": "a3", "scope": "emphasis:acme/api", "text": "learned emphasis", "tags": ["review-tuning", "calibration", "emphasis"]},
+            {"id": "h1", "scope": "standard:acme/api", "text": "hand-written rule", "tags": ["house"]},
+            {"id": "h2", "scope": "acme/api", "text": "outcome note", "tags": ["outcome"]},
+            {"id": "g1", "scope": "", "text": "global learned", "tags": L},
+            {"id": "o1", "scope": "standard:other/svc", "text": "another key's standard", "tags": L},
+            {"id": "x1", "scope": "standard:acme/api-extra", "text": "a key that only shares a prefix", "tags": L},
+        ]
+
+    def test_moves_only_the_learned_entries_of_the_trained_keys(self):
+        out, store = run_js_mem(self.archive, {"collect": {"keys": ["acme/api"]}}, self.store())
+        self.assertEqual(sorted(out["ids"]), ["a1", "a2", "a3"])
+        by_scope = {}
+        for m in store:
+            by_scope.setdefault(m["scope"], []).append(m["text"])
+        self.assertEqual(sorted(by_scope["archive:acme/api"]), ["learned fact"])
+        self.assertEqual(by_scope["archive:standard:acme/api"], ["learned standard"])
+        self.assertEqual(by_scope["archive:emphasis:acme/api"], ["learned emphasis"])
+        self.assertEqual(by_scope["standard:acme/api"], ["hand-written rule"])   # untagged: kept
+        self.assertEqual(by_scope["acme/api"], ["outcome note"])                 # not a lesson: kept
+        self.assertEqual(by_scope[""], ["global learned"])                       # global: never archived
+        self.assertEqual(by_scope["standard:other/svc"], ["another key's standard"])
+        self.assertEqual(by_scope["standard:acme/api-extra"], ["a key that only shares a prefix"])
+        moved = [m for m in store if m["scope"].startswith("archive:")]
+        self.assertTrue(all("review-tuning" in m["tags"] for m in moved))       # tags kept on the move
+
+    def test_plan_does_not_dedup_against_what_was_archived(self):
+        known = [{"id": "a2", "scope": "standard:acme/api", "text": "learned standard"}]
+        ctx = {"collect": {"repos": ["acme/api"]}, "known": {"list": known}, "archive": {"ids": ["a2"]},
+               "merge": {"entries": [entry("acme/api", "standard", "learned standard", ["acme/api#1"], supersedes="a2")]}}
+        out = run_js(self.plan, ctx)
+        self.assertEqual([w["scope"] for w in out["writes"]], ["standard:acme/api"])   # re-learned, not "already recorded"
+        self.assertEqual(out["forget"], [])                                            # and the archived one isn't forgotten
+
+    def test_archive_runs_after_the_agents_and_before_plan(self):
+        backfill = [t for t in load()["triggers"] if t["name"] == "review-backfill"][0]
+        steps = [s.get("id") for s in backfill["steps"]]
+        self.assertLess(steps.index("merge"), steps.index("archive"))
+        self.assertLess(steps.index("archive"), steps.index("plan"))
+        self.assertLess(steps.index("fresh"), steps.index("extract"))
 
 
 class LayeringTest(unittest.TestCase):

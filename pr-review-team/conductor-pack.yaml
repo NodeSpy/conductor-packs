@@ -309,7 +309,9 @@ x-templates:
       const entries = src.entries || [];
       const allowed = {};
       for (const r of ((ctx.collect && ctx.collect.repos) || [])) allowed[r] = 1;
-      const known = (ctx.known && ctx.known.list) || [];
+      const archived = {};
+      for (const id of ((ctx.archive && ctx.archive.ids) || [])) archived[id] = 1;
+      const known = ((ctx.known && ctx.known.list) || []).filter(function (m) { return !archived[m.id]; });
       const byId = {}; const seenText = {};
       for (const m of known) { byId[m.id] = m; seenText[m.scope + "\u0000" + m.text.trim()] = 1; }
       const origin = ctx.calibrate ? "calibration" : "backfill";
@@ -370,6 +372,46 @@ x-templates:
         if (ctx.memory.forget(id)) forgotten++;
       }
       return { items: items, count: items.length, forgotten: forgotten };
+
+  # A FRESH train (review-backfill --input fresh=true). Read once, like auto:
+  # true/yes/1 or false/no/0 (empty = false); anything else fails the run
+  # before any agent starts.
+  fresh: &fresh
+    id: fresh
+    run: js
+    code: |
+      const raw = String((ctx.inputs && ctx.inputs.fresh) == null ? "" : ctx.inputs.fresh);
+      const v = raw.trim().toLowerCase();
+      if (v === "" || v === "false" || v === "no" || v === "0") return { on: false };
+      if (v === "true" || v === "yes" || v === "1") return { on: true };
+      throw new Error("review-backfill: --input fresh= takes true or false, got " + JSON.stringify(raw));
+
+  # ...and what it does, once the agents have produced the new entries and
+  # before they are written: every LEARNED entry (tagged review-tuning) in the
+  # layers of the keys this run trains — <key>, standard:<key>, emphasis:<key>
+  # — is MOVED to archive:<scope> (written there, then forgotten here), never
+  # deleted. Hand-written entries (no review-tuning tag) stay, and so does the
+  # shared set: a per-key train never archives global entries. Nothing reads
+  # archive: scopes; move an entry back with `conductor memory rescope`.
+  archive: &archive
+    id: archive
+    run: js
+    code: |
+      const keys = (ctx.collect && (ctx.collect.keys || ctx.collect.repos)) || [];
+      const layer = {};
+      for (const k of keys) { if (k) { layer[k] = 1; layer["standard:" + k] = 1; layer["emphasis:" + k] = 1; } }
+      const all = ctx.memory.recall({ limit: 0 }) || [];
+      const items = [], ids = [];
+      for (const m of all) {
+        const scope = m.scope || "";
+        const tags = m.tags || [];
+        if (!scope || !layer[scope] || tags.indexOf("review-tuning") < 0) continue;
+        const moved = ctx.memory.remember(String(m.text || ""), tags, "archive:" + scope);
+        ctx.memory.forget(m.id);
+        ids.push(m.id);
+        items.push({ id: m.id, to: moved.id, scope: scope, text: String(m.text || "").slice(0, 300) });
+      }
+      return { ids: ids, items: items, count: items.length };
 
 workflows:
   # ---- The review ENGINE: produces a ReviewRecord, never posts. ----
@@ -1085,7 +1127,9 @@ triggers:
   # ---- Calibration: learn from what happened after past reviews. ----
   #
   # Weekly (or by hand), read what changed since the last run — reviews this
-  # pack posted (from the audit log), follow-up commits that changed lines a
+  # pack posted (from the audit log), what the reviewer's OWN account wrote by
+  # hand on those PRs afterwards (owner catches: the strongest signal, and the
+  # only direct one in auto mode), follow-up commits that changed lines a
   # reviewed PR added, what the human did with each hand-off draft, and what
   # teammates flagged in review — and turn the misses into memory entries the
   # lens panel reads next time. Repos come from the audit log; nothing is
@@ -1118,7 +1162,7 @@ triggers:
           MIN_LINES: "${settings.calibration_min_lines}"
           TEAM_PAGES: "${settings.calibration_team_pages}"
       - <<: *known
-        if: &calib_any "collect.count > 0 || collect.flagged > 0 || collect.handoffs > 0 || collect.team_count > 0"
+        if: &calib_any "collect.count > 0 || collect.flagged > 0 || collect.handoffs > 0 || collect.owner_count > 0 || collect.team_count > 0"
       - <<: *doc_claude
         if: *calib_any
       - <<: *doc_agents
@@ -1171,6 +1215,16 @@ triggers:
           only <these> variables; a new required variable breaks the deploy
           (owner/name#N)".
 
+          0. OWNER CATCHES are the strongest signal there is. The reviewer posts AS
+             its owner's account; each OWNER line is something that account wrote BY
+             HAND on a PR the reviewer had already reviewed — a later review (its
+             verdict shown; CHANGES_REQUESTED after the reviewer approved is a clear
+             miss), an inline comment or a reply to one of the reviewer's own comments,
+             a conversation comment, or the reviewer's review being DISMISSED. The
+             owner is correcting the reviewer: treat every substantive one as a miss
+             (or, replying to its comment, as a comment it should not have made or
+             should have made differently) unless it is plainly unrelated chatter.
+             They outrank everything below, team comments included.
           1. FOLLOW-UPS. Each FOLLOW-UP below is a commit that changed or removed lines
              a reviewed PR added, within the window after it merged, with its message
              and patch. Decide whether it fixed something the review should have
@@ -1189,7 +1243,7 @@ triggers:
              flagging: concerns on more than one PR or from more than one person that
              the lenses wouldn't surface on their own. One-offs, style nits and
              questions are not patterns. Weigh a comment by whether the issue is real,
-             not by who posted it. The reviewer's own misses (1, 2) come first; a team
+             not by who posted it. The reviewer's own misses (0, 1, 2) come first; a team
              pattern carries somewhat less weight — keep it when it is clearly
              important (repeated, several people, or it caught a real bug), mark it
              team: true, and say "the team flags…" in the text.
@@ -1200,6 +1254,9 @@ triggers:
              duplicate, write the improved text and set supersedes to its id (same
              repo and kind).
           5. summary: one line per entry written or dropped, and why.
+
+          OWNER CATCHES ({{.collect.owner_count}} on {{.collect.owner_prs}} reviewed PRs):
+          {{.collect.owner}}
 
           REVIEWS ({{.collect.count}} new, {{.collect.flagged}} with follow-ups, {{.collect.handoffs}} hand-off outcome(s)):
           {{.collect.reviews}}
@@ -1227,7 +1284,11 @@ triggers:
   # One-time (manual only) map-reduce over the repos you name: one agent per
   # month extracts what reviewers look out for, one agent merges those into
   # entries, and the same restricted write path as calibration writes them.
-  #   conductor run <instance>/review-backfill --input repos=owner/a,owner/b [--input days=180]
+  #   conductor run <instance>/review-backfill --input repos=owner/a,owner/b [--input days=180|all] [--input fresh=true]
+  # days=all reads each repo's whole history (up to backfill_max_pages per
+  # repo — a repo the cap cut short is named in the run's output and log).
+  # fresh=true archives what earlier runs learned for these keys first, so the
+  # result is a clean train rather than a merge (see `archive` above).
   # Grant review-backfill/collect and review-backfill/record `trust: full`
   # like calibration's, and arm it (`enabled: true`).
   - name: review-backfill
@@ -1243,6 +1304,7 @@ triggers:
           MAX_PAGES: "${settings.backfill_max_pages}"
           MIN_CHARS: "${settings.backfill_min_chars}"
           REVIEWER_SINCE: "${settings.backfill_reviewer_since}"
+      - *fresh
       - id: extract
         if: "collect.month_count > 0"
         for_each: "{{.collect.months}}"
@@ -1358,6 +1420,8 @@ triggers:
 
           REPO DOCS:
           {{.repodocs.text}}
+      - <<: *archive
+        if: "fresh.on && patterns.count > 0"
       - <<: *plan
         if: "patterns.count > 0"
       - *write

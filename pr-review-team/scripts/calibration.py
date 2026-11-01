@@ -173,9 +173,10 @@ def clone(repo, fetched):
     return fetched[repo]
 
 
-def human_comments(repo, since, max_pages, skip_login=None):
+def human_comments(repo, since, max_pages, skip_login=None, truncated=None):
     """Top-level inline review comments on repo's PRs created after `since`, newest first,
-    by humans (bots and replies dropped; skip_login's dropped too when given)."""
+    by humans (bots and replies dropped; skip_login's dropped too when given). When the
+    page cap ends the read before `since` is reached, repo is appended to `truncated`."""
     if not valid_repo(repo):
         return
     for page in range(1, max_pages + 1):
@@ -193,6 +194,128 @@ def human_comments(repo, since, max_pages, skip_login=None):
             if skip_login and login == skip_login:
                 continue
             yield ts, login, c
+        if len(batch) < 100:
+            return
+    if truncated is not None:
+        truncated.append(repo)
+
+
+def norm(text):
+    return " ".join((text or "").split())
+
+
+def pack_posts():
+    """Every review this pack posted, from the audit log: "repo#pr" -> [{ts, body, comments}].
+    Reviews post AS the reviewer's account, so the audit log — not the author — is what
+    tells the pack's reviews apart from what the owner wrote by hand."""
+    out = {}
+    for e in audit_events(['submit_review']):
+        if not is_review_post(e):
+            continue
+        o = e.get("options") or {}
+        repo = o.get("repo") or e.get("repo")
+        try:
+            pr = int(o.get("pr") or e.get("number") or 0)
+        except (TypeError, ValueError):
+            continue
+        if not valid_repo(repo) or pr <= 0:
+            continue
+        out.setdefault("%s#%d" % (repo, pr), []).append(
+            {"ts": iso(e["ts"]), "body": norm(o.get("body")), "comments": set(norm_comments(o.get("comments")).values())})
+    return out
+
+
+def audit_start():
+    """The oldest timestamp still in the audit log (it rotates), or None."""
+    for name in audit_files():
+        try:
+            with open(name) as f:
+                for line in f:
+                    try:
+                        return iso(json.loads(line)["ts"])
+                    except (ValueError, KeyError, TypeError):
+                        continue
+        except OSError:
+            continue
+    return None
+
+
+# A GitHub review is one this pack posted when the reviewer's account submitted it within
+# MATCH_SECONDS of an audited submit_review on the same PR, with the same body (the
+# connector posts the body verbatim). GitHub's review id is not in the audit log.
+MATCH_SECONDS = 900
+
+
+def is_pack_review(rv, posts):
+    t = rv.get("submitted_at")
+    if not t:
+        return False
+    t, body = iso(t), norm(rv.get("body"))
+    return any(abs((t - p["ts"]).total_seconds()) <= MATCH_SECONDS and body == p["body"] for p in posts)
+
+
+def gh_list(path, max_pages=10):
+    out = []
+    for page in range(1, max_pages + 1):
+        batch = gh_json("%s%sper_page=100&page=%d" % (path, "&" if "?" in path else "?", page))
+        if not isinstance(batch, list) or not batch:
+            break
+        out += batch
+        if len(batch) < 100:
+            break
+    return out
+
+
+def pack_review_ids(repo, pr, me, posts, cache):
+    """GitHub ids of the reviews this pack posted on repo#pr (and the reviews list itself)."""
+    key = "%s#%d" % (repo, pr)
+    if key not in cache:
+        reviews = gh_list("repos/%s/pulls/%d/reviews" % (repo, pr)) if valid_repo(repo) else []
+        ids = {rv.get("id") for rv in reviews
+               if (rv.get("user") or {}).get("login") == me and is_pack_review(rv, posts)}
+        cache[key] = (ids, reviews)
+    return cache[key]
+
+
+def owner_activity(repo, pr, me, posts, cache):
+    """What the reviewer's own account did on a PR this pack reviewed that the pack did NOT
+    post: reviews (with their verdict), inline comments and replies, conversation comments —
+    and the pack's own reviews that were since dismissed. [(ts or None, label, text)]."""
+    if not valid_repo(repo):
+        return []
+    ids, reviews = pack_review_ids(repo, pr, me, posts, cache)
+    audited = set().union(*[p["comments"] for p in posts]) if posts else set()
+    out = []
+    for rv in reviews:
+        if rv.get("id") in ids:
+            if rv.get("state") == "DISMISSED":
+                out.append((None, "DISMISSED the pack's review", norm(rv.get("body"))[:300]))
+            continue
+        if (rv.get("user") or {}).get("login") != me or not rv.get("submitted_at"):
+            continue
+        state, body = rv.get("state") or "", norm(rv.get("body"))
+        if not body and state not in ("CHANGES_REQUESTED",):
+            continue   # the empty shell of inline comments (listed below), or a bare approval
+        out.append((iso(rv["submitted_at"]), "REVIEW " + state, body[:600]))
+    inline = gh_list("repos/%s/pulls/%d/comments" % (repo, pr))
+    by_id = {c.get("id"): c for c in inline}
+    for c in inline:
+        if (c.get("user") or {}).get("login") != me or not c.get("created_at"):
+            continue
+        body = norm(c.get("body"))
+        if c.get("pull_request_review_id") in ids or body in audited:
+            continue   # the pack's own inline comment
+        label = "INLINE %s:%s" % (c.get("path"), c.get("line") or c.get("original_line") or "")
+        parent = by_id.get(c.get("in_reply_to_id"))
+        if parent is not None:
+            label += " (reply to %s: %s)" % (
+                "the pack's comment" if parent.get("pull_request_review_id") in ids else (parent.get("user") or {}).get("login"),
+                norm(parent.get("body"))[:200])
+        out.append((iso(c["created_at"]), label, body[:600]))
+    for c in gh_list("repos/%s/issues/%d/comments" % (repo, pr)):
+        if (c.get("user") or {}).get("login") == me and c.get("created_at"):
+            out.append((iso(c["created_at"]), "COMMENT", norm(c.get("body"))[:600]))
+    return out
 
 
 def cap(text, limit, what):
@@ -214,6 +337,7 @@ def write_json_atomic(path, obj):
 
 REVIEWS_CAP = 120_000   # bytes of review/follow-up text handed to the agent
 TEAM_CAP = 60_000       # bytes of team comments handed to the agent
+OWNER_CAP = 60_000      # bytes of owner catches handed to the agent
 PATCH_CAP = 3_000       # bytes of one follow-up commit's patch
 
 
@@ -405,6 +529,36 @@ def collect_calibration():
             outcomes.append("%s (handed off %s): EDITED before posting" % (key, h["at"][:10]))
             outcomes += ["    - " + x for x in diff]
 
+    # 2c. OWNER CATCHES. Reviews post as the reviewer's own account, so what that account
+    #     wrote on a reviewed PR by hand — after the pack's review, through the follow-up
+    #     window — is the owner correcting it: the strongest miss signal there is, and
+    #     the only direct one in auto mode, where nothing is handed off. Told apart from
+    #     the pack's own posts by the audit log, never by author.
+    posts_by_pr = pack_posts()
+    review_cache, catches = {}, {}
+    for key, r in sorted(tracked.items()):
+        posts = posts_by_pr.get(key)
+        if not posts:
+            continue   # its audit records rotated away: the pack's posts can't be told apart
+        first = min(p["ts"] for p in posts)
+        if r.get("merged"):
+            end = iso(r["merged"]) + dt.timedelta(days=WINDOW_DAYS)
+        else:
+            end = first + dt.timedelta(days=UNMERGED_DAYS)
+        seen_dismissed = set(r.get("dismissed") or [])
+        got = []
+        for ts, label, text in owner_activity(r["repo"], r["pr"], me, posts, review_cache):
+            if ts is None:   # a dismissal: reported once
+                if text in seen_dismissed:
+                    continue
+                seen_dismissed.add(text)
+            elif not (ts > first and ts > last and ts <= end):
+                continue
+            got.append("    - OWNER %s%s: %s" % (label, "" if ts is None else " (" + ts.strftime("%Y-%m-%d") + ")", text))
+        r["dismissed"] = sorted(seen_dismissed)
+        if got:
+            catches[key] = got
+
     # 3. Team comments created since the last run, on every repo calibration covers.
     repos = sorted({r["repo"] for r in tracked.values()} | handoff_repos)
     team = {}
@@ -442,6 +596,11 @@ def collect_calibration():
         out += review_lines(key, key)
         out += followup_lines(key)
 
+    owner_lines = []
+    for key in sorted(catches):
+        owner_lines += review_lines(key, key)
+        owner_lines += catches[key]
+
     team_lines, both = [], 0
     for key, cs in sorted(team.items(), key=lambda kv: ((kv[0] not in tracked), kv[0])):
         if key in tracked:
@@ -460,6 +619,8 @@ def collect_calibration():
         "handoffs": sum(1 for o in outcomes if not o.startswith("    ")),
         "repos": repos, "reviewer": me,
         "reviews": cap("\n".join(out) + "\n", REVIEWS_CAP, "reviews"),
+        "owner": cap("\n".join(owner_lines) + "\n", OWNER_CAP, "owner catches"),
+        "owner_count": sum(len(v) for v in catches.values()), "owner_prs": len(catches),
         "team": cap("\n".join(team_lines) + "\n", TEAM_CAP, "team comments"),
         "team_count": sum(len(v) for v in team.values()), "team_prs": len(team), "team_both": both,
         "invalid_repos": sorted(invalid),
@@ -499,19 +660,37 @@ def collect_backfill(ctx):
     repos = parse_repos((ctx.get("inputs") or {}).get("repos") or os.environ.get("BACKFILL_REPOS"))
     if not repos:
         raise SystemExit("review-backfill: name the repos — conductor run <instance>/review-backfill --input repos=owner/a,owner/b")
-    days = env_int("BACKFILL_DAYS", 365)
+    raw_days = (os.environ.get("BACKFILL_DAYS") or "").strip().lower()
+    whole = raw_days == "all"
+    if not whole and raw_days and not raw_days.isdigit():
+        raise SystemExit("review-backfill: --input days= takes a number of days or `all`, got %r" % raw_days)
+    days = int(raw_days) if raw_days.isdigit() else 365
     max_pages = env_int("MAX_PAGES", 300)
     min_chars = env_int("MIN_CHARS", 40)
     me = gh_login()
     since_raw = (os.environ.get("REVIEWER_SINCE") or "").strip()
     pack_since = iso(since_raw + "T00:00:00+00:00") if since_raw else first_post_by_pack()
+    # Your own comments from the pack's era are yours unless the pack posted them: the
+    # audit log names every review it posted, so only those (and their inline comments)
+    # are dropped. Before the oldest audit record (rotated away) that can't be told, so
+    # pack-era comments there are dropped as before.
+    posts_by_pr, review_cache, start = pack_posts(), {}, audit_start()
     t_now = now()
-    since = t_now - dt.timedelta(days=days)
-    months, counts = {}, {}
+    since = dt.datetime(1970, 1, 1, tzinfo=dt.timezone.utc) if whole else t_now - dt.timedelta(days=days)
+    months, counts, truncated, pack_dropped = {}, {}, [], 0
     for repo in repos:
-        for ts, login, c in human_comments(repo, since, max_pages):
+        for ts, login, c in human_comments(repo, since, max_pages, truncated=truncated):
             if login == me and pack_since and ts >= pack_since:
-                continue   # may have been posted by this pack under your name
+                pr = int(c["pull_request_url"].rsplit("/", 1)[-1])
+                posts = posts_by_pr.get("%s#%d" % (repo, pr))
+                if posts:
+                    ids, _ = pack_review_ids(repo, pr, me, posts, review_cache)
+                    if c.get("pull_request_review_id") in ids or norm(c.get("body")) in set().union(*[p["comments"] for p in posts]):
+                        pack_dropped += 1
+                        continue   # posted by this pack under your name
+                elif start is None or ts < start:
+                    pack_dropped += 1
+                    continue       # the audit log no longer covers it: can't tell
             body = " ".join((c.get("body") or "").split())
             if len(body) < min_chars:
                 continue
@@ -525,8 +704,13 @@ def collect_backfill(ctx):
     for m in sorted(months):
         text = "".join(key + "\n" + "\n".join(months[m][key]) + "\n" for key in sorted(months[m]))
         out.append({"month": m, "text": cap(text, MONTH_CAP, "month"), "mine": counts[m]["mine"], "team": counts[m]["team"]})
-    return {"months": out, "month_count": len(out), "repos": repos, "reviewer": me, "since": since.date().isoformat(),
-            "mine": sum(o["mine"] for o in out), "team": sum(o["team"] for o in out)}
+    if truncated:
+        sys.stderr.write("pr-review-team: review-backfill read only %d pages for %s — older comments were NOT read. "
+                         "Raise the backfill_max_pages setting to read the whole window.\n" % (max_pages, ", ".join(truncated)))
+    return {"months": out, "month_count": len(out), "repos": repos, "reviewer": me,
+            "since": "all" if whole else since.date().isoformat(),
+            "mine": sum(o["mine"] for o in out), "team": sum(o["team"] for o in out),
+            "truncated": truncated, "max_pages": max_pages, "pack_dropped": pack_dropped}
 
 
 # ---------------------------------------------------------------------------
@@ -546,6 +730,14 @@ def record(ctx):
     for i, w in enumerate(writes):
         got = written[i] if i < len(written) and isinstance(written[i], dict) else {}
         lines.append("- %s [%s] %s" % (got.get("id") or "?", w.get("label") or w.get("scope") or "global", w.get("text", "")))
+    archived = ((ctx.get("archive") or {}).get("items")) or []
+    if archived:
+        lines.append("Archived (fresh train) (%d):" % len(archived))
+        lines += ["- %s [%s] -> %s [archive:%s] %s" % (a.get("id"), a.get("scope"), a.get("to"), a.get("scope"), a.get("text", ""))
+                  for a in archived]
+    trunc = ((ctx.get("collect") or {}).get("truncated")) or []
+    if trunc:
+        lines.append("TRUNCATED by backfill_max_pages (older comments not read): " + ", ".join(trunc))
     for key, title in (("downgraded", "Downgraded (global resting on one repo)"), ("superseded", "Superseded"),
                        ("rejected", "Rejected (out of scope)"), ("dropped", "Dropped")):
         items = plan.get(key) or []
@@ -565,6 +757,7 @@ def record(ctx):
             promoted = True
     return {"written": len(writes), "rejected": len(plan.get("rejected") or []),
             "downgraded": len(plan.get("downgraded") or []),
+            "archived": len(archived), "truncated": trunc,
             "dropped": len(plan.get("dropped") or []), "promoted": promoted,
             "log": os.path.join(cache, "calibration-log.md")}
 
