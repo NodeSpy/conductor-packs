@@ -34,6 +34,8 @@ FAKE_GH = textwrap.dedent('''\
         parts = path.split("/")
         if len(parts) == 6 and parts[3] == "commits" and parts[5] == "pulls" and path not in api:
             path = "/".join(parts[:4] + ["*", "pulls"])   # one answer for every commit
+        if len(parts) == 5 and parts[3] == "commits" and path not in api:
+            path = "/".join(parts[:4] + ["*"])
         if path in api:
             print(json.dumps(api[path]) if page == "page=1" else "[]"); sys.exit(0)
     sys.exit(1)
@@ -75,9 +77,9 @@ class Fixture:
             json.dump(cs, f)
 
     def set_api(self, paths):
-        # a follow-up commit with no PR was pushed straight to the branch (trusted),
-        # unless a test says otherwise
-        paths = dict({"repos/acme/api/commits/*/pulls": []}, **paths)
+        # a follow-up commit with no PR was pushed straight to the branch by the
+        # reviewer's own account (trusted), unless a test says otherwise
+        paths = dict({"repos/acme/api/commits/*/pulls": [], "repos/acme/api/commits/*": {"author": {"login": "rev"}}}, **paths)
         with open(self.api, "w") as f:
             json.dump(paths, f)
 

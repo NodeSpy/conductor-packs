@@ -272,19 +272,58 @@ class Fence:
         return "<<<%s %s %s>>>" % (self.token, t, self.token)
 
 
-def commit_trust(repo, sha, trusted, me):
-    """Who a follow-up commit came from: the PR GitHub associates it with, judged by its
-    author's association (or the reviewer's own account). A commit with no PR was pushed
-    straight to the branch, which takes write access. -> (trusted?, reason)."""
-    prs = gh_json("repos/%s/commits/%s/pulls" % (repo, sha)) if valid_repo(repo) and re.fullmatch(r"[0-9a-f]{7,40}", sha) else None
+WRITE_PERMISSIONS = ("admin", "maintain", "write")
+
+
+def login_association(repo, login, cache):
+    """What GitHub would call login's association with repo, worked out the way GitHub
+    ranks it: OWNER (the repo's owner), MEMBER (a member of the owning organization),
+    COLLABORATOR (write access or more), else "permission <level>" or "unknown" —
+    nothing trusted_associations can name. Cached per run."""
+    k = (repo, login)
+    if k not in cache:
+        owner = repo.split("/")[0]
+        if not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})", login or ""):
+            cache[k] = "unknown"
+        elif login.lower() == owner.lower():
+            cache[k] = "OWNER"
+        elif gh("api", "orgs/%s/members/%s" % (owner, login)).returncode == 0:
+            cache[k] = "MEMBER"
+        else:
+            perm = gh_json("repos/%s/collaborators/%s/permission" % (repo, login))
+            level = str((perm or {}).get("permission") or "") if isinstance(perm, dict) else ""
+            cache[k] = "COLLABORATOR" if level in WRITE_PERMISSIONS else ("permission %s" % level if level else "unknown")
+    return cache[k]
+
+
+def commit_trust(repo, sha, trusted, me, cache=None):
+    """Who a follow-up commit came from -> (trusted?, reason). A commit GitHub ties to a
+    PR is judged by that PR's author association (or the reviewer's own account). A
+    commit with no PR was pushed straight to the branch: it counts only when its author
+    is a GitHub login (the reviewer's own, or one whose association with the repo is in
+    `trusted`). Anything GitHub can't answer is untrusted."""
+    if not (valid_repo(repo) and re.fullmatch(r"[0-9a-f]{7,40}", sha)):
+        return False, "unknown"
+    prs = gh_json("repos/%s/commits/%s/pulls" % (repo, sha))
     if not isinstance(prs, list):
         return False, "unknown"
-    if not prs:
+    if prs:
+        for p in prs:
+            if (p.get("user") or {}).get("login") == me or str(p.get("author_association") or "") in trusted:
+                return True, "pr"
+        return False, str(prs[0].get("author_association") or "unknown")
+    c = gh_json("repos/%s/commits/%s" % (repo, sha))
+    if not isinstance(c, dict):
+        return False, "unknown"
+    login = str((c.get("author") or {}).get("login") or "")
+    if not login:
+        return False, "push by an author with no GitHub login"
+    if login == me:
         return True, "push"
-    for p in prs:
-        if (p.get("user") or {}).get("login") == me or str(p.get("author_association") or "") in trusted:
-            return True, "pr"
-    return False, str(prs[0].get("author_association") or "unknown")
+    assoc = login_association(repo, login, {} if cache is None else cache)
+    if assoc in trusted:
+        return True, "push"
+    return False, "push, %s" % assoc
 
 
 def cap_items(items, limit, what):
@@ -579,7 +618,7 @@ def collect_calibration():
 
     # 2. Follow-ups: for every tracked PR still inside its window, commits that
     #    landed since the last run and change or remove lines the PR added.
-    fetched = {}
+    fetched, assoc_cache = {}, {}
     followups = {}
     for key, r in list(tracked.items()):
         if not isinstance(r, dict) or not valid_repo(r.get("repo")):
@@ -626,7 +665,7 @@ def collect_calibration():
                              "patch": cap(git(d, "show", "-U3", "--format=", h, "--", *touched), PATCH_CAP, "patch")})
         kept = []
         for hit in sorted(hits, key=lambda x: -x["lines"])[:4]:
-            ok, why = commit_trust(r["repo"], hit.pop("full"), trusted, me)
+            ok, why = commit_trust(r["repo"], hit.pop("full"), trusted, me, assoc_cache)
             if ok:
                 kept.append(hit)
             else:   # learn only from trusted authors: a commit from an outside PR is not evidence
@@ -1281,14 +1320,22 @@ def record(ctx):
     if held:
         # an entry that would make reviews go easier on something, with no owner
         # catch behind it: written where no review reads it, for the owner to judge
-        lines.append("QUARANTINED (%d) — each would tell reviewers to go easier on something (approve, skip, ignore, "
-                     "trust, lower severity …) and no owner catch backs it, so it was written to quarantine:<key>, "
-                     "which no review reads. Read the exact text; to use one, move it by hand:" % len(held))
+        lines.append("QUARANTINED (%d) — written to quarantine:<key>, which no review reads, each for the reason shown "
+                     "(learning_review: %s). Read the exact text first. To use one, promote it on its own with the "
+                     "command under it — its tag is unique to that entry; drop --apply to preview the move:" % (
+                         len(held), plan.get("mode") or "quarantine_loosening"))
         for i, w in held:
             got = written[i] if i < len(written) and isinstance(written[i], dict) else {}
-            lines.append("- %s [%s, would be %s] %r" % (got.get("id") or "?", w.get("scope"), w.get("target"), w.get("text", "")))
+            lines.append("- %s [%s, would be %s] %r — %s" % (got.get("id") or "?", w.get("scope"), w.get("target"),
+                                                          w.get("text", ""), w.get("why") or "held"))
             lines.append("    conductor memory rescope --scope %s --tag %s --to %s --apply" % (
                 shell_quote(w.get("scope")), shell_quote(w.get("hold_tag")), shell_quote(w.get("target_scope") or "global")))
+    flagged = plan.get("live_flagged") or []
+    if flagged:
+        lines.append("LIVE WITHOUT REVIEW (%d) — learning_review is live, so these went straight to reviews although "
+                     "the gate finds them loosening; archive any you don't want (conductor memory rescope … --to "
+                     "'archive:{scope}' --apply):" % len(flagged))
+        lines += ["- %r" % str(x) for x in flagged]
     collect = ctx.get("collect") or {}
     untrusted = collect.get("untrusted") or {}
     if untrusted:

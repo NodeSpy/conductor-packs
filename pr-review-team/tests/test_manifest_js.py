@@ -148,6 +148,18 @@ RUN = ("acme/api#1", "acme/api#2", "acme/api#3", "acme/api#4", "acme/api#5", "ac
 FENCE = "ev0123456789abcdef"
 # collect's output as the plan sees it: every PR carries trusted evidence, none a catch
 COLLECTED = {"fence": FENCE, "trusted_refs": list(RUN), "catch_refs": []}
+# ...and every PR a catch too: the routing tests below are about where an entry
+# lands, so the grounding rule (tested on its own) lets everything through
+GROUNDED = dict(COLLECTED, catch_refs=list(RUN))
+
+
+def judge(ctx, p=0.0):
+    """ctx plus the direction judge's answers, as a fake light model gives them:
+    the real candidates step builds the notes, and each gets P(loosening) = p
+    (a number, or a function of the note's text)."""
+    cand = run_js(load()["x-templates"]["candidates"]["code"], ctx)
+    rate = p if callable(p) else (lambda _t: p)
+    return dict(ctx, candidates=cand, direction={"items": [{"loosens": {"noul": rate(c["text"])}} for c in cand["list"]]})
 
 
 class PlanTest(unittest.TestCase):
@@ -161,8 +173,8 @@ class PlanTest(unittest.TestCase):
         cls.repo_keys = keys_for(RUN)
 
     def plan(self, entries, keys=None, known=(), via="calibrate"):
-        ctx = {"keys": keys or self.repo_keys, "known": {"list": list(known)}, via: {"entries": entries}, "collect": COLLECTED}
-        return run_js(self.code, ctx)
+        ctx = {"keys": keys or self.repo_keys, "known": {"list": list(known)}, via: {"entries": entries}, "collect": GROUNDED}
+        return run_js(self.code, judge(ctx))
 
     def test_each_kind_lands_in_its_own_scope(self):
         out = self.plan([
@@ -290,7 +302,7 @@ class OwnerKeyTest(unittest.TestCase):
         cls.keys = keys_for(RUN, "org:{{.owner}}")
 
     def plan(self, entries):
-        return run_js(self.plan_code, {"keys": self.keys, "known": {"list": []}, "calibrate": {"entries": entries}, "collect": COLLECTED})
+        return run_js(self.plan_code, judge({"keys": self.keys, "known": {"list": []}, "calibrate": {"entries": entries}, "collect": GROUNDED}))
 
     def test_prs_of_one_owner_map_to_one_key(self):
         k = self.keys
@@ -803,9 +815,9 @@ class FreshTrainTest(unittest.TestCase):
 
     def test_plan_does_not_dedup_against_what_was_archived(self):
         known = [{"id": "a2", "scope": "standard:acme/api", "text": "learned standard"}]
-        ctx = {"keys": keys_for(["acme/api#1"]), "known": {"list": known}, "archive": {"ids": ["a2"]}, "collect": COLLECTED,
+        ctx = {"keys": keys_for(["acme/api#1"]), "known": {"list": known}, "archive": {"ids": ["a2"]}, "collect": GROUNDED,
                "merge": {"entries": [entry("acme/api", "standard", "learned standard", ["acme/api#1"], supersedes="a2")]}}
-        out = run_js(self.plan, ctx)
+        out = run_js(self.plan, judge(ctx))
         self.assertEqual([w["scope"] for w in out["writes"]], ["standard:acme/api"])   # re-learned, not "already recorded"
         self.assertEqual(out["forget"], [])                                            # and the archived one isn't forgotten
 

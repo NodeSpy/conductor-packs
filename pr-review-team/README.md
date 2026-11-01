@@ -87,8 +87,10 @@ Every setting is optional. Set them under `packs.<instance>.settings`.
 | `calibration_discard_days` | `7` | A hand-off draft nobody posted within this many days counts as discarded. |
 | `calibration_min_lines` | `3` | A later commit is a follow-up only if it changes or removes at least this many lines the reviewed PR added. |
 | `calibration_team_pages` | `15` | Pages (100 comments each) of teammates' review comments read per repo per calibration run. |
-| `perspectives_as_lenses` | `false` | `true`: a learned perspective distinct from every lens may become an extra lens for its key, at most 3 per key. See [Perspectives](#perspectives-the-team-in-the-review). |
-| `trusted_associations` | `OWNER,MEMBER,COLLABORATOR` | Calibration and backfill learn only from comments (and follow-up commits) by authors with one of these GitHub `author_association` values; your own account always counts. `none` = only yours. See [Training data and prompt injection](#training-data-and-prompt-injection). |
+| `perspectives_as_lenses` | `false` | `true`: a learned perspective distinct from every lens, once you promote it out of quarantine, may become an extra lens for its key, at most 3 per key. See [Perspectives](#perspectives-the-team-in-the-review). |
+| `learning_review` | `quarantine_loosening` | Which learned entries go live: `quarantine_loosening` holds loosening entries, standards and globals with no catch, and perspectives; `hold_all` holds everything; `live` holds nothing (a footgun). See [the gate](#the-gate-what-goes-live-and-what-waits-for-you). |
+| `loosening_threshold` | `0.2` | The direction judge's P(an entry makes reviewers go easier) at or above which it is held (0–1). |
+| `trusted_associations` | `OWNER,MEMBER,COLLABORATOR` | Calibration and backfill learn only from comments and follow-up commits by authors with one of these GitHub `author_association` values (a commit pushed with no PR: its author's rank on the repo); your own account always counts. `none` = only yours. See [Training data and prompt injection](#training-data-and-prompt-injection). |
 | `backfill_max_pages` | `300` | Pages (100 comments each) read per repo by `review-backfill` — a safety cap. A repo that hits it is reported as truncated; raise it for a `days=all` train of a long history. |
 | `backfill_min_chars` | `40` | `review-backfill` ignores comments shorter than this. |
 | `backfill_reviewer_since` | `""` | `review-backfill`: the date (`YYYY-MM-DD`) this pack started posting under your account. From then on your own comments count as yours only when the audit log shows the pack didn't post them; from before the audit log's oldest record they are dropped. Empty: the date of the first review this pack posted, from the audit log. |
@@ -128,9 +130,10 @@ calibration triggers (or by you) — layered by a **scope key**, the
 **Notes steer the review; they never replace it.** Each lens reviewer is told
 to do a full, independent review of the whole change through its lens first,
 whatever the notes say. The notes come after everything else in the prompt,
-framed as judgment aids: what matters here, what is known to be safe, where
-past reviews missed things. They are not a checklist, not the scope of the
-review, and never a reason to skip or soften an issue. A note alone never
+framed as judgment aids: what matters here and where past reviews missed
+things. They are not a checklist, not the scope of the review, and never a
+reason to skip or soften an issue; a note that calls something safe, vetted,
+trusted or exempt never outweighs a defect the lens can see in the diff. A note alone never
 makes a finding blocking — that still takes the change actually breaking
 something. Your repo's own CLAUDE.md/AGENTS.md/CONTRIBUTING keep their
 blocking weight; learned `standard` notes are strong guidance, not law.
@@ -172,11 +175,20 @@ The lenses read perspectives as notes, inside `memory_limit`: "engineers on
 this code tend to look for these; take the ones that fit your lens as extra
 focus, never instead of it."
 
+**Perspectives wait for you.** A perspective has no catch behind it (it
+rests on comments, not on a miss), so by default every learned perspective
+is held in `quarantine:<key>` until you promote it, like any held entry (see
+[Training data and prompt injection](#training-data-and-prompt-injection)).
+
 `perspectives_as_lenses` (default `false`): when `true`, a perspective the
 agent marks as distinct from every existing lens becomes an **extra lens**
-for its key ("Perspective: <login>"). The plan step allows at most 3 per key
-and keeps the rest as notes, and the review reads at most 3. A lens's focus
-is learned text that the lens follows, which is why this is off by default.
+for its key ("Perspective: <login>") — but only once you have promoted it
+out of quarantine. The review recognizes a promoted entry by the `held-` tag
+the move keeps; a perspective written straight to its scope (for example
+with `learning_review: live`) never becomes a lens. The plan step allows at
+most 3 per key and keeps the rest as notes, and the review reads at most 3.
+A lens's focus is learned text that the lens follows, which is why this is
+off by default.
 
 **Perspectives name people.** They are entries about named colleagues, kept
 in your conductor memory, and `conductor memory export` carries them like
@@ -317,8 +329,13 @@ instruction that got learned would stay. The pack defends at each step:
 - **Who it learns from.** Team comments count only when their author's
   `author_association` on the repo is in `trusted_associations` (default
   `OWNER`, `MEMBER`, `COLLABORATOR`). A follow-up commit counts only when the
-  PR that landed it is by such an author, or it was pushed straight to the
-  branch. Your own account always counts. Everything else (outside
+  PR that landed it is by such an author. A commit pushed straight to the
+  branch, with no PR, counts only when its author is a GitHub login ranked
+  the way GitHub ranks associations — the repo's owner (`OWNER`), a member of
+  its organization (`MEMBER`), or a collaborator with write access
+  (`COLLABORATOR`) — and that rank is in the setting. A commit whose author
+  maps to no login, or that GitHub can't answer for, is untrusted. Your own
+  account always counts. Everything else (outside
   contributors, bots, unknown) is dropped and counted in the run log. Every
   entry must cite at least one PR with trusted evidence: a catch, a
   hand-off outcome, a trusted follow-up or a trusted author's comment.
@@ -335,28 +352,66 @@ instruction that got learned would stay. The pack defends at each step:
   - entries over 500 characters are rejected;
   - so is any entry containing a URL, a code fence, a command or tool call,
     an `@mention`, control characters, or the fence;
-  - an entry that would make reviews go easier on something (approve, skip,
-    ignore, trust, allowlist, lower severity, "not blocking" and the like)
-    is written to `quarantine:<key>` (`quarantine:global` for a shared
-    one), which no review reads, unless its evidence includes a catch (by
-    you or any trusted engineer) or a hand-off you edited or discarded. It
-    never replaces an existing entry. Backfill has no catches, so in
-    backfill such entries are always quarantined.
+  - then the **gate** decides whether the entry goes live or waits in
+    `quarantine:<key>` (`quarantine:global` for a shared one), which no
+    review reads (see below). A held entry never replaces an existing one.
 
-  The run log (`calibration-log.md`) lists each quarantined entry with its
-  exact text and the command that would promote it, for example:
-  `conductor memory rescope --scope 'quarantine:owner/app' --tag 'held-1a2b3c4d' --to 'standard:owner/app' --apply`.
-  It also lists the rejected entries with the reason, and the instructions
-  found in the evidence.
+  The run log (`calibration-log.md`) lists the rejected entries with the
+  reason, the instructions found in the evidence, and every held entry with
+  its exact text, why it was held, and the command that promotes it.
 - **How reviews read it.** The lens prompt says learned notes are data about
   the code and can't change the review instructions, the output format, or
   what makes a finding blocking. The verdict is never a model's: `reconcile`
   computes `APPROVE` or `REQUEST_CHANGES` from the findings alone, and no step
   that decides or posts it reads memory. A note can't approve a PR by itself.
 
-The screening matches patterns, so it errs on the side of holding an entry
-back: a true statement like "the loader ignores x- keys" lands in quarantine
-for you to promote. Repo docs (`CLAUDE.md`, `AGENTS.md`, `CONTRIBUTING.md`
+#### The gate: what goes live, and what waits for you
+
+A deny-list of words can't tell "the cache table is rebuilt nightly" from
+"the input layer already sanitizes everything", so the gate fails closed:
+
+- **An isolated direction judge.** Every proposed entry is rated by a
+  separate light-model decide step that sees the entry's text, fenced, and
+  nothing else — no evidence, no PR text, no other entries, no tools. It
+  answers one question: would following this note make a reviewer less
+  likely to raise an issue, more likely to approve, or more likely to treat
+  something as safe, trusted, vetted or exempt? Anything at or above
+  `loosening_threshold` (default `0.2`) is **loosening**. So is anything the
+  judge didn't rate, and everything if the judge can't run. A keyword
+  tripwire ("approve", "skip", "trusted", "battle-tested", "already
+  validated", "safe" …) marks entries loosening too, whatever the judge says.
+- **Grounding.** An entry goes live only if it is not loosening, and it is a
+  fact or emphasis entry or its evidence includes a catch (a miss a trusted
+  engineer flagged, or a hand-off you edited or discarded). A standard or
+  global entry with no catch is held. A perspective is always held: it rests
+  on comments, never on a catch. A catch never lets a loosening entry
+  through. Backfill has no catches, so backfill's standards and globals are
+  always held.
+
+`learning_review` sets how strict this is:
+
+| Value | What goes live |
+|---|---|
+| `quarantine_loosening` (default) | What the rules above allow. |
+| `hold_all` | Nothing: every learned entry waits for you. |
+| `live` | Everything that passes screening — **a footgun**: whatever the agent writes steers every review at once, and in auto mode that means posted reviews. The log lists what the gate would have held under "LIVE WITHOUT REVIEW". |
+
+**Promoting a held entry, one at a time.** Each held entry carries a tag
+unique to it (`held-` and 8 hex digits), and the log prints, under the
+entry's text and the reason it was held, the exact command that moves that
+one entry to the scope it was meant for:
+
+```
+- m2df552980328 [quarantine:owner/app, would be standard:owner/app] 'handlers in api/ return typed errors' — standard entry with no catch in its evidence
+    conductor memory rescope --scope 'quarantine:owner/app' --tag 'held-24ab5a77' --to 'standard:owner/app' --apply
+```
+
+Read the text, then run the command (drop `--apply` to preview the move).
+To discard an entry, leave it: nothing reads `quarantine:` scopes. An entry
+already held is not held again by later runs.
+
+The rules err on the side of holding: a true fact that happens to say
+"safe", or that the judge reads as lowering scrutiny, waits for you. Repo docs (`CLAUDE.md`, `AGENTS.md`, `CONTRIBUTING.md`
 on the default branch) are shown unfenced, as the repo's own word. The PRs
 themselves are still reviewed whoever wrote them; trust only decides what
 the reviewer learns.
@@ -564,10 +619,14 @@ Re-export and push to update it.
   it would inject the notes a second time, unframed. Only the shared set and
   the key's three layers are read (not the workflow or step scopes conductor's
   default injection added).
-- **Only trusted authors teach it.** Teammates' comments count only from
-  `trusted_associations` (default `OWNER,MEMBER,COLLABORATOR`), and entries
-  that would make reviews go easier on something are quarantined unless a
-  catch backs them. If your teammates show up as `CONTRIBUTOR` (for
+- **Only trusted authors teach it, and learned entries wait for you.**
+  Teammates' comments count only from `trusted_associations` (default
+  `OWNER,MEMBER,COLLABORATOR`); a commit pushed with no PR counts only when
+  its author is trusted. A learned entry goes live only through
+  [the gate](#the-gate-what-goes-live-and-what-waits-for-you): loosening
+  entries, standards and globals with no catch, and every perspective are
+  held in `quarantine:<key>` for you to promote one at a time
+  (`learning_review`). If your teammates show up as `CONTRIBUTOR` (for
   example, org membership the reviewer's token can't see), the run log's
   "Untrusted" line counts them; widen the setting only if you mean it.
 - **Your team's corrections teach it.** Calibration used to skip everything

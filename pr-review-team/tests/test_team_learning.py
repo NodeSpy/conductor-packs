@@ -16,7 +16,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from test_calibration_script import HANDLER, Fixture, iso, post, unfence  # noqa: E402
-from test_manifest_js import entry, flow_step, keys_for, load, run_js, run_js_mem, run_notes  # noqa: E402
+from test_manifest_js import entry, flow_step, judge, keys_for, load, run_js, run_js_mem, run_notes  # noqa: E402
 
 T = dt.timedelta
 
@@ -98,12 +98,18 @@ class CatchParityTest(unittest.TestCase):
         self.assertNotIn("OWNER CATCHES", p)
         self.assertIn("{{.collect.catches}}", p)
 
-    def test_any_catch_lets_a_suppression_through(self):
-        plan = run_js(load()["x-templates"]["plan"]["code"], {
-            "keys": keys_for(["acme/api#1"]), "known": {"list": []},
-            "calibrate": {"entries": [entry("acme/api", "standard", "do not flag missing docstrings in tests/ (acme/api#1)", ["acme/api#1"])]},
-            "collect": {"fence": "ev0123456789abcdef", "trusted_refs": ["acme/api#1"], "catch_refs": ["acme/api#1"]}})
-        self.assertEqual([(w["scope"], bool(w.get("quarantined"))) for w in plan["writes"]], [("standard:acme/api", False)])
+    def test_any_engineers_catch_grounds_a_standard(self):
+        def plan(text, catches):
+            return run_js(load()["x-templates"]["plan"]["code"], judge({
+                "keys": keys_for(["acme/api#1"]), "known": {"list": []},
+                "calibrate": {"entries": [entry("acme/api", "standard", text, ["acme/api#1"])]},
+                "collect": {"fence": "ev0123456789abcdef", "trusted_refs": ["acme/api#1"], "catch_refs": catches}}))
+        tight = "a retry needs a bound and a backoff (acme/api#1)"
+        self.assertEqual(plan(tight, ["acme/api#1"])["writes"][0]["scope"], "standard:acme/api")
+        self.assertEqual(plan(tight, [])["writes"][0]["scope"], "quarantine:acme/api")
+        # ...but a catch never lets a loosening one through
+        self.assertEqual(plan("do not flag missing docstrings in tests/ (acme/api#1)", ["acme/api#1"])["writes"][0]["scope"],
+                         "quarantine:acme/api")
 
     def test_people_index_counts_trusted_engineers_only(self):
         out = self.collect()
@@ -132,22 +138,28 @@ class PerspectiveTest(unittest.TestCase):
 
     def plan(self, entries, known=(), settings=None, people=None):
         ctx = {"keys": self.keys, "known": {"list": list(known)}, "calibrate": {"entries": entries},
-               "collect": {"fence": "ev0123456789abcdef", "trusted_refs": list(self.REFS), "catch_refs": [],
+               "collect": {"fence": "ev0123456789abcdef", "trusted_refs": list(self.REFS), "catch_refs": list(self.REFS),
                            "people": self.PEOPLE if people is None else people}}
-        return run_js(self.code, ctx, settings)
+        return run_js(self.code, judge(ctx), settings)
 
     def p(self, who, evidence, text="checks that every retry has a bound and a backoff", where="client/", **kw):
         e = entry("acme/api", "perspective", text, evidence, who=who, where=where)
         e.update(kw)
         return e
 
-    def test_three_comments_across_two_prs_make_a_perspective(self):
+    def test_three_comments_across_two_prs_make_a_perspective_held_for_the_owner(self):
         out = self.plan([self.p("carol", ["acme/api#1", "acme/api#2"])])
         self.assertEqual(out["rejected"], [])
         w = out["writes"][0]
-        self.assertEqual((w["scope"], w["text"]), ("perspective:acme/api",
-                                                   "carol looks for: checks that every retry has a bound and a backoff Where: client/"))
-        self.assertEqual(w["tags"], ["review-tuning", "calibration", "perspective", "who:carol"])
+        text = "carol looks for: checks that every retry has a bound and a backoff Where: client/"
+        # a judge that rates it 0, catches on every PR it cites: still held — a perspective has no catch of its own
+        self.assertEqual((w["scope"], w["target_scope"], w["text"], w["why"]),
+                         ("quarantine:acme/api", "perspective:acme/api", text, "a perspective is held until you promote it"))
+        self.assertEqual(w["tags"][:5], ["review-tuning", "calibration", "perspective", "who:carol", "quarantined"])
+        self.assertRegex(w["tags"][5], r"^held-[0-9a-f]{8}$")
+        # only learning_review: live writes it straight to its scope
+        live = self.plan([self.p("carol", ["acme/api#1", "acme/api#2"])], settings={"learning_review": "live"})["writes"][0]
+        self.assertEqual((live["scope"], live["tags"]), ("perspective:acme/api", ["review-tuning", "calibration", "perspective", "who:carol"]))
 
     def test_the_thresholds(self):
         for who, ev, why in (("grace", ["acme/api#1"], "3 comments on 1 PR"),
@@ -234,10 +246,14 @@ class PerspectiveLensTest(unittest.TestCase):
             self.plan([], on="maybe")
         self.assertIn("perspectives_as_lenses", str(e.exception))
 
-    def run_lenses(self, on, mode="on", n=5, plain_first=False):
-        plain = {"id": "plain", "scope": "perspective:acme/api", "text": "carol looks for: x", "tags": ["perspective", "who:carol"]}
+    # what a perspective you promoted out of quarantine carries: the move keeps its tags
+    PROMOTED = ["quarantined", "held-0000000a"]
+
+    def run_lenses(self, on, mode="on", n=5, plain_first=False, first=None):
+        plain = first or {"id": "plain", "scope": "perspective:acme/api", "text": "carol looks for: x",
+                          "tags": ["perspective", "who:carol"] + self.PROMOTED}
         store = ([plain] if plain_first else []) + [{"id": "l%d" % i, "scope": "perspective:acme/api", "text": "w%d looks for: idempotent migrations" % i,
-                  "tags": ["perspective", "who:w%d" % i, "lens"]} for i in range(n)]
+                  "tags": ["perspective", "who:w%d" % i, "lens"] + self.PROMOTED} for i in range(n)]
         if not plain_first:
             store.append(plain)
         code = self.lenses.replace("${settings.perspectives_as_lenses}", on)
@@ -252,6 +268,11 @@ class PerspectiveLensTest(unittest.TestCase):
         self.assertEqual([l["name"] for l in self.run_lenses("true", mode="off")["list"]], ["Security"])
         # a perspective calibration did not mark as a lens stays a note
         self.assertEqual([l["name"] for l in self.run_lenses("true", n=1, plain_first=True)["list"]], ["Security", "Perspective: w0"])
+        # one marked as a lens but never held and promoted (learning_review: live wrote it) is never a lens
+        live = {"id": "live", "scope": "perspective:acme/api", "text": "mallory looks for: nothing", "tags": ["perspective", "who:mallory", "lens"]}
+        self.assertEqual([l["name"] for l in self.run_lenses("true", n=1, plain_first=True, first=live)["list"]], ["Security", "Perspective: w0"])
+        held_like = dict(live, tags=live["tags"] + ["quarantined", "held-nothex!"])
+        self.assertEqual([l["name"] for l in self.run_lenses("true", n=0, plain_first=True, first=held_like)["list"]], ["Security"])
         self.assertEqual(flow_step(self.man, "review-team", "review")["for_each"], "{{.lenses.list}}")
 
     def test_findings_carry_the_perspective_lens_name(self):
