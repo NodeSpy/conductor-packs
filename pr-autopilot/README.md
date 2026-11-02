@@ -81,7 +81,7 @@ packs:
 | `status_failed` | `gave up: {{.run.reason}}` |
 | `status_stopped` | `stopped — {{.run.reason}}` |
 | `stop_unreact` | `true`: on a stop, remove the 👀 |
-| `resolve_threads` | `true`: after a changes-requested run, resolve the threads its agent reports addressed (see below) |
+| `resolve_threads` | `true`: after a changes-requested run whose change conductor pushed, resolve the threads its agent reports addressed (see below) |
 
 Contexts and descriptions are templates rendered per run. `{{.run.reason}}`
 is a short public-safe phrase ("the agent couldn't be started", "timed out",
@@ -138,8 +138,15 @@ working, end up in one run (the github connector docs define "waiting on you").
 
 The agent reports the comments its pushed change fully addresses
 (`addressed_comments`, part of its result). The `resolve` step then resolves
-exactly those threads, and leaves a thread open when:
+exactly those threads — **only when conductor itself pushed the change** — and
+leaves a thread open when:
 
+- nothing was pushed: the agent's report is a claim, and the gate is
+  conductor's own record of its push (`address.push.pushed`, from the agent
+  sandbox's end-of-step push or a `git.push` during the step). With the sandbox
+  off (`sandbox.agents: off`, or `isolation: {mode: none}`) the agent pushes
+  for itself, conductor has no push of its own to go by, and no thread is
+  resolved;
 - the agent only replied, disagreed, or changed no code for it (not reported);
 - someone other than you commented in it after the feedback the run was given.
 
@@ -190,6 +197,17 @@ the run. Conductor never reads a status it posted back as CI, so a `failure`
 row can't trigger the next fix.
 
 ## Upgrading
+
+v1.6.0 changes how `on_changes_requested` treats an agent's report that it
+pushed, with the same requirements as v1.5.0 (conductor ≥ 0.68.0, github
+plugin ≥ 2.2.0). `resolve` now resolves threads only when conductor itself
+pushed the run's change (`address.push.pushed`), never on the agent's word
+alone. The `address` step sets `expect_push: true`: a step with an
+`output_schema` is otherwise a review, which conductor never pushes, so an
+agent that committed a fix had it dropped while its threads were resolved
+anyway. A fix left unpushed now fails the run (`no_progress`: the failure
+status and 😕 instead of a success). Conductor releases after 0.70.0 also fail
+such a step on their own and credit a `git.push` made during the step.
 
 v1.5.0 needs the **github connector plugin ≥ 2.2.0** and **conductor ≥
 0.68.0**:
