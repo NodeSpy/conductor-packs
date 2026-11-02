@@ -52,7 +52,7 @@
 
 pack:
   name: pr-review-team
-  version: 3.0.2
+  version: 3.1.0
   description: Multi-lens PR review (correctness / security / design …) with refute-verify, deterministic reconcile, an optional human hand-off, and calibration that learns memory, under a scope key you choose, from past reviews.
   tags: [review, github, code-quality, agents, memory]
   homepage: https://github.com/NodeSpy/conductor-packs
@@ -138,6 +138,10 @@ settings:
     type: string
     default: "15"
     desc: "pages (100 each) of teammates' review comments read per repo per calibration run"
+  review_passes:
+    type: string
+    default: "1"
+    desc: "how many times each lens reviews a PR, 1 to 3. Above 1, every lens runs that many independent sessions in parallel (same prompt, notes and checkout; no pass sees another's output), and the findings are merged before verify: the same issue raised by several passes or lenses is posted once, and a finding only one pass raised is kept. Costs that many times the lens runs, plus light-judge calls to match findings. Any other value fails the review run."
   perspectives_as_lenses:
     type: string
     default: "false"
@@ -866,9 +870,12 @@ workflows:
       #   prior_comments  on | off — off: review as if the PR had no comments
       #                   yet (a replay of a PR this pack already commented on)
       #   scope_key       another scope_key template for this run ("" = the setting)
+      #   passes          1-3 — how many times each lens reviews ("" = the
+      #                   review_passes setting)
       memory: { type: string, default: "on" }
       prior_comments: { type: string, default: "on" }
       scope_key: { type: string, default: "" }
+      passes: { type: string, default: "" }
       # The review lenses — one parallel reviewer per entry. Override per run to
       # review through a subset.
       lenses:
@@ -913,7 +920,10 @@ workflows:
       summary: "{{.reconcile.summary}}"         # the review body (one line)
       comments: "{{.reconcile.comments}}"       # [{path, line, body}] — list preserved by sole-field-ref
       review: "{{.reconcile.review}}"           # JSON {event, body, comments} — the ReviewRecord to show + post
-      findings: "{{.reconcile.findings}}"       # [{path, line, blocking, body, lens, note}] — what review-eval compares
+      findings: "{{.reconcile.findings}}"       # [{path, line, blocking, body, lens, note}] — what review-eval compares;
+                                                # with review_passes > 1 each also has agreement (passes that raised it),
+                                                # passes, lenses and also_at (the other places merged into it)
+      passes: "{{.reconcile.passes}}"           # how many times each lens reviewed
       notes: "{{.notes.count}}"                 # learned notes the lenses read
       # No `diff:` output anymore (2.10 removed it, a breaking change for any
       # consumer that reused it): a reviewer's checkout carries the real,
@@ -1044,7 +1054,19 @@ workflows:
               extra.push({ name: "Perspective: " + who, focus: String(m.text || "").trim() + " Review only for this concern; the other lenses own the rest." });
             }
           }
-          return { list: list.concat(extra), extra: extra.length };
+          // review_passes (or the passes input): each lens reviews this many times,
+          // each pass its own session. 1 = one session a lens, as before.
+          const rawPasses = String(ctx.inputs.passes == null ? "" : ctx.inputs.passes).trim();
+          const passText = rawPasses !== "" ? rawPasses : String.raw`${settings.review_passes}`.trim();
+          if (!/^[1-3]$/.test(passText))
+            throw new Error("pr-review-team: " + (rawPasses !== "" ? "the passes input" : "the review_passes setting") +
+                            " must be a whole number from 1 to 3, got " + JSON.stringify(passText));
+          const passes = Number(passText);
+          const all = list.concat(extra);
+          const runs = [];
+          if (passes === 1) runs.push.apply(runs, all);
+          else for (const l of all) for (let p = 1; p <= passes; p++) runs.push(Object.assign({}, l, { pass: p }));
+          return { list: all, extra: extra.length, passes: passes, runs: runs };
       # The lens panel. `extends:` (not `<<:`) so this step's own guidance
       # stacks UNDER the house voice rather than replacing it — and so a
       # consumer's `review-team/review` override stacks under both.
@@ -1067,7 +1089,10 @@ workflows:
         extends: *panelist
         checkout: checkout-pr
         checkout_pr: { repo: "{{.inputs.repo}}", pr: "{{.inputs.pr}}" }
-        for_each: "{{.lenses.list}}"
+        # one session per lens per pass (lenses.runs = the lenses, review_passes
+        # times over); the prompt never names the pass, so the passes are the
+        # same review run independently
+        for_each: "{{.lenses.runs}}"
         parallel: true
         guidance: "You are one lens of a panel. Stay inside your lens; another reviewer owns the rest."
         # Learned notes come from the `notes` step above, framed in the
@@ -1173,7 +1198,8 @@ workflows:
       - id: flatten
         run: js
         code: |
-          const lenses = (ctx.lenses && ctx.lenses.list) || ctx.inputs.lenses || [];
+          const lenses = (ctx.lenses && (ctx.lenses.runs || ctx.lenses.list)) || ctx.inputs.lenses || [];
+          const multi = ((ctx.lenses && ctx.lenses.passes) || 1) > 1;
           const passes = (ctx.review && ctx.review.items) || [];
           // Index every changed file's own patch once, so each finding can carry
           // just its own file's hunk(s) downstream (verify) instead of the whole
@@ -1187,14 +1213,165 @@ workflows:
             const fs = (passes[i] && passes[i].findings) || [];
             for (const f of fs) {
               const fileInfo = filesByPath[f.path];
-              out.push(Object.assign({
+              const row = Object.assign({
                 id: "f" + out.length,
                 lens: (lenses[i] || {}).name || "?",
                 patch: (fileInfo && fileInfo.patch) || "",
-              }, f));
+              }, f);
+              // which session raised it: the merge below never matches a session with itself
+              if (multi) Object.assign(row, { session: i, pass: (lenses[i] || {}).pass || 1 });
+              out.push(row);
             }
           }
           return { value: out };
+
+      # review_passes > 1: MERGE BEFORE VERIFY. The passes (and lenses) often
+      # raise the same issue; it is verified and posted once. Candidate pairs
+      # are findings from different sessions (a session never matches itself):
+      # review-eval's matcher. Identical text near the same line is the same
+      # finding; every other candidate goes to the light judge (mjudge). With
+      # one pass this is a no-op: the findings go on exactly as flattened.
+      - id: mpairs
+        run: js
+        code: |
+          // THE MATCHER (the same lines in review-eval's pairs step; a test keeps them equal).
+          // Same file, lines at most NEAR apart: identical text is the same finding
+          // outright, other text goes to the judge. Different files of the same PR:
+          // the same bug reported at two places — to the judge when the text is close
+          // (at least 3 content words shared, covering half the shorter text).
+          const NEAR = 5, CLOSE = 0.5, CLOSE_WORDS = 3;
+          const STOP = {};
+          "the and for this that with from are was were but not you your its into when then than has have had should would could can will here there also only all any one its use uses used just".split(" ").forEach(function (w) { STOP[w] = 1; });
+          const norm = function (t) { return String(t || "").split(/\s+/).join(" ").trim().toLowerCase(); };
+          const words = function (t) {
+            const o = {};
+            for (const w of norm(t).split(/[^a-z0-9_]+/)) {
+              if (w.length < 3 || STOP[w]) continue;
+              o[w.length > 3 && w.slice(-1) === "s" ? w.slice(0, -1) : w] = 1;
+            }
+            return Object.keys(o);
+          };
+          const closeness = function (x, y) {
+            const a = words(x), b = words(y), has = {};
+            a.forEach(function (w) { has[w] = 1; });
+            const k = b.filter(function (w) { return has[w]; }).length;
+            return k >= CLOSE_WORDS ? k / Math.min(a.length, b.length) : 0;
+          };
+          const candidate = function (x, y) {
+            if (String(x.path) === String(y.path)) {
+              if (Math.abs((x.line || 0) - (y.line || 0)) > NEAR) return null;
+              return { exact: norm(x.body) === norm(y.body), dist: Math.abs((x.line || 0) - (y.line || 0)) };
+            }
+            const c = closeness(x.body, y.body);
+            return c >= CLOSE ? { exact: false, dist: 1000000, close: c } : null;
+          };
+          // END MATCHER
+          const MAX_CLOSE = 3;   // judge calls a finding may spend on other files
+          const findings = (ctx.flatten && ctx.flatten.value) || [];
+          if (((ctx.lenses && ctx.lenses.passes) || 1) <= 1) return { list: [], exact: [], count: 0 };
+          const list = [], exact = [], close = [];
+          for (let i = 0; i < findings.length; i++) {
+            for (let j = i + 1; j < findings.length; j++) {
+              const x = findings[i], y = findings[j];
+              if (x.session === y.session) continue;
+              const c = candidate(x, y);
+              if (!c) continue;
+              const pair = { a: i, b: j, dist: c.dist, ref: ctx.inputs.repo + "#" + ctx.inputs.pr,
+                             base_path: String(x.path), base_line: x.line || 0, mem_path: String(y.path), mem_line: y.line || 0,
+                             base_body: String(x.body || ""), mem_body: String(y.body || "") };
+              if (c.exact) exact.push(pair);
+              else if (c.close) close.push(Object.assign(pair, { close: c.close }));
+              else list.push(pair);
+            }
+          }
+          // other-file candidates, closest first, at most MAX_CLOSE per finding
+          close.sort(function (p, q) { return q.close - p.close; });
+          const spent = {};
+          for (const pair of close) {
+            if ((spent[pair.a] || 0) >= MAX_CLOSE || (spent[pair.b] || 0) >= MAX_CLOSE) continue;
+            spent[pair.a] = (spent[pair.a] || 0) + 1; spent[pair.b] = (spent[pair.b] || 0) + 1;
+            list.push(pair);
+          }
+          return { list: list, exact: exact, count: list.length };
+      - id: mjudge
+        if: "mpairs.count > 0"
+        for_each: "{{.mpairs.list}}"
+        parallel: true
+        model: light
+        retry: { max: 6, backoff: 30s }
+        decide: &same_issue
+          state: |
+            Two review comments on {{.item.ref}}:
+
+            A, at {{.item.base_path}}:{{.item.base_line}}: {{.item.base_body}}
+
+            B, at {{.item.mem_path}}:{{.item.mem_line}}: {{.item.mem_body}}
+          questions:
+            same_issue:
+              type: noul
+              instructions: >-
+                Do A and B raise the SAME underlying issue — the same problem, even if
+                worded differently, anchored a few lines apart, or reported at two places
+                in related files (the same bug where it is defined and where it is used)?
+                Two different problems that happen to sit close together, or alike-sounding
+                concerns about unrelated code, are not the same issue.
+              criteria:
+                true: A and B point at the same problem.
+                false: They are different problems.
+      # One finding per issue: pairs best first (identical text, then the
+      # judge's P(same issue) >= 0.5, nearer lines breaking ties), joined unless
+      # that would put two findings of one session together — so a session's
+      # own findings stay apart, and between any two sessions the matching is
+      # one-to-one. Each merged finding keeps one representative (a blocking
+      # one first, then the earliest lens), unchanged, and records its
+      # agreement: how many of the passes raised it. Nothing is dropped for low
+      # agreement — a finding one pass raised goes on to verify like any other.
+      - id: merged
+        run: js
+        code: |
+          const findings = (ctx.flatten && ctx.flatten.value) || [];
+          const passes = (ctx.lenses && ctx.lenses.passes) || 1;
+          if (passes <= 1) return { value: findings, merged: 0 };
+          const SAME_AT = 0.5;
+          const answers = (ctx.mjudge && ctx.mjudge.items) || [];
+          const edges = ((ctx.mpairs && ctx.mpairs.exact) || []).map(function (e) { return Object.assign({ p: 1 }, e); });
+          ((ctx.mpairs && ctx.mpairs.list) || []).forEach(function (e, k) {
+            const a = answers[k] && answers[k].same_issue;
+            const p = a && typeof a.noul === "number" ? a.noul : 0;
+            if (p >= SAME_AT) edges.push(Object.assign({ p: p }, e));
+          });
+          edges.sort(function (x, y) { return (y.p - x.p) || (x.dist - y.dist); });
+          const group = findings.map(function (f, i) { return i; });
+          const members = findings.map(function (f, i) { return [i]; });
+          const sessions = findings.map(function (f) { const o = {}; o[f.session] = 1; return o; });
+          for (const e of edges) {
+            const ga = group[e.a], gb = group[e.b];
+            if (ga === gb) continue;
+            if (Object.keys(sessions[gb]).some(function (s) { return sessions[ga][s]; })) continue;
+            for (const i of members[gb]) { group[i] = ga; members[ga].push(i); }
+            Object.assign(sessions[ga], sessions[gb]);
+            members[gb] = [];
+          }
+          const out = [];
+          for (let g = 0; g < findings.length; g++) {
+            const m = members[g].slice().sort(function (x, y) {
+              return ((findings[y].blocking ? 1 : 0) - (findings[x].blocking ? 1 : 0)) || (x - y);
+            });
+            if (!m.length) continue;
+            const rep = findings[m[0]];
+            const raised = {}, lenses = [], at = [];
+            for (const i of m) {
+              const f = findings[i];
+              raised[f.pass || 1] = 1;
+              if (lenses.indexOf(f.lens) < 0) lenses.push(f.lens);
+              const where = String(f.path) + ":" + (f.line || 0);
+              if (where !== String(rep.path) + ":" + (rep.line || 0) && at.indexOf(where) < 0) at.push(where);
+            }
+            out.push(Object.assign({}, rep, { agreement: Object.keys(raised).length, passes: passes, raised_by: m.length,
+                                              lenses: lenses, also_at: at }));
+          }
+          out.sort(function (x, y) { return Number(x.id.slice(1)) - Number(y.id.slice(1)); });
+          return { value: out, merged: findings.length - out.length };
 
       # 2.10: the unique set of files any surviving finding touched, so the
       # next step fetches each file's head-of-PR content ONCE rather than
@@ -1202,7 +1379,7 @@ workflows:
       - id: paths
         run: js
         code: |
-          const findings = (ctx.flatten && ctx.flatten.value) || [];
+          const findings = (ctx.merged && ctx.merged.value) || [];
           const seen = {};
           const out = [];
           for (const f of findings) {
@@ -1237,7 +1414,7 @@ workflows:
       - id: windows
         run: js
         code: |
-          const findings = (ctx.flatten && ctx.flatten.value) || [];
+          const findings = (ctx.merged && ctx.merged.value) || [];
           const paths = (ctx.paths && ctx.paths.value) || [];
           const items = (ctx.headfiles && ctx.headfiles.items) || [];
           const textByPath = {};
@@ -1326,10 +1503,11 @@ workflows:
       - id: reconcile
         run: js
         code: |
-          const findings = (ctx.flatten && ctx.flatten.value) || [];
-          // verify runs once per finding, in flatten order (windows.value —
-          // verify's for_each source — is flatten.value with patch/window
-          // attached, same order). The pack's policy: refute only when
+          const findings = (ctx.merged && ctx.merged.value) || [];
+          const multi = ((ctx.lenses && ctx.lenses.passes) || 1) > 1;
+          // verify runs once per finding, in merged order (windows.value —
+          // verify's for_each source — is merged.value with patch/window
+          // attached, same order; with one pass merged.value is flatten.value). The pack's policy: refute only when
           // P(refuted) >= 0.8 — default hard to keep.
           const REFUTE_AT = 0.8;
           const verdict = {};
@@ -1346,7 +1524,10 @@ workflows:
             if (verdict[f.id] === "refuted") return false;
             return !existing[String(f.path || "") + ":" + (f.line || 0)];
           });
-          kept.sort(function (a, b) { return (b.blocking ? 1 : 0) - (a.blocking ? 1 : 0); });
+          // blocking first; with several passes, more agreement breaks a tie (two
+          // findings on one line) — a tiebreak only, never a reason to drop one
+          const agree = function (f) { return multi ? (f.agreement || 0) : 0; };
+          kept.sort(function (a, b) { return ((b.blocking ? 1 : 0) - (a.blocking ? 1 : 0)) || (agree(b) - agree(a)); });
           const seen = {}; const uniq = [];
           for (const f of kept) {
             const k = String(f.path || "") + ":" + (f.line || 0);
@@ -1370,8 +1551,12 @@ workflows:
             comments: comments,
             review: JSON.stringify({ event: event, body: summary, comments: postComments }),
             findings: uniq.map(function (f) {
-              return { path: f.path, line: f.line, blocking: !!f.blocking, body: f.body, lens: f.lens, note: f.note || "" };
+              const row = { path: f.path, line: f.line, blocking: !!f.blocking, body: f.body, lens: f.lens, note: f.note || "" };
+              // with several passes: how many raised it (agreement of passes), for the audit and review-eval — never the body
+              if (multi) Object.assign(row, { agreement: f.agreement, passes: f.passes, lenses: f.lenses, also_at: f.also_at });
+              return row;
             }),
+            passes: multi ? ctx.lenses.passes : 1,
           };
 
   # ---- The review FLOW: triage, always review, then auto-post or hand off. ----
@@ -2175,7 +2360,8 @@ triggers:
       - <<: *calib_script
         id: pick
         args: [eval-pick]
-        env: { STATE_DIR: "${settings.state_dir}", AUDIT_LOG: "${settings.audit_log}", TRUSTED_ASSOCIATIONS: "${settings.trusted_associations}" }
+        env: { STATE_DIR: "${settings.state_dir}", AUDIT_LOG: "${settings.audit_log}", TRUSTED_ASSOCIATIONS: "${settings.trusted_associations}",
+               REVIEW_PASSES: "${settings.review_passes}" }
       - id: replay
         for_each: "{{.pick.runs}}"
         workflow: review-team
@@ -2185,23 +2371,56 @@ triggers:
           memory: "{{.item.memory}}"
           prior_comments: "off"
           scope_key: "{{.pick.scope_key}}"
+          passes: "{{.pick.passes}}"          # every arm, the control's too: "" = the review_passes setting
       # What is compared with what. baseline=memory: each PR's memory-off
       # findings (A) with its memory-on findings (M) and, with the control arm,
       # A with the second memory-off run (B), and B with M (which of M's
       # additions B raised too). baseline=team: the
       # comments trusted engineers left (A) with each run's findings (B), once
-      # per run. Candidate pairs: same file, lines at most NEAR apart.
-      # Identical text is the same finding outright; every other candidate
-      # pair goes to the judge.
+      # per run. Candidate pairs: the matcher — same file, lines at most NEAR
+      # apart (identical text is the same finding outright), or different files
+      # with close text (at most MAX_CLOSE such pairs per finding); every
+      # candidate but an identical one goes to the judge.
       - id: pairs
         run: js
         code: |
-          const NEAR = 5;
+          // THE MATCHER (the same lines in review-eval's pairs step; a test keeps them equal).
+          // Same file, lines at most NEAR apart: identical text is the same finding
+          // outright, other text goes to the judge. Different files of the same PR:
+          // the same bug reported at two places — to the judge when the text is close
+          // (at least 3 content words shared, covering half the shorter text).
+          const NEAR = 5, CLOSE = 0.5, CLOSE_WORDS = 3;
+          const STOP = {};
+          "the and for this that with from are was were but not you your its into when then than has have had should would could can will here there also only all any one its use uses used just".split(" ").forEach(function (w) { STOP[w] = 1; });
+          const norm = function (t) { return String(t || "").split(/\s+/).join(" ").trim().toLowerCase(); };
+          const words = function (t) {
+            const o = {};
+            for (const w of norm(t).split(/[^a-z0-9_]+/)) {
+              if (w.length < 3 || STOP[w]) continue;
+              o[w.length > 3 && w.slice(-1) === "s" ? w.slice(0, -1) : w] = 1;
+            }
+            return Object.keys(o);
+          };
+          const closeness = function (x, y) {
+            const a = words(x), b = words(y), has = {};
+            a.forEach(function (w) { has[w] = 1; });
+            const k = b.filter(function (w) { return has[w]; }).length;
+            return k >= CLOSE_WORDS ? k / Math.min(a.length, b.length) : 0;
+          };
+          const candidate = function (x, y) {
+            if (String(x.path) === String(y.path)) {
+              if (Math.abs((x.line || 0) - (y.line || 0)) > NEAR) return null;
+              return { exact: norm(x.body) === norm(y.body), dist: Math.abs((x.line || 0) - (y.line || 0)) };
+            }
+            const c = closeness(x.body, y.body);
+            return c >= CLOSE ? { exact: false, dist: 1000000, close: c } : null;
+          };
+          // END MATCHER
+          const MAX_CLOSE = 3;   // judge calls a finding may spend on other files
           const team = ctx.pick && ctx.pick.mode === "team";
           const humans = (ctx.pick && ctx.pick.humans) || {};
           const runs = (ctx.pick && ctx.pick.runs) || [];
           const items = (ctx.replay && ctx.replay.items) || [];
-          const norm = function (t) { return String(t || "").split(/\s+/).join(" ").trim().toLowerCase(); };
           const prs = [], byRef = {};
           // arms: A memory off, B memory off again (the control), M memory on
           for (let i = 0; i < runs.length; i++) {
@@ -2229,14 +2448,26 @@ triggers:
           }
           const list = [], exact = [];
           for (const G of groups) {
+            const close = [];
             G.a.forEach(function (b, bi) {
               G.b.forEach(function (m, mi) {
-                if (String(b.path) !== String(m.path) || Math.abs((b.line || 0) - (m.line || 0)) > NEAR) return;
-                const pair = { g: G.g, ref: G.ref, b: bi, m: mi, path: String(b.path), base_line: b.line || 0, mem_line: m.line || 0,
+                const c = candidate(b, m);
+                if (!c) return;
+                const pair = { g: G.g, ref: G.ref, b: bi, m: mi, dist: c.dist, path: String(b.path), base_path: String(b.path),
+                               mem_path: String(m.path), base_line: b.line || 0, mem_line: m.line || 0,
                                base_body: String(b.body || ""), mem_body: String(m.body || "") };
-                (norm(b.body) === norm(m.body) ? exact : list).push(pair);
+                if (c.exact) exact.push(pair);
+                else if (c.close) close.push(Object.assign(pair, { close: c.close }));
+                else list.push(pair);
               });
             });
+            close.sort(function (p, q) { return q.close - p.close; });
+            const spentA = {}, spentB = {};
+            for (const pair of close) {
+              if ((spentA[pair.b] || 0) >= MAX_CLOSE || (spentB[pair.m] || 0) >= MAX_CLOSE) continue;
+              spentA[pair.b] = (spentA[pair.b] || 0) + 1; spentB[pair.m] = (spentB[pair.m] || 0) + 1;
+              list.push(pair);
+            }
           }
           return { mode: team ? "team" : "memory", prs: prs, list: list, exact: exact, count: list.length };
       - id: judge
@@ -2245,28 +2476,10 @@ triggers:
         parallel: true
         model: light
         retry: { max: 6, backoff: 30s }
-        decide:
-          state: |
-            Two review comments on {{.item.ref}}, both on {{.item.path}}
-            (lines {{.item.base_line}} and {{.item.mem_line}}).
-
-            A: {{.item.base_body}}
-
-            B: {{.item.mem_body}}
-          questions:
-            same_issue:
-              type: noul
-              instructions: >-
-                Do A and B raise the SAME underlying issue — the same problem in the same
-                code — even if worded differently or anchored a few lines apart? Two
-                different problems that happen to sit close together are not the same
-                issue.
-              criteria:
-                true: A and B point at the same problem.
-                false: They are different problems.
+        decide: *same_issue      # the merge's judge (review-team/mjudge): one question, one meaning
       # One-to-one matching within each comparison: the most likely pairs
       # first (identical text, then the judge's P(same issue) >= 0.5, closer
-      # lines breaking ties). baseline=memory: a memory-off finding with no
+      # lines breaking ties, a pair across files last). baseline=memory: a memory-off finding with no
       # match was DROPPED with memory, a memory-on one with no match ADDED;
       # with the control, each finding is also marked matched or not against
       # the other arms — the report's statistics (calibration.py) read the marks.
@@ -2290,7 +2503,7 @@ triggers:
           const at = function (f) { return String(f.path) + ":" + (f.line || 0); };
           const match = function (g) {
             const c = (cands[g] || []).slice().sort(function (x, y) {
-              return (y.p - x.p) || (Math.abs(x.base_line - x.mem_line) - Math.abs(y.base_line - y.mem_line));
+              return (y.p - x.p) || (x.dist - y.dist);   // nearer lines first; another file last
             });
             const usedA = {}, usedB = {}, pairs = [];
             for (const x of c) {
