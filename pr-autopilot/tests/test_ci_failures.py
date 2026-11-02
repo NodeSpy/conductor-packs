@@ -176,7 +176,24 @@ class Wiring(unittest.TestCase):
     def test_other_fixers_get_no_ci_surface(self):
         for name in ("on_merge_conflict", "on_changes_requested", "on_new_comment"):
             for s in trigger(name)["steps"]:
-                self.assertNotIn("skill", s, name)
+                verbs = (s.get("skill") or {}).get("verbs") or {}
+                self.assertNotIn("github.check_failures", verbs, name)
+
+    def test_feedback_fixers_can_answer_and_nothing_else(self):
+        # The agents answering reviews and comments may post replies (pinned
+        # to the run's repo, as the operator); no other verb, and no other
+        # fixer gets them.
+        answer = {"github.reply", "github.comment"}
+        for name in ("on_changes_requested", "on_new_comment"):
+            agents = [s for s in trigger(name)["steps"] if s.get("type") == "agent"]
+            self.assertTrue(agents, name)
+            for s in agents:
+                self.assertEqual(set(s["skill"]["verbs"]), answer, name)
+                self.assertTrue(all(v == {} for v in s["skill"]["verbs"].values()), name)
+        for name in ("on_merge_conflict", "on_failing_checks"):
+            for s in trigger(name)["steps"]:
+                verbs = (s.get("skill") or {}).get("verbs") or {}
+                self.assertFalse(answer & set(verbs), name)
 
 
 if __name__ == "__main__":
