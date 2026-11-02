@@ -13,7 +13,9 @@ person. It never writes memory: the pack's memory.remember step does that.
 """
 import datetime as dt
 import json
+import math
 import os
+import random
 import re
 import secrets
 import subprocess
@@ -1009,14 +1011,19 @@ def ledger_add(refs, mode):
 
 EVAL_COUNT = 5
 EVAL_MAX = 50
-EVAL_TARGET = 0.9   # memory-on should keep at least this share of the baseline findings
+EVAL_TARGET = 0.9   # the old fixed target: memory-on keeps at least this share of the baseline findings
+EVAL_SEED = 1       # the bootstrap's seed: the same runs always give the same interval
+EVAL_RESAMPLES = 2000
+EVAL_LEVEL = 0.9    # the gap's interval: 90%
 REF_RE = re.compile(r"([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#([0-9]+)")
 
 
 def eval_pick(ctx):
     """Which PRs review-eval replays: the ones named (prs=), else the most recent
     `count` this pack reviewed in `repos` (the audit log's submit_review records).
-    Each becomes two runs, memory off then on."""
+    Each becomes three runs — memory off (arm A), memory off again (B, the control:
+    how much two runs differ with nothing changed), memory on (M) — or two, A and
+    M, with --input control=false."""
     inputs = ctx.get("inputs") or {}
     repos = parse_repos(inputs.get("repos") or "")
     raw_count = str(inputs.get("count") or EVAL_COUNT).strip()
@@ -1028,6 +1035,10 @@ def eval_pick(ctx):
         raise SystemExit("review-eval: --input baseline= takes memory or team, got %r" % inputs.get("baseline"))
     named = [x for x in re.split(r"[\s,]+", str(inputs.get("prs") or "")) if x]
     refs = []
+    control = parse_switch(inputs.get("control"), True, "control")
+    raw_seed = str(inputs.get("seed") or EVAL_SEED).strip()
+    if not raw_seed.isdigit():
+        raise SystemExit("review-eval: --input seed= takes a whole number, got %r" % raw_seed)
     if mode == "team":
         return eval_pick_team(inputs, repos, count, named)
     if named:
@@ -1053,9 +1064,23 @@ def eval_pick(ctx):
     runs = []
     for ref in refs:
         repo, n = ref.rsplit("#", 1)
-        runs += [{"repo": repo, "pr": int(n), "memory": "off"}, {"repo": repo, "pr": int(n), "memory": "on"}]
+        runs.append({"repo": repo, "pr": int(n), "memory": "off", "arm": "A"})
+        if control:
+            runs.append({"repo": repo, "pr": int(n), "memory": "off", "arm": "B"})
+        runs.append({"repo": repo, "pr": int(n), "memory": "on", "arm": "M"})
     return {"mode": "memory", "prs": refs, "runs": runs, "count": len(refs), "humans": {}, "trained": [], "held_out": [],
-            "scope_key": str(inputs.get("scope_key") or "").strip()}
+            "scope_key": str(inputs.get("scope_key") or "").strip(), "control": control, "seed": int(raw_seed)}
+
+
+def parse_switch(raw, default, name):
+    v = str(raw if raw is not None else "").strip().lower()
+    if v == "":
+        return default
+    if v in ("true", "yes", "on", "1"):
+        return True
+    if v in ("false", "no", "off", "0"):
+        return False
+    raise SystemExit("review-eval: --input %s= takes true or false, got %r" % (name, raw))
 
 
 EVAL_TEAM_PAGES = 5   # pages (100 each) of a repo's review comments scanned for candidate PRs
@@ -1145,10 +1170,102 @@ def eval_pick_team(inputs, repos, count, named):
             "trained": flagged, "held_out": held_out, "scope_key": str(inputs.get("scope_key") or "").strip()}
 
 
+# ---- the control arm: how far apart two memory-off runs land, and is memory further? ----
+#
+# Per PR, compare() marks each finding matched or not: a_in_b (each A finding: did
+# B raise it too?), b_in_a (each B finding: did A?), a_in_m (each A finding: did M
+# keep it?). Pooled over PRs:
+#   control agreement = mean of (A's findings B also found, B's findings A also found)
+#   memory retention  = A's findings M also found
+#   gap               = control agreement - memory retention
+# A positive gap is memory losing more than chance does. Its interval is a seeded
+# bootstrap: resample the PRs, and within each the A and B findings (an A finding
+# carries both of its marks, so A-vs-B and A-vs-M stay paired); with one PR that
+# is the per-PR interval.
+
+
+def share(k, n):
+    """k of n; nothing to find is nothing missed."""
+    return k / n if n else 1.0
+
+
+def control_point(units):
+    """(control agreement, memory retention, gap) pooled over units — one per PR:
+    {"a_in_b": [bool], "b_in_a": [bool], "a_in_m": [bool]} (a_in_b and a_in_m per A finding)."""
+    na = sum(len(u["a_in_b"]) for u in units)
+    nb = sum(len(u["b_in_a"]) for u in units)
+    ctrl = (share(sum(map(sum, (u["a_in_b"] for u in units))), na) +
+            share(sum(map(sum, (u["b_in_a"] for u in units))), nb)) / 2
+    mem = share(sum(map(sum, (u["a_in_m"] for u in units))), na)
+    return ctrl, mem, ctrl - mem
+
+
+def control_interval(units, seed, resamples=EVAL_RESAMPLES, level=EVAL_LEVEL):
+    """The gap's bootstrap interval (lo, hi) at `level`: deterministic for a seed."""
+    rng = random.Random(seed)
+    gaps = []
+    for _ in range(resamples):
+        draw = []
+        for u in (rng.choice(units) for _ in units):
+            ia = [rng.randrange(len(u["a_in_b"])) for _ in u["a_in_b"]]
+            ib = [rng.randrange(len(u["b_in_a"])) for _ in u["b_in_a"]]
+            draw.append({"a_in_b": [u["a_in_b"][i] for i in ia], "a_in_m": [u["a_in_m"][i] for i in ia],
+                         "b_in_a": [u["b_in_a"][i] for i in ib]})
+        gaps.append(control_point(draw)[2])
+    gaps.sort()
+    tail = (1 - level) / 2
+    return gaps[int(math.floor(tail * resamples))], gaps[int(math.ceil((1 - tail) * resamples)) - 1]
+
+
+def control_verdict(lo, hi):
+    """Memory is crowding the review only when its retention is credibly below the control's
+    agreement: the whole interval of the gap above 0."""
+    if lo > 0:
+        return "crowding"
+    return "better" if hi < 0 else "ok"
+
+
+def control_stats(prs, seed):
+    """Overall and per-PR control numbers; None when the runs had no control arm."""
+    units = [pr["control"] for pr in prs if isinstance(pr.get("control"), dict)]
+    if not units or len(units) != len(prs):
+        return None
+    ctrl, mem, gap = control_point(units)
+    lo, hi = control_interval(units, seed)
+    per = []
+    for i, u in enumerate(units):
+        c, m, g = control_point([u])
+        plo, phi = control_interval([u], seed + 1 + i)
+        per.append({"agreement": c, "retention": m, "gap": g, "lo": plo, "hi": phi})
+    verdict = control_verdict(lo, hi)
+    return {"agreement": ctrl, "retention": mem, "gap": gap, "lo": lo, "hi": hi, "level": EVAL_LEVEL,
+            "verdict": "ok" if verdict == "better" else verdict, "better": verdict == "better",
+            "seed": seed, "resamples": EVAL_RESAMPLES, "prs": per}
+
+
+def pts(x):
+    return "%+d pts" % round(100 * x)
+
+
 def eval_dir():
     d = os.path.join(cache_dir(), "eval")
     os.makedirs(d, exist_ok=True)
     return d
+
+
+def control_summary(t, c, scope_key):
+    return ("review-eval: %d PR(s), %d learned note(s) read; findings A %d / B %d / M %d; control agreement %s, "
+            "memory retention %s, gap %s (%d%% interval %s to %s) — %s; baseline %d finding(s), %d retained with memory "
+            "(%s), %d dropped, %d added (%d also found by the control, %d citing a note) [fixed %d%% target: %s]%s" % (
+                t.get("prs", 0), t.get("notes", 0), t.get("baseline", 0), t.get("control_findings", 0), t.get("with_memory", 0),
+                pct(c["agreement"]), pct(c["retention"]), pts(c["gap"]), round(100 * c["level"]), pts(c["lo"]), pts(c["hi"]),
+                "memory retains more than a second memory-off run agrees: notes steer, the review stands" if c["better"] else
+                {"ok": "memory retention is within the noise of two memory-off runs: notes steer, the review stands",
+                 "crowding": "memory retention is credibly below two memory-off runs' agreement: the notes are crowding out the review"
+                 }[c["verdict"]],
+                t.get("baseline", 0), t.get("retained", 0), pct(t.get("retention", 1)), t.get("dropped", 0), t.get("added", 0),
+                t.get("added_in_control", 0), t.get("added_citing_note", 0), round(100 * EVAL_TARGET), t.get("verdict_fixed", "?"),
+                (" [scope_key %s]" % scope_key) if scope_key else ""))
 
 
 def eval_summary(t, scope_key):
@@ -1217,6 +1334,36 @@ def team_report_lines(t, prs, pick, summary, stamp):
     return lines
 
 
+def control_head(t, c, summary, scope_key, stamp):
+    lvl = round(100 * c["level"])
+    return ["# review-eval — %s" % stamp.strftime("%Y-%m-%d %H:%M UTC"), "",
+            "Each PR was reviewed three times by the lens panel — memory off (A), memory off again (B), memory on "
+            "(M), the same steps and model tiers — with nothing posted and nothing written to memory.", "",
+            "Two runs differ even when nothing changes, so memory is measured against that noise floor. Control "
+            "agreement: the share of A's findings B also raised, averaged with the share of B's that A raised. "
+            "Memory retention: the share of A's findings M also raised. The gap is control minus memory; its %d%% "
+            "interval is a bootstrap (seed %d, %d resamples) over the PRs and, within each, their findings. Crowding "
+            "only when the whole interval is above 0 — memory credibly loses more than a second memory-off run does."
+            % (lvl, c["seed"], c["resamples"]), "",
+            "## Overall", "", summary, "",
+            "| | |", "|---|---|",
+            "| PRs | %d |" % t.get("prs", 0),
+            "| learned notes read (memory on) | %d |" % t.get("notes", 0),
+            "| findings: A (memory off) | %d |" % t.get("baseline", 0),
+            "| findings: B (memory off, control) | %d |" % t.get("control_findings", 0),
+            "| findings: M (memory on) | %d |" % t.get("with_memory", 0),
+            "| control agreement (A vs B) | %s |" % pct(c["agreement"]),
+            "| memory retention (A vs M) | %s |" % pct(c["retention"]),
+            "| gap (control - memory) | %s, %d%% interval %s to %s |" % (pts(c["gap"]), lvl, pts(c["lo"]), pts(c["hi"])),
+            "| verdict | %s |" % ("ok (memory better)" if c["better"] else c["verdict"]),
+            "| retained (A in M) | %d (%d%%) |" % (t.get("retained", 0), round(100 * t.get("retention", 1))),
+            "| dropped with memory | %d |" % t.get("dropped", 0),
+            "| added with memory | %d (%d also found by the control, so not memory's doing; %d citing a note) |" % (
+                t.get("added", 0), t.get("added_in_control", 0), t.get("added_citing_note", 0)),
+            "| old verdict (fixed %d%% target) | %s |" % (round(100 * EVAL_TARGET), t.get("verdict_fixed", "?")),
+            "| scope_key | %s |" % (scope_key or "(the setting)"), ""]
+
+
 def eval_report(ctx):
     """Write <cache>/eval/<date>.md and latest.json; return the summary."""
     cmp = ctx.get("compare") or {}
@@ -1224,7 +1371,13 @@ def eval_report(ctx):
     pick = ctx.get("pick") or {}
     scope_key = pick.get("scope_key") or ""
     team = cmp.get("mode") == "team"
-    summary = team_summary(totals, pick) if team else eval_summary(totals, scope_key)
+    ctl = None if team else control_stats(prs, int(pick.get("seed") or EVAL_SEED))
+    if ctl:
+        # the verdict now weighs memory against the control; the fixed-target one is kept beside it
+        totals = dict(totals, verdict_fixed=totals.get("verdict"), verdict=ctl["verdict"], control=ctl)
+        summary = control_summary(totals, ctl, scope_key)
+    else:
+        summary = team_summary(totals, pick) if team else eval_summary(totals, scope_key)
     t = now()
     d = eval_dir()
     path = os.path.join(d, t.strftime("%Y-%m-%d") + ".md")
@@ -1240,7 +1393,8 @@ def eval_report(ctx):
         print(summary, file=sys.stderr)
         return {"summary": summary, "path": path, "totals": totals, "mode": "team"}
     fmt = lambda f: "%s:%s — %s" % (f.get("path"), f.get("line"), " ".join(str(f.get("body") or "").split())[:300])
-    lines = ["# review-eval — %s" % t.strftime("%Y-%m-%d %H:%M UTC"), "",
+    lines = (control_head(totals, ctl, summary, scope_key, t) if ctl else
+             ["# review-eval — %s" % t.strftime("%Y-%m-%d %H:%M UTC"), "",
              "Each PR was reviewed twice by the lens panel — memory off (the baseline), then memory on — "
              "with nothing posted and nothing written to memory.", "",
              "Target: memory-on retains nearly all baseline findings (%d%% or more). A large drop means the "
@@ -1255,18 +1409,24 @@ def eval_report(ctx):
              "| retained | %d (%d%%) |" % (totals.get("retained", 0), round(100 * totals.get("retention", 1))),
              "| dropped with memory | %d |" % totals.get("dropped", 0),
              "| added with memory | %d (%d citing a note) |" % (totals.get("added", 0), totals.get("added_citing_note", 0)),
-             "| scope_key | %s |" % (scope_key or "(the setting)"), ""]
-    for pr in prs:
+             "| scope_key | %s |" % (scope_key or "(the setting)"), ""])
+    for i, pr in enumerate(prs):
         lines += ["## %s" % pr.get("ref"), "",
                   "%d note(s) read; baseline %d, with memory %d; retained %d (%d%%), dropped %d, added %d." % (
                       pr.get("notes", 0), pr.get("baseline", 0), pr.get("with_memory", 0), len(pr.get("retained") or []),
                       round(100 * pr.get("retention", 1)), len(pr.get("dropped") or []), len(pr.get("added") or [])), ""]
+        if ctl:
+            c = ctl["prs"][i]
+            lines += ["Findings A %d, B %d, M %d; control agreement %s, memory retention %s, gap %s (%d%% interval %s to %s)." % (
+                          pr.get("baseline", 0), len(pr["control"]["b_in_a"]), pr.get("with_memory", 0), pct(c["agreement"]),
+                          pct(c["retention"]), pts(c["gap"]), round(100 * ctl["level"]), pts(c["lo"]), pts(c["hi"])), ""]
         if pr.get("dropped"):
             lines.append("Dropped with memory (the baseline raised these; memory-on did not):")
             lines += ["- " + fmt(f) for f in pr["dropped"]]
         if pr.get("added"):
             lines.append("Added with memory:")
-            lines += ["- " + fmt(f) + ((" [note: %s]" % " ".join(str(f["note"]).split())[:120]) if f.get("note") else "")
+            lines += ["- " + fmt(f) + ((" [note: %s]" % " ".join(str(f["note"]).split())[:120]) if f.get("note") else "") +
+                      (" [the control found it too]" if f.get("in_control") else "")
                       for f in pr["added"]]
         if pr.get("retained"):
             lines.append("Retained:")

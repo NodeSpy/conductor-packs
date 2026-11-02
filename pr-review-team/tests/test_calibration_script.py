@@ -392,9 +392,10 @@ class EvalScriptTest(unittest.TestCase):
         self.assertEqual(res.returncode, 0, res.stderr)
         out = json.loads(res.stdout)
         self.assertEqual(out["prs"], ["acme/api#3", "acme/web#7", "acme/api#2"])
-        self.assertEqual(out["runs"][:2], [{"repo": "acme/api", "pr": 3, "memory": "off"},
-                                           {"repo": "acme/api", "pr": 3, "memory": "on"}])
-        self.assertEqual((len(out["runs"]), out["scope_key"]), (6, ""))
+        self.assertEqual(out["runs"][:3], [{"repo": "acme/api", "pr": 3, "memory": "off", "arm": "A"},
+                                           {"repo": "acme/api", "pr": 3, "memory": "off", "arm": "B"},
+                                           {"repo": "acme/api", "pr": 3, "memory": "on", "arm": "M"}])
+        self.assertEqual((len(out["runs"]), out["scope_key"], out["control"]), (9, "", True))
         self.assertEqual(json.loads(self.pick(repos="acme/api").stdout)["count"], 3)   # default 5, only 3 exist
 
     def test_named_prs_and_a_scope_key(self):

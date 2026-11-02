@@ -52,7 +52,7 @@
 
 pack:
   name: pr-review-team
-  version: 3.0.1
+  version: 3.0.2
   description: Multi-lens PR review (correctness / security / design …) with refute-verify, deterministic reconcile, an optional human hand-off, and calibration that learns memory, under a scope key you choose, from past reviews.
   tags: [review, github, code-quality, agents, memory]
   homepage: https://github.com/NodeSpy/conductor-packs
@@ -2149,9 +2149,13 @@ triggers:
   #   … [--input scope_key='org:{{.owner}}']   (try another key on the same PRs)
   # Replays PRs this pack already reviewed (the audit log's submit_review
   # records; count = the most recent N in the repos, default 5) through
-  # review-team twice — memory off, then memory on: the same steps and model
-  # tiers — as if the PR had no comments yet, and compares what each run
-  # would have posted. It POSTS NOTHING (review-team never posts and nothing
+  # review-team three times — memory off (A), memory off again (B, the
+  # control), memory on (M): the same steps and model tiers — as if the PR had
+  # no comments yet, and compares what each run would have posted. The
+  # verdict weighs memory retention (A vs M) against the control's agreement
+  # (A vs B): crowding only when it is credibly below (calibration.py,
+  # control_stats). --input control=false: A and M only, the old fixed 90%
+  # target. It POSTS NOTHING (review-team never posts and nothing
   # here hands off), WRITES NO MEMORY (the lenses' memory is off; the notes
   # step only reads), and writes only its report:
   # <state_dir>/pr-review-team/eval/<date>.md. Grant review-eval/pick and
@@ -2182,7 +2186,9 @@ triggers:
           prior_comments: "off"
           scope_key: "{{.pick.scope_key}}"
       # What is compared with what. baseline=memory: each PR's memory-off
-      # findings (A) with its memory-on findings (B). baseline=team: the
+      # findings (A) with its memory-on findings (M) and, with the control arm,
+      # A with the second memory-off run (B), and B with M (which of M's
+      # additions B raised too). baseline=team: the
       # comments trusted engineers left (A) with each run's findings (B), once
       # per run. Candidate pairs: same file, lines at most NEAR apart.
       # Identical text is the same finding outright; every other candidate
@@ -2197,10 +2203,14 @@ triggers:
           const items = (ctx.replay && ctx.replay.items) || [];
           const norm = function (t) { return String(t || "").split(/\s+/).join(" ").trim().toLowerCase(); };
           const prs = [], byRef = {};
+          // arms: A memory off, B memory off again (the control), M memory on
           for (let i = 0; i < runs.length; i++) {
             const run = runs[i], got = items[i] || {}, ref = run.repo + "#" + run.pr;
             if (!byRef[ref]) { byRef[ref] = { ref: ref, off: { findings: [], notes: 0 }, on: { findings: [], notes: 0 } }; prs.push(byRef[ref]); }
-            byRef[ref][run.memory] = { findings: Array.isArray(got.findings) ? got.findings : [], notes: Number(got.notes || 0) };
+            const arm = run.arm || (run.memory === "on" ? "M" : "A");
+            const r = { findings: Array.isArray(got.findings) ? got.findings : [], notes: Number(got.notes || 0) };
+            if (arm === "B") byRef[ref].control = r;
+            else byRef[ref][arm === "M" ? "on" : "off"] = r;
           }
           const groups = [];
           for (const p of prs) {
@@ -2210,7 +2220,11 @@ triggers:
               groups.push({ g: p.ref + "|off", ref: p.ref, a: h, b: p.off.findings });
               groups.push({ g: p.ref + "|on", ref: p.ref, a: h, b: p.on.findings });
             } else {
-              groups.push({ g: p.ref, ref: p.ref, a: p.off.findings, b: p.on.findings });
+              groups.push({ g: p.ref + "|AM", ref: p.ref, a: p.off.findings, b: p.on.findings });
+              if (p.control) {
+                groups.push({ g: p.ref + "|AB", ref: p.ref, a: p.off.findings, b: p.control.findings });
+                groups.push({ g: p.ref + "|BM", ref: p.ref, a: p.control.findings, b: p.on.findings });
+              }
             }
           }
           const list = [], exact = [];
@@ -2253,7 +2267,9 @@ triggers:
       # One-to-one matching within each comparison: the most likely pairs
       # first (identical text, then the judge's P(same issue) >= 0.5, closer
       # lines breaking ties). baseline=memory: a memory-off finding with no
-      # match was DROPPED with memory, a memory-on one with no match ADDED.
+      # match was DROPPED with memory, a memory-on one with no match ADDED;
+      # with the control, each finding is also marked matched or not against
+      # the other arms — the report's statistics (calibration.py) read the marks.
       # baseline=team: recall = the engineers' comments matched / all of
       # them; noise = the run's findings no engineer raised / all its findings.
       - id: compare
@@ -2310,24 +2326,31 @@ triggers:
             return { mode: "team", prs: rows, totals: T };
           }
           const totals = { prs: prs.length, baseline: 0, with_memory: 0, retained: 0, dropped: 0, added: 0, added_citing_note: 0, notes: 0 };
+          const control = prs.length > 0 && prs.every(function (pr) { return !!pr.control; });
+          if (control) { totals.control_findings = 0; totals.added_in_control = 0; }
+          const marks = function (n, used) { const o = []; for (let i = 0; i < n; i++) o.push(!!used[i]); return o; };
           const out = [];
           for (const pr of prs) {
             const base = pr.off.findings, mem = pr.on.findings;
-            const c = (cands[pr.ref] || []).slice().sort(function (x, y) {
-              return (y.p - x.p) || (Math.abs(x.base_line - x.mem_line) - Math.abs(y.base_line - y.mem_line));
+            const am = match(pr.ref + "|AM");
+            const retained = am.pairs.map(function (x) {
+              return { base: at(base[x.b]), memory: at(mem[x.m]), p: x.p, body: String(base[x.b].body || "") };
             });
-            const usedB = {}, usedM = {}, retained = [];
-            for (const x of c) {
-              if (usedB[x.b] || usedM[x.m]) continue;
-              usedB[x.b] = usedM[x.m] = 1;
-              retained.push({ base: at(base[x.b]), memory: at(mem[x.m]), p: x.p, body: String(base[x.b].body || "") });
-            }
-            const dropped = base.filter(function (f, i) { return !usedB[i]; });
-            const added = mem.filter(function (f, i) { return !usedM[i]; });
+            const dropped = base.filter(function (f, i) { return !am.usedA[i]; });
+            let added = mem.filter(function (f, i) { return !am.usedB[i]; });
             const row = { ref: pr.ref, notes: pr.on.notes, baseline: base.length, with_memory: mem.length,
                           retained: retained, dropped: dropped, added: added,
                           added_citing_note: added.filter(function (f) { return !!f.note; }).length,
                           retention: base.length ? retained.length / base.length : 1 };
+            if (control) {
+              const ctl = pr.control.findings, ab = match(pr.ref + "|AB"), bm = match(pr.ref + "|BM");
+              // an addition the control raised too came from run-to-run noise, not from memory
+              row.added = added = mem.map(function (f, i) { return am.usedB[i] ? null : Object.assign({}, f, { in_control: !!bm.usedB[i] }); })
+                                     .filter(function (f) { return f; });
+              row.added_in_control = added.filter(function (f) { return f.in_control; }).length;
+              row.control = { a_in_b: marks(base.length, ab.usedA), b_in_a: marks(ctl.length, ab.usedB), a_in_m: marks(base.length, am.usedA) };
+              totals.control_findings += ctl.length; totals.added_in_control += row.added_in_control;
+            }
             out.push(row);
             totals.baseline += base.length; totals.with_memory += mem.length; totals.retained += retained.length;
             totals.dropped += dropped.length; totals.added += added.length; totals.added_citing_note += row.added_citing_note;
