@@ -22,7 +22,7 @@
 #   packs:
 #     autopilot:
 #       source: github.com/NodeSpy/conductor-packs//pr-autopilot
-#       version: "~> 1.5"
+#       version: "~> 1.6"
 #       # heavy fleet resolves against whatever your runtime offers; pin if you like:
 #       #   models: { heavy: ["claude-opus-*"] }
 #       triggers:
@@ -63,7 +63,7 @@
 
 pack:
   name: pr-autopilot
-  version: 1.5.0
+  version: 1.6.0
   description: Autopilot for routine PR events — fix red CI, resolve conflicts, address requested changes, answer comments. One agent per event, scoped to your repos.
   tags: [github, ci, automation, agents, maintenance]
   homepage: https://github.com/NodeSpy/conductor-packs
@@ -84,6 +84,9 @@ pack:
     # 0.68.0: the agent sandbox, and with it the skill endpoint a sandboxed
     # agent reaches conductor through — how the CI fixer re-reads
     # github.check_failures after it pushes, with no GitHub access of its own.
+    # It is also the release whose agent steps carry a `push` output —
+    # conductor's own report of the end-of-step push of a sandboxed agent's
+    # work — which `resolve` gates on instead of the agent's report (1.6.0).
     conductor: ">=0.68.0"
     # github 2.2.0: github.check_failures (each failing check's output,
     # annotations, and an Actions job's failed-step log), and the
@@ -121,7 +124,7 @@ settings:
   status_failed:    { type: string, default: "gave up: {{.run.reason}}", desc: "failure description (on the PR's current head)" }
   status_stopped:   { type: string, default: "stopped — {{.run.reason}}", desc: "success description when the PR merged/closed under the run (on the commit the run started on)" }
   stop_unreact:     { type: boolean, default: true, desc: "when the PR merged/closed under the run, take the 👀 back off the review/comment" }
-  resolve_threads:  { type: boolean, default: true, desc: "after a changes_requested run, resolve the review threads its agent reports its pushed change addressed (never ones it only replied to or disagreed with, nor ones with newer feedback)" }
+  resolve_threads:  { type: boolean, default: true, desc: "after a changes_requested run whose change conductor pushed, resolve the review threads its agent reports that change addressed (never ones it only replied to or disagreed with, nor ones with newer feedback; nothing when nothing was pushed)" }
 
 x-templates:
   # One worker shape for every behavior: a strong model in its own worktree,
@@ -318,6 +321,11 @@ triggers:
       - id: address
         <<: *fixer
         guidance: "Reviewers left feedback on this PR. review_comments and outstanding_reviews hold ALL of it that is still waiting on you, not only the review that fired this run; an earlier run may already have handled some, so check the PR's current code before changing anything. Address the feedback concretely and push; don't argue in code. If something can't be done, that's a reason to leave a brief reply, not to guess. When you finish, report addressed_comments: the id of every review comment (review_comments[].id) whose point your pushed change fully addresses. Leave out any you only replied to, disagreed with, or did not change code for: those threads stay open for the reviewer."
+        # A fixer: conductor pushes its work. An output_schema alone reads as
+        # a review, whose commits conductor never pushes — so a fixer that
+        # also reports a result says so. A change left unpushed fails the
+        # step (no_progress) rather than passing as done.
+        expect_push: true
         # How the agent reports what it addressed: its structured result
         # (delivered with step.done, or as its final reply where step.done
         # is unavailable). Every field is optional, so a run with nothing
@@ -330,9 +338,13 @@ triggers:
       - id: resolve
         # Resolve exactly the threads the agent reported addressed, and only
         # those still without newer feedback from someone else (seen_through:
-        # the latest submission this run was given). Off with
+        # the latest submission this run was given) — and only when conductor
+        # pushed the change: address.push.pushed is conductor's own report of
+        # its push (at the step's end, or a git.push during it), never the
+        # agent's. Nothing pushed (or an unsandboxed agent, which pushes
+        # itself: no push output) leaves every thread open. Off with
         # settings.resolve_threads: false.
-        if: "${settings.resolve_threads}"
+        if: "${settings.resolve_threads} && address.push.pushed"
         uses: github.resolve_threads
         options: { repo: "{{.repo}}", pr: "{{.pr}}", comments: "{{.address.addressed_comments}}", seen_through: "{{.feedback_cursor}}" }
       - id: rerequest
