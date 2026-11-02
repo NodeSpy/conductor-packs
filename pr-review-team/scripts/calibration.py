@@ -1039,8 +1039,9 @@ def eval_pick(ctx):
     raw_seed = str(inputs.get("seed") or EVAL_SEED).strip()
     if not raw_seed.isdigit():
         raise SystemExit("review-eval: --input seed= takes a whole number, got %r" % raw_seed)
+    passes = eval_passes(inputs)
     if mode == "team":
-        return eval_pick_team(inputs, repos, count, named)
+        return dict(eval_pick_team(inputs, repos, count, named), passes=passes)
     if named:
         for x in named:
             m = REF_RE.fullmatch(x)
@@ -1069,7 +1070,22 @@ def eval_pick(ctx):
             runs.append({"repo": repo, "pr": int(n), "memory": "off", "arm": "B"})
         runs.append({"repo": repo, "pr": int(n), "memory": "on", "arm": "M"})
     return {"mode": "memory", "prs": refs, "runs": runs, "count": len(refs), "humans": {}, "trained": [], "held_out": [],
-            "scope_key": str(inputs.get("scope_key") or "").strip(), "control": control, "seed": int(raw_seed)}
+            "scope_key": str(inputs.get("scope_key") or "").strip(), "control": control, "seed": int(raw_seed),
+            "passes": passes}
+
+
+def eval_passes(inputs):
+    """How many times each lens reviews in every replay: --input passes=, else the
+    review_passes setting — the same for every arm, so the control shows what passes buy."""
+    raw = str(inputs.get("passes") or "").strip()
+    if raw:
+        if not re.fullmatch(r"[1-3]", raw):
+            raise SystemExit("review-eval: --input passes= takes a whole number from 1 to 3, got %r" % raw)
+        return raw
+    setting = os.environ.get("REVIEW_PASSES", "1").strip()
+    if not re.fullmatch(r"[1-3]", setting):
+        raise SystemExit("review-eval: the review_passes setting must be a whole number from 1 to 3, got %r" % setting)
+    return setting
 
 
 def parse_switch(raw, default, name):
@@ -1378,6 +1394,10 @@ def eval_report(ctx):
         summary = control_summary(totals, ctl, scope_key)
     else:
         summary = team_summary(totals, pick) if team else eval_summary(totals, scope_key)
+    passes = str(pick.get("passes") or "1")
+    if passes != "1":
+        # every arm reviewed with this many passes a lens (merged before verify)
+        summary += " [passes %s]" % passes
     t = now()
     d = eval_dir()
     path = os.path.join(d, t.strftime("%Y-%m-%d") + ".md")

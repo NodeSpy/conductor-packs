@@ -273,7 +273,10 @@ class PerspectiveLensTest(unittest.TestCase):
         self.assertEqual([l["name"] for l in self.run_lenses("true", n=1, plain_first=True, first=live)["list"]], ["Security", "Perspective: w0"])
         held_like = dict(live, tags=live["tags"] + ["quarantined", "held-nothex!"])
         self.assertEqual([l["name"] for l in self.run_lenses("true", n=0, plain_first=True, first=held_like)["list"]], ["Security"])
-        self.assertEqual(flow_step(self.man, "review-team", "review")["for_each"], "{{.lenses.list}}")
+        # the panel runs lenses.runs: the list itself with one pass, each lens repeated with more
+        self.assertEqual(flow_step(self.man, "review-team", "review")["for_each"], "{{.lenses.runs}}")
+        out = self.run_lenses("true")
+        self.assertEqual(out["runs"], out["list"])
 
     def test_findings_carry_the_perspective_lens_name(self):
         code = flow_step(self.man, "review-team", "flatten")["code"]
@@ -367,6 +370,7 @@ class LedgerTest(unittest.TestCase):
         self.assertEqual(out["prs"], ["acme/api#3", "acme/api#5"])
         self.assertEqual((out["held_out"], out["trained"]), (["acme/api#4"], []))
         self.assertEqual([r["memory"] for r in out["runs"]], ["off", "on", "off", "on"])
+        self.assertEqual(out["passes"], "1")                                   # the replays' passes, as in memory mode
         # trusted, top-level, with a line; the pack's own post and outsiders left out
         self.assertEqual(out["humans"]["acme/api#3"], [{"path": "handler.go", "line": 10, "by": "carol", "body": "retry has no bound"}])
         self.assertEqual([h["body"] for h in out["humans"]["acme/api#5"]], ["my own hand-written note"])

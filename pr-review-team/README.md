@@ -89,6 +89,7 @@ Every setting is optional. Set them under `packs.<instance>.settings`.
 | `calibration_discard_days` | `7` | A hand-off draft nobody posted within this many days counts as discarded. |
 | `calibration_min_lines` | `3` | A later commit is a follow-up only if it changes or removes at least this many lines the reviewed PR added. |
 | `calibration_team_pages` | `15` | Pages (100 comments each) of teammates' review comments read per repo per calibration run. |
+| `review_passes` | `1` | How many times each lens reviews a PR, 1 to 3. Above 1, each lens runs that many independent sessions and the findings are merged before verify. See [Review passes](#review-passes-a-second-look). Anything else fails the review run. |
 | `perspectives_as_lenses` | `false` | `true`: a learned perspective distinct from every lens, once you promote it out of quarantine, may become an extra lens for its key, at most 3 per key. See [Perspectives](#perspectives-the-team-in-the-review). |
 | `learning_review` | `quarantine_loosening` | Which learned entries go live: `quarantine_loosening` holds loosening entries, standards and globals with no catch, and perspectives; `hold_all` holds everything; `live` holds nothing (a footgun). See [the gate](#the-gate-what-goes-live-and-what-waits-for-you). |
 | `loosening_threshold` | `0.2` | The direction judge's P(an entry makes reviewers go easier) at or above which it is held (0–1). |
@@ -507,6 +508,38 @@ Everything calibration keeps is under `<state_dir>/pr-review-team/`: its
 position (`calibration.json`), clones, and the log. Delete a memory entry to
 undo it.
 
+## Review passes: a second look
+
+One run of the lens panel is noisy: two runs of the same panel on the same PR
+can agree on only about half their findings (measure yours with
+[`review-eval`](#measuring-it-review-eval)'s control arm). `review_passes: 2`
+(or 3) has every lens review the PR that many times:
+
+- **Independent passes.** Each pass is its own agent session, run in
+  parallel, with the same prompt, learned notes and checkout. No pass sees
+  another's output.
+- **Merged before verify.** The findings of all passes and lenses are matched
+  with `review-eval`'s matcher — same file and lines at most 5 apart, or
+  another file with close text — and identical text or the light judge's
+  same-issue call. Matching is one-to-one between any two sessions, and a
+  session's own findings never merge with each other. Each issue is verified
+  and posted once, as the finding of one pass (a blocking one first),
+  unchanged.
+- **Agreement.** Each merged finding records how many passes raised it
+  (`agreement` of `passes`), the lenses that did, and the other places merged
+  into it (`also_at`), in the review's `findings` output and the audit log.
+  The posted review is unchanged: no "found 2/2" in any comment. Reconcile
+  uses agreement only to break a tie between two findings on one line. **A
+  finding only one pass raised is never dropped for that** — the point of a
+  second pass is to catch what the first missed.
+- **Cost.** N times the lens runs (the expensive part), plus one light-judge
+  call per pair of similar findings from different sessions. Verify then runs
+  once per merged finding, so it costs about what one pass's verify did, plus
+  the extra findings the second pass found.
+
+`review_passes: 1` (the default) is the review as before: one session a
+lens, no merge, the same output.
+
 ## Measuring it: review-eval
 
 Does memory sharpen the review, or crowd it out? `review-eval` replays PRs
@@ -535,7 +568,11 @@ report, `<state_dir>/pr-review-team/eval/<date>.md`; the summary line is the
 
 Findings are matched one-to-one between runs: same file, lines at most 5
 apart, and either identical text or a light-model judge saying they raise the
-same issue. Per PR and overall it reports:
+same issue. A finding in another file is a candidate too when the two texts
+share enough words (at least 3 content words, covering half the shorter one;
+at most 3 such judge calls per finding): the same bug reported where it is
+defined in one run and where it is used in the other is one finding. Per PR
+and overall it reports:
 
 - **findings per arm** — A, B and M;
 - **control agreement** (A vs B) — the share of A's findings B also raised,
@@ -561,6 +598,13 @@ usable one. The old fixed-target verdict (90% retention `ok`, 75–90% `watch`,
 below `crowding`) is still in the report beside it, and is the verdict with
 `--input control=false`. The control arm costs half again as many replays and about
 three times the judge calls. `baseline=team` has no control arm.
+
+**Measuring review passes.** `--input passes=N` replays every arm — A, B and
+M — with N passes a lens (default: the `review_passes` setting). Run it once
+with `passes=1` and once with `passes=2` on the same PRs: the control
+agreement is how steady the review is from one run to the next, so the
+difference between the two reports is what the second pass buys. The summary
+ends `[passes N]` when N is above 1.
 
 Arm it like the calibration triggers (its `pick` step reads the audit log and
 `report` writes the report):
@@ -633,6 +677,18 @@ packs:
 
 Its manifest is just pack metadata plus `memory: { entries: memory }`.
 Re-export and push to update it.
+
+## 3.1.0 — review passes
+
+- **`review_passes`** (default 1; up to 3): each lens reviews the PR that many
+  times in independent sessions, and the findings are merged before verify.
+  Each merged finding records how many passes raised it; a finding one pass
+  raised is kept. See [Review passes](#review-passes-a-second-look).
+- **`review-eval --input passes=N`** replays every arm with N passes, so the
+  control agreement shows what a second pass buys.
+- **The matcher** (`review-eval`, and now the merge) also matches the same bug
+  reported in two related files, when the texts are close; before, it only
+  compared findings in one file.
 
 ## 3.0.2 — review-eval measures memory against a control arm
 
