@@ -24,6 +24,10 @@ scratch.
 
 ## Install
 
+For a full walkthrough from zero (install conductor, model credential, a
+fully automatic self-training reviewer, first training run), see
+[SETUP.md](SETUP.md).
+
 Bind your github connector and arm the trigger. The pack brings its own
 review-team/assess/hand-off steps, so you don't define any agents:
 
