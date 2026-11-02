@@ -198,6 +198,15 @@ row can't trigger the next fix.
 
 ## Upgrading
 
+v1.7.0 lets the `on_changes_requested` and `on_new_comment` agents answer on
+the PR. Both steps now grant `github.reply` and `github.comment`, pinned to the
+repo the run fired for and posting as you. The guidance makes every review
+comment the agent doesn't change code for get a reply on its thread (where the
+current code already does it, or why not), and `address` reports those ids as
+`replied_comments`. Before this, a sandboxed agent had no way to post: a review
+whose point was already fixed got 👀 and 👍 and no answer. Same requirements
+as v1.6.0.
+
 v1.6.0 changes how `on_changes_requested` treats an agent's report that it
 pushed, with the same requirements as v1.5.0 (conductor ≥ 0.68.0, github
 plugin ≥ 2.2.0). `resolve` now resolves threads only when conductor itself

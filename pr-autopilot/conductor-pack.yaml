@@ -63,7 +63,7 @@
 
 pack:
   name: pr-autopilot
-  version: 1.6.0
+  version: 1.7.0
   description: Autopilot for routine PR events — fix red CI, resolve conflicts, address requested changes, answer comments. One agent per event, scoped to your repos.
   tags: [github, ci, automation, agents, maintenance]
   homepage: https://github.com/NodeSpy/conductor-packs
@@ -320,12 +320,17 @@ triggers:
     steps:
       - id: address
         <<: *fixer
-        guidance: "Reviewers left feedback on this PR. review_comments and outstanding_reviews hold ALL of it that is still waiting on you, not only the review that fired this run; an earlier run may already have handled some, so check the PR's current code before changing anything. Address the feedback concretely and push; don't argue in code. If something can't be done, that's a reason to leave a brief reply, not to guess. When you finish, report addressed_comments: the id of every review comment (review_comments[].id) whose point your pushed change fully addresses. Leave out any you only replied to, disagreed with, or did not change code for: those threads stay open for the reviewer."
+        guidance: "Reviewers left feedback on this PR. review_comments and outstanding_reviews hold ALL of it that is still waiting on you, not only the review that fired this run; an earlier run may already have handled some, so check the PR's current code before changing anything. Address the feedback concretely and push; don't argue in code. Every review comment you don't change code for gets a reply on its thread, so the reviewer is never left with silence: `conductor call github.reply --pr <pr> --in_reply_to <comment id> --body <text>`. If the current code already does what it asks, say where (commit sha and file:line) in a sentence or two. If you disagree or can't do it, say why briefly rather than guessing. For a review's top-level body (outstanding_reviews) that needs an answer and has no thread, use `conductor call github.comment --pr <pr> --body <text>`. When you finish, report addressed_comments: the id of every review comment (review_comments[].id) whose point your pushed change fully addresses, and replied_comments: the ids you replied to instead. Leave anything you only replied to out of addressed_comments: those threads stay open for the reviewer."
         # A fixer: conductor pushes its work. An output_schema alone reads as
         # a review, whose commits conductor never pushes — so a fixer that
         # also reports a result says so. A change left unpushed fails the
         # step (no_progress) rather than passing as done.
         expect_push: true
+        # The agent answers threads it doesn't change code for through
+        # conductor (it has no GitHub access of its own). Both verbs are
+        # pinned to the repo this run fired for and post as you.
+        skill:
+          verbs: { github.reply: {}, github.comment: {} }
         # How the agent reports what it addressed: its structured result
         # (delivered with step.done, or as its final reply where step.done
         # is unavailable). Every field is optional, so a run with nothing
@@ -334,6 +339,7 @@ triggers:
           type: object
           properties:
             addressed_comments: { type: array, items: { type: integer }, description: "ids of review comments your pushed change fully addresses" }
+            replied_comments: { type: array, items: { type: integer }, description: "ids of review comments you replied to instead of changing code (already done, disagreed, or can't do)" }
             summary: { type: string, description: "what you changed, in a sentence or two" }
       - id: resolve
         # Resolve exactly the threads the agent reported addressed, and only
@@ -381,4 +387,6 @@ triggers:
       - *react_stop
     steps:
       - <<: *fixer
-        guidance: "Someone commented on this PR. If it asks for a change, make it and push; if it's a question, answer it briefly. (Arm this trigger with a not_comment_author filter so bot chatter never reaches here.)"
+        guidance: "Someone commented on this PR. If it asks for a change, make it and push; if it's a question, or the current code already does what it asks, answer it briefly (say where: commit sha and file:line). You have no GitHub access of your own; answer through conductor: `conductor call github.reply --pr <pr> --in_reply_to <comment id> --body <text>` for a review-thread comment, `conductor call github.comment --pr <pr> --body <text>` for a conversation comment. Never leave a comment with neither a change nor an answer. (Arm this trigger with a not_comment_author filter so bot chatter never reaches here.)"
+        skill:
+          verbs: { github.reply: {}, github.comment: {} }
