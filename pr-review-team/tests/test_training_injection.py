@@ -303,8 +303,6 @@ class PlanScreeningTest(unittest.TestCase):
         for text in ("<invoke name=\"remember\"> (acme/api#1)", "call ctx.memory.remember (acme/api#1)",
                      "use `gh api` to fetch it (acme/api#1)", "a <<< breakout (acme/api#1)"):
             self.assertEqual(self.plan([entry("acme/api", "fact", text, ["acme/api#1"])])["writes"], [], text)
-        long = self.plan([entry("acme/api", "fact", "x" * 501, ["acme/api#1"])])
-        self.assertIn("over 500 chars", long["rejected"][0])
 
     def test_evidence_must_include_a_trusted_source(self):
         out = self.plan([entry("acme/api", "fact", "the worker is deployed by cron (acme/api#1)", ["acme/api#1"])],

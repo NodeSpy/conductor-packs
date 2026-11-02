@@ -53,7 +53,9 @@ connectors and no secrets — posting uses your connector's own write identity.
 
 ## What it needs (`requires:`)
 
-- **`conductor: >=0.69.0`** — memory scope keys that are templates over the
+- **`conductor: >=0.70.0`** — a step's `checkout_pr:`, so `review-eval`'s
+  replays (a manual run) check out the PR they replay. And, since 0.69.0,
+  memory scope keys that are templates over the
   step's facts (`standard:{{.repo}}`, `org:{{.owner}}`), and `ctx.memory.key`
   — core's scope-key renderer, which the pack renders every key it computes
   with (so its keys are exactly the keys core reads).
@@ -349,7 +351,11 @@ instruction that got learned would stay. The pack defends at each step:
   the backfill extractors return, are fenced the same way.
 - **What it will write.** The agents' output is screened by a deterministic
   step:
-  - entries over 500 characters are rejected;
+  - entries over 800 characters (a perspective's `where`, 160) are
+    rejected whole, never cut to fit. The prompts and the output schema
+    state the limit, so the agents write to fit, and the run log shows the
+    first 200 characters of anything rejected for length. Backfill handles
+    a mined pattern over 800 characters the same way;
   - so is any entry containing a URL, a code fence, a command or tool call,
     an `@mention`, control characters, or the fence;
   - then the **gate** decides whether the entry goes live or waits in
@@ -380,6 +386,17 @@ A deny-list of words can't tell "the cache table is rebuilt nightly" from
   judge didn't rate, and everything if the judge can't run. A keyword
   tripwire ("approve", "skip", "trusted", "battle-tested", "already
   validated", "safe" …) marks entries loosening too, whatever the judge says.
+  Both read the **lesson** only: the entry's text (and a perspective's
+  `where`) with any PR-history clause taken out — never its `why`, its
+  evidence, or an engineer's login.
+- **Lesson and history are separate.** An entry's `text` states the rule or
+  fact; what happened on the PR that taught it ("owner/app#12 was approved
+  while …") goes in its `why`, which the run log shows under the entry and
+  which is never written to memory or read by a review. Text that still
+  tells PR history ("#12 was approved", "merged in #12") is **rejected**
+  with that reason, so the agent learns the format; if the lesson itself
+  (the text without the history) is loosening, it is held instead, like any
+  loosening entry. Either way it never goes live.
 - **Grounding.** An entry goes live only if it is not loosening, and it is a
   fact or emphasis entry or its evidence includes a catch (a miss a trusted
   engineer flagged, or a hand-off you edited or discarded). A standard or
@@ -508,7 +525,9 @@ conductor run review/review-eval --input repos=owner/app --input baseline=team  
 It **posts nothing** (it runs the review engine, never the posting flow or
 the hand-off), **writes no memory** (notes are only read), and replays each PR
 as if it had no comments yet — the pack's own earlier comments would
-otherwise hide exactly the findings being compared. Its one write is the
+otherwise hide exactly the findings being compared. Each lens checks out the
+replayed PR itself (`checkout_pr:` on the lens step), exactly as a live review
+does. Its one write is the
 report, `<state_dir>/pr-review-team/eval/<date>.md`; the summary line is the
 `report` step's output and goes to the daemon log.
 
@@ -597,6 +616,32 @@ packs:
 
 Its manifest is just pack metadata plus `memory: { entries: memory }`.
 Re-export and push to update it.
+
+## 3.0.1 — learned entries up to 800 characters; review-eval checks out the replayed PR
+
+- **Learned entries can be up to 800 characters** (was 500). The calibrate,
+  extract and merge prompts and their output schemas now state the limit,
+  so the agents write to fit. An entry over it is still rejected, never cut
+  to fit; the run log now shows its first 200 characters so you can see
+  what was lost. Backfill used to silently cut each mined pattern to 600
+  characters; a pattern over 800 is now rejected and logged the same way.
+- **History no longer trips the gate.** Good entries were held because
+  their text told PR history ("#12 was approved while …"), and the keyword
+  tripwire matched "approved". The entry schema now has a `why` for the
+  history, the prompts keep `text` to the rule or fact, the tripwire and
+  the judge read the lesson only, and text that still tells PR history is
+  rejected with a reason rather than held. Every loosening phrasing the gate
+  held before is still held.
+- **`review-eval` works on a real checkout.** Its replays run from a manual
+  trigger, whose own target is `manual:<name>`; the lens step's
+  `checkout: checkout-pr` cloned that and failed (`gitwt: base checkout for
+  manual:review/review-eval`). The lens step now names the PR to check out
+  (`checkout_pr:`, from the workflow's `repo`/`pr` inputs). On a review
+  request that is the event's own PR, so live reviews are unchanged. **Needs
+  conductor >= 0.70.0.** Conductor honors a templated `checkout_pr` only on a
+  run you started (`conductor run`) or a cron schedule — never one a webhook
+  or a remote caller started — so an event can't pick what is cloned. If you
+  override `review-team/review` with `checkout: none`, it stays off.
 
 ## Upgrading from 2.x
 
