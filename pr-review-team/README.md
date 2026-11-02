@@ -510,9 +510,10 @@ undo it.
 ## Measuring it: review-eval
 
 Does memory sharpen the review, or crowd it out? `review-eval` replays PRs
-this pack already reviewed through the lens panel twice — **memory off** (the
-baseline), then **memory on**, with the same steps and model tiers — and
-compares what each would have posted:
+this pack already reviewed through the lens panel three times — **memory off**
+(A, the baseline), **memory off again** (B, the control), then **memory on**
+(M), with the same steps and model tiers — and compares what each would have
+posted:
 
 ```
 conductor run review/review-eval --input repos=owner/app                 # the 5 most recent it reviewed
@@ -520,6 +521,7 @@ conductor run review/review-eval --input repos=owner/app --input count=10
 conductor run review/review-eval --input prs=owner/app#12,owner/app#15
 conductor run review/review-eval --input repos=owner/app --input scope_key='org:{{.owner}}'   # try another key
 conductor run review/review-eval --input repos=owner/app --input baseline=team                  # against the team
+conductor run review/review-eval --input repos=owner/app --input control=false                   # A and M only: faster, no noise floor
 ```
 
 It **posts nothing** (it runs the review engine, never the posting flow or
@@ -531,19 +533,34 @@ does. Its one write is the
 report, `<state_dir>/pr-review-team/eval/<date>.md`; the summary line is the
 `report` step's output and goes to the daemon log.
 
-Findings are matched one-to-one across the two runs: same file, lines at most
-5 apart, and either identical text or a light-model judge saying they raise
-the same issue. Per PR and overall it reports:
+Findings are matched one-to-one between runs: same file, lines at most 5
+apart, and either identical text or a light-model judge saying they raise the
+same issue. Per PR and overall it reports:
 
-- **retained** — baseline findings memory-on also raised;
-- **dropped** — baseline findings memory-on did not raise;
-- **added** — memory-on findings the baseline did not have, and how many cite a note.
+- **findings per arm** — A, B and M;
+- **control agreement** (A vs B) — the share of A's findings B also raised,
+  averaged with the share of B's that A raised: how far two runs land apart
+  with nothing changed;
+- **memory retention** (A vs M) — the share of A's findings M also raised;
+- **the gap** — control agreement minus memory retention, with a 90% interval
+  from a seeded bootstrap over the PRs (and, within each, their findings), so
+  the same runs always give the same interval (`--input seed=N` picks another);
+- **retained / dropped** — A's findings M did / did not raise;
+- **added** — M's findings A did not have: how many the control (B) raised
+  too, so they are run-to-run noise rather than memory's doing, and how many
+  cite a note.
 
-**Target: memory-on retains nearly all baseline findings** — 90% or more reads
-`ok`, 75–90% `watch`, below that `crowding`: the notes are pulling the review
-away from what it would otherwise catch. Look at what was dropped, and prune or
-reword the notes behind it (or lower `memory_limit`). Model runs vary from one
-run to the next, so judge over a handful of PRs, not one.
+**The verdict compares memory to the control, not to a fixed target.** Two
+memory-off runs of the same PR already differ, so a low retention alone means
+little. `crowding` only when the whole interval of the gap is above 0 — memory
+credibly loses more of the baseline than a second memory-off run does; `ok`
+otherwise (the interval reaches 0, or memory retains more). When it says
+crowding, look at what was dropped, and prune or reword the notes behind it
+(or lower `memory_limit`). The intervals are wide on a few PRs: 15–20 give a
+usable one. The old fixed-target verdict (90% retention `ok`, 75–90% `watch`,
+below `crowding`) is still in the report beside it, and is the verdict with
+`--input control=false`. The control arm costs half again as many replays and about
+three times the judge calls. `baseline=team` has no control arm.
 
 Arm it like the calibration triggers (its `pick` step reads the audit log and
 `report` writes the report):
@@ -616,6 +633,17 @@ packs:
 
 Its manifest is just pack metadata plus `memory: { entries: memory }`.
 Re-export and push to update it.
+
+## 3.0.2 — review-eval measures memory against a control arm
+
+- **`review-eval` replays each PR three times:** memory off (A), memory off
+  again (B), memory on (M). Two memory-off runs already disagree, so the
+  verdict now asks whether memory retention (A vs M) is credibly below the
+  control's agreement (A vs B) — a seeded bootstrap interval on the gap,
+  overall and per PR — instead of comparing it to a fixed 90%. The old
+  numbers and the old verdict stay in the report. It also counts each arm's
+  findings and which of memory's additions the control raised too.
+  `--input control=false` keeps the old two-run mode.
 
 ## 3.0.1 — learned entries up to 800 characters; review-eval checks out the replayed PR
 
