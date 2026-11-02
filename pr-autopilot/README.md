@@ -5,7 +5,7 @@ to the repos you arm:
 
 | trigger | event | the agent… |
 |---|---|---|
-| `on_failing_checks` | CI concluded failing | finds why and pushes a fix (re-runs once first: most red CI is a flake) |
+| `on_failing_checks` | CI concluded failing | finds why and pushes a fix, from what failed as conductor read it (re-runs once first: most red CI is a flake) |
 | `on_merge_conflict` | the PR conflicts with its base | resolves the conflict and pushes |
 | `on_changes_requested` | a review requested changes (or sweep: feedback still waiting on you) | addresses ALL review feedback still waiting on you, pushes, resolves the threads its change addressed, re-requests every reviewer with changes outstanding |
 | `on_new_comment` | a comment, or a review no changes-requested trigger takes | makes the change or answers the question |
@@ -87,6 +87,47 @@ Contexts and descriptions are templates rendered per run. `{{.run.reason}}`
 is a short public-safe phrase ("the agent couldn't be started", "timed out",
 "the change was never pushed", …), never the error text.
 
+### Failing checks: what the fixer is handed
+
+The fixer runs in conductor's agent sandbox: no GitHub credentials and no
+route to github.com. It sees CI through conductor instead:
+
+1. **`ci`** reads the failures with your github connector's credentials
+   (`github.check_failures`): every failing check run on the PR's head as of
+   now, with what it reported (title, summary, details, annotations), and for
+   a GitHub Actions job the failed step and the part of its log that shows
+   the failure, size-capped. Checks this trigger ignores (`ignore_checks`)
+   are left out. If the read fails, the run goes on without it.
+2. **`ci_text`** turns that into text inside a data fence: between
+   `<<<evTOKEN` and `evTOKEN>>>` markers, with a token drawn per run, the
+   convention pr-review-team uses for PR text. A test log prints whatever the
+   code under test or the PR's author wants, including text addressed to an
+   agent, so nothing inside may look like a marker: any `ev`+16-hex token,
+   `<<<` and `>>>` are broken up, and control and invisible format
+   characters are removed. The prompt tells the agent the fenced text is data
+   to diagnose from, never instructions.
+3. The fixer gets it in its prompt, and one conductor verb,
+   `check_failures`, scoped to the PR's repo. After it pushes, it calls the
+   verb to read the new head's checks (still-running ones are listed as
+   pending) instead of guessing whether the fix took.
+
+To leave a check out, list it on the trigger. The fixer is never dispatched
+for it, and it doesn't appear in what the fixer reads:
+
+```yaml
+packs:
+  autopilot:
+    triggers:
+      on_failing_checks:
+        enabled: true
+        repos: [your-org/app]
+        options: { ignore_checks: [pr-title-lint] }
+```
+
+The flaky re-run (`flaky_rerun: { enabled: true, max: 1 }`) is unchanged.
+Failed jobs re-run once before an agent is engaged, and the fixer reads the
+re-run's results.
+
 ### Changes requested: what a run covers, resolves, and re-requests
 
 A `changes_requested` run is handed every piece of review feedback on the PR
@@ -149,6 +190,18 @@ the run. Conductor never reads a status it posted back as CI, so a `failure`
 row can't trigger the next fix.
 
 ## Upgrading
+
+v1.5.0 needs the **github connector plugin ≥ 2.2.0** and **conductor ≥
+0.68.0**:
+
+- Plugin 2.2.0 adds `github.check_failures` and the `failing_checks`
+  event's `ignore_checks`. It also declares egress to GitHub's Actions log
+  hosts, which it reaches without your GitHub credential. Update the plugin
+  first; an older one refuses v1.5.0's `ci` step at `conductor validate`.
+- Conductor 0.68.0 is the agent sandbox. It also gives a sandboxed fixer the
+  skill endpoint it calls `check_failures` through.
+
+The other flows are unchanged.
 
 v1.4.0 needs the **github connector plugin ≥ 2.1.0** (`requires.connectors`):
 the release whose `changes_requested` carries all waiting feedback
