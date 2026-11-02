@@ -1317,6 +1317,8 @@ def record(ctx):
             continue
         got = written[i] if i < len(written) and isinstance(written[i], dict) else {}
         lines.append("- %s [%s] %s" % (got.get("id") or "?", w.get("label") or w.get("scope") or "global", w.get("text", "")))
+        if w.get("history"):   # the agent's why: for the owner only, never in memory
+            lines.append("    why: %r" % str(w["history"]))
     if held:
         # an entry that would make reviews go easier on something, with no owner
         # catch behind it: written where no review reads it, for the owner to judge
@@ -1328,6 +1330,8 @@ def record(ctx):
             got = written[i] if i < len(written) and isinstance(written[i], dict) else {}
             lines.append("- %s [%s, would be %s] %r — %s" % (got.get("id") or "?", w.get("scope"), w.get("target"),
                                                           w.get("text", ""), w.get("why") or "held"))
+            if w.get("history"):
+                lines.append("    why: %r" % str(w["history"]))
             lines.append("    conductor memory rescope --scope %s --tag %s --to %s --apply" % (
                 shell_quote(w.get("scope")), shell_quote(w.get("hold_tag")), shell_quote(w.get("target_scope") or "global")))
     flagged = plan.get("live_flagged") or []
@@ -1357,6 +1361,8 @@ def record(ctx):
     for key, title in (("downgraded", "Downgraded (global resting on one key)"), ("superseded", "Superseded"),
                        ("rejected", "Rejected"), ("dropped", "Dropped")):
         items = plan.get(key) or []
+        if key == "rejected" and "rejected" not in plan:   # backfill with nothing left to merge
+            items = (ctx.get("patterns") or {}).get("rejected") or []
         if items:
             lines.append("%s (%d):" % (title, len(items)))
             lines += ["- " + str(x) for x in items]
