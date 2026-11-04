@@ -92,6 +92,10 @@ class OnePassIsTheOldReviewTest(unittest.TestCase):
         now = dict(flow_step(load(), "review-team", "review"))
         then = dict(self.snap["review_step"])
         self.assertEqual((now.pop("for_each"), then.pop("for_each")), ("{{.lenses.runs}}", "{{.lenses.list}}"))
+        # 3.1.1: a lens session (and its checkout) ends with its step
+        now["extends"] = dict(now["extends"])
+        self.assertIs(now["extends"].pop("archive_when_done"), True)
+        self.assertNotIn("archive_when_done", then["extends"])
         self.assertEqual(now, then)
 
     def test_one_pass_ignores_an_agreement_a_lens_made_up(self):
