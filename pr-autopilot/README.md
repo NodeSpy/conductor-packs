@@ -198,6 +198,12 @@ row can't trigger the next fix.
 
 ## Upgrading
 
+v1.8.0 makes `on_changes_requested`'s `rerequest` pass the commit conductor
+just pushed as `head`. GitHub's PR head lags a push by seconds, so the
+re-request, made right after the push, read the reviewed commit as still
+current and skipped the reviewer ("has no new commits to review"). Requires
+the github plugin ≥ 2.4.0; conductor ≥ 0.68.0 as before.
+
 v1.7.0 lets the `on_changes_requested` and `on_new_comment` agents answer on
 the PR. Both steps now grant `github.reply` and `github.comment`, pinned to the
 repo the run fired for and posting as you. The guidance makes every review
