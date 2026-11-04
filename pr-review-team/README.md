@@ -682,6 +682,14 @@ packs:
 Its manifest is just pack metadata plus `memory: { entries: memory }`.
 Re-export and push to update it.
 
+## 3.1.1 — lens sessions end with their step
+
+- **The lens reviewers are archived when their step finishes**
+  (`archive_when_done: true` on the panel). They answer through
+  `output_schema` and never signal done, so each session and its PR checkout
+  stayed live until the daemon restarted: one per lens per pass, every
+  review. The hand-off is unchanged; it stays live for you on purpose.
+
 ## 3.1.0 — review passes
 
 - **`review_passes`** (default 1; up to 3): each lens reviews the PR that many

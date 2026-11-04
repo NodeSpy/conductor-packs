@@ -52,7 +52,7 @@
 
 pack:
   name: pr-review-team
-  version: 3.1.0
+  version: 3.1.1
   description: Multi-lens PR review (correctness / security / design …) with refute-verify, deterministic reconcile, an optional human hand-off, and calibration that learns memory, under a scope key you choose, from past reviews.
   tags: [review, github, code-quality, agents, memory]
   homepage: https://github.com/NodeSpy/conductor-packs
@@ -226,6 +226,10 @@ x-templates:
     model: heavy
     mode: auto
     workspace: worktree
+    # A lens answers through output_schema and never calls step.done, so
+    # without this its session (and its ~250MB PR checkout) stays live until
+    # the daemon restarts: lenses × passes of them per review.
+    archive_when_done: true
 
   # ---- Calibration building blocks (review-calibration, review-backfill) ----
   #
