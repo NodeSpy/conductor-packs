@@ -22,7 +22,7 @@
 #   packs:
 #     autopilot:
 #       source: github.com/NodeSpy/conductor-packs//pr-autopilot
-#       version: "~> 1.6"
+#       version: "~> 1.8"
 #       # heavy fleet resolves against whatever your runtime offers; pin if you like:
 #       #   models: { heavy: ["claude-opus-*"] }
 #       triggers:
@@ -63,7 +63,7 @@
 
 pack:
   name: pr-autopilot
-  version: 1.7.0
+  version: 1.8.0
   description: Autopilot for routine PR events — fix red CI, resolve conflicts, address requested changes, answer comments. One agent per event, scoped to your repos.
   tags: [github, ci, automation, agents, maintenance]
   homepage: https://github.com/NodeSpy/conductor-packs
@@ -88,14 +88,15 @@ pack:
     # conductor's own report of the end-of-step push of a sandboxed agent's
     # work — which `resolve` gates on instead of the agent's report (1.6.0).
     conductor: ">=0.68.0"
-    # github 2.2.0: github.check_failures (each failing check's output,
-    # annotations, and an Actions job's failed-step log), and the
-    # failing_checks event's ignore_checks. 2.1.0: changes_requested carries
+    # github 2.4.0: rerequest_review's head, which `rerequest` passes as the
+    # commit conductor just pushed. 2.2.0: github.check_failures (each failing
+    # check's output, annotations, and an Actions job's failed-step log), and
+    # the failing_checks event's ignore_checks. 2.1.0: changes_requested carries
     # every review still waiting on you (review_comments with ids,
     # outstanding_reviews, feedback_cursor), github.resolve_threads, and
     # rerequest_review's all_outstanding. An older plugin refuses this pack's
     # steps at load.
-    connectors: { github: ">=2.2.0" }
+    connectors: { github: ">=2.4.0" }
 
 # The worker model as a fleet — conductor resolves it against your runtime's
 # roster best-first, so the pack ships no provider-specific ids. Override with
@@ -360,8 +361,12 @@ triggers:
         # since, nothing new landed, or the PR closed. all_outstanding adds
         # every OTHER reviewer in that state: the event's reviewer may only
         # have commented while someone else's changes-request blocks the merge.
+        # head is the commit conductor just pushed: GitHub's PR head lags a
+        # push by seconds, and read alone it showed the reviewed commit as
+        # still current, so the reviewer was skipped as having nothing new.
+        # Nothing pushed renders it empty, and GitHub's head decides alone.
         uses: github.rerequest_review
-        options: { repo: "{{.repo}}", pr: "{{.pr}}", reviewers: ["{{.author}}"], only_outstanding: true, all_outstanding: true }
+        options: { repo: "{{.repo}}", pr: "{{.pr}}", reviewers: ["{{.author}}"], only_outstanding: true, all_outstanding: true, head: "{{.address.push.head}}" }
 
   - name: on_new_comment
     on: github.new_comment
