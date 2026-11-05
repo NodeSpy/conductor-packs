@@ -198,6 +198,13 @@ row can't trigger the next fix.
 
 ## Upgrading
 
+v1.7.1 has the `on_changes_requested` and `on_new_comment` agents reply on
+every thread they change code for, not only the ones they don't. Before, a
+fixed thread was resolved with no word on it, so the reviewer had to diff the
+branch to see what happened. The agent pushes first (`git.push`), then replies
+naming the head commit the push returned. It never quotes a sha from its own
+log, which signing rewrites. Same requirements as v1.7.0.
+
 v1.7.0 lets the `on_changes_requested` and `on_new_comment` agents answer on
 the PR. Both steps now grant `github.reply` and `github.comment`, pinned to the
 repo the run fired for and posting as you. The guidance makes every review

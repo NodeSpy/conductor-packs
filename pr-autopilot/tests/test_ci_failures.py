@@ -195,6 +195,18 @@ class Wiring(unittest.TestCase):
                 verbs = (s.get("skill") or {}).get("verbs") or {}
                 self.assertFalse(answer & set(verbs), name)
 
+    def test_feedback_fixers_reply_on_what_they_fixed(self):
+        # A fixed thread gets a reply too, after the push, naming the commit
+        # git.push returned (signing rewrites the agent's local shas).
+        for name in ("on_changes_requested", "on_new_comment"):
+            for s in trigger(name)["steps"]:
+                if s.get("type") != "agent":
+                    continue
+                g = s["guidance"]
+                self.assertIn("conductor call git.push", g, name)
+                self.assertIn("head commit git.push returned", g, name)
+                self.assertNotIn("you don't change code for gets a reply", g, name)
+
 
 if __name__ == "__main__":
     unittest.main()
