@@ -250,6 +250,15 @@ row can't trigger the next fix.
 
 ## Upgrading
 
+v2.0.1 appends `workspace_git` to every fixer's task. It tells the agent that
+its workspace's git has no network: `origin/*` is as of the run's start and
+conductor pushes for it. A fixer that ran `git fetch` spawned ssh, and the
+sandbox's tunnel detection killed the whole run. Override the text with the
+`workspace_git` setting. The run-killing itself is conductor's: from conductor
+with `detect.action: terminate`, the operator can opt the fixer steps into
+stopping only the offending process (`packs: { <instance>: { steps: { <step>:
+{ isolation: { detect: { action: terminate } } } } } }`).
+
 v2.0.0 handles a PR branch that moved while a fixer worked ([Moved
 head](#moved-head-the-pr-branch-moved-while-a-fixer-worked)). It needs
 **conductor ≥ 0.82.0** (`continue_on_error` with a condition) and the
