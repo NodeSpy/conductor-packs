@@ -52,13 +52,15 @@
 
 pack:
   name: pr-review-team
-  version: 3.1.1
+  version: 3.2.0
   description: Multi-lens PR review (correctness / security / design …) with refute-verify, deterministic reconcile, an optional human hand-off, and calibration that learns memory, under a scope key you choose, from past reviews.
   tags: [review, github, code-quality, agents, memory]
   homepage: https://github.com/NodeSpy/conductor-packs
   license: Apache-2.0
   requires:
-    # The daemon versions this pack supports. 0.70.0 is the floor for 3.0.1:
+    # The daemon versions this pack supports. 0.81.0 is the floor for 3.2:
+    # the lens panel shares one PR tree, a plugin verb's binary output stored
+    # as a blob and handed to every lens as `workspace: { from: }`. 0.70.0 was the floor for 3.0.1:
     # a step's `checkout_pr:`, so review-eval's replays (a manual run) check
     # out the PR they replay. 0.69.0 was the floor for 3.0:
     # memory scope keys are templates over the step's facts
@@ -71,14 +73,15 @@ pack:
     # the `checkout: checkout-pr` workspace jail and `github.pr_files`
     # patches — 0.54.0 for `decide:` steps, and 0.33.0 for the reactive
     # hand-off surface.)
-    conductor: ">=0.70.0"
+    conductor: ">=0.81.0"
     # Bind-only environment the pack needs — you wire this; the pack never
     # ships it.
     # requires.connectors is the pack's CAPABILITY BOUNDARY as well as its
     # socket list: the pack's skill.verbs may name no connector outside it,
     # and its wildcards are bounded to it.
     connectors:
-      github: "*"
+      # 2.5.0: pr_snapshot, the PR tree the lenses share (3.2).
+      github: ">=2.5.0"
       # Built-in, binds to itself: assess reads emphasis entries, and the
       # calibration triggers read existing entries and write new ones — all
       # through the js code binding (ctx.memory), so a config without a
@@ -206,7 +209,7 @@ exports:
 x-templates:
   # Every agent in this pack reads PR context and writes a judgement; none of
   # them pushes anything, so none needs write access — the lens reviewers get
-  # a checkout (see `panelist` below) to READ the tree, not to change it.
+  # a copy of the PR tree (see `review-team` below) to READ, not to change.
   house: &house
     type: agent
     checkout: none
@@ -227,8 +230,8 @@ x-templates:
     mode: auto
     workspace: worktree
     # A lens answers through output_schema and never calls step.done, so
-    # without this its session (and its ~250MB PR checkout) stays live until
-    # the daemon restarts: lenses × passes of them per review.
+    # without this its session (and its copy of the PR tree) stays live
+    # until the daemon restarts: lenses × passes of them per review.
     archive_when_done: true
 
   # ---- Calibration building blocks (review-calibration, review-backfill) ----
@@ -1071,28 +1074,43 @@ workflows:
           if (passes === 1) runs.push.apply(runs, all);
           else for (const l of all) for (let p = 1; p <= passes; p++) runs.push(Object.assign({}, l, { pass: p }));
           return { list: all, extra: extra.length, passes: passes, runs: runs };
+      # ONE fetch for the whole panel (3.2). Every lens used to check the PR
+      # out itself: lenses × passes fetches of the same head at once, and a
+      # forge times out some of the ssh connections in a burst like that.
+      # Now `snapshot` fetches it once, as one artifact, and every lens
+      # starts from its own copy of it.
+      #
+      # The snapshot is the github connector's pr_snapshot, with its own
+      # credentials over HTTPS, retrying a fetch that fails on the network:
+      # the PR head and its base branch, deepened until their merge-base is
+      # in it, returned as an archive that conductor keeps as a run-scoped
+      # blob. It keeps its .git, so a lens can still diff
+      # origin/<base>...HEAD, log and blame. It is a self-contained shallow
+      # clone, so the artifact is the tree plus that much history, and
+      # borrows from no other clone.
+      #
+      # The repo and PR are this workflow's own inputs. On a review request
+      # that is the event's own PR; on a review-eval replay (a manual run,
+      # whose own target is synthetic) it is the PR being replayed.
+      - id: snapshot
+        uses: github.pr_snapshot
+        options: { repo: "{{.inputs.repo}}", pr: "{{.inputs.pr}}" }
       # The lens panel. `extends:` (not `<<:`) so this step's own guidance
       # stacks UNDER the house voice rather than replacing it — and so a
       # consumer's `review-team/review` override stacks under both.
       #
-      # 2.10 (#154 §6): each lens reviewer now gets a REAL PR checkout
-      # (`checkout: checkout-pr` — conductor's own worktree provisioning,
-      # same mechanism the handoff step below already uses) instead of an
-      # inlined, 60 KB-capped diff. A cli/acp launch with no isolation block
-      # runs inside the default workspace jail; this step also carries
-      # `output_schema`, which makes it a review step: its `gh` and `git` are
-      # read-only (no push, no gh writes — the binaries' own profiles), and
-      # it is granted no write verbs. `gh` reads and local `git` work happen
-      # inside the jail.
-      #
-      # checkout_pr names the PR to check out: this workflow's own inputs. On a
-      # review request that is the event's own PR (nothing changes); on a
-      # review-eval replay — a manual run, whose own target is synthetic — it
-      # is the PR being replayed, which a plain checkout-pr can't find.
+      # Each lens starts in its OWN copy of the snapshot (`workspace.from`):
+      # the real, uncapped PR tree with its git history, unpacked fresh for
+      # that session, so no lens sees what another did there. Nothing is
+      # fetched and nothing is ever pushed from it. A cli/acp launch with no
+      # isolation block runs inside the default workspace jail; this step
+      # also carries `output_schema`, which makes it a review step: its `gh`
+      # and `git` are read-only (no push, no gh writes — the binaries' own
+      # profiles), and it is granted no write verbs. `gh` reads and local
+      # `git` work happen inside the jail.
       - id: review
         extends: *panelist
-        checkout: checkout-pr
-        checkout_pr: { repo: "{{.inputs.repo}}", pr: "{{.inputs.pr}}" }
+        workspace: { from: "{{.snapshot.archive}}" }
         # one session per lens per pass (lenses.runs = the lenses, review_passes
         # times over); the prompt never names the pass, so the passes are the
         # same review run independently

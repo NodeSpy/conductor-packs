@@ -746,7 +746,7 @@ class EvalTest(unittest.TestCase):
             self.assertNotIn(bad, blob)
         for st in engine:
             self.assertNotIn("uses", st) if not str(st.get("uses", "")).startswith("github.") else \
-                self.assertIn(st["uses"], ("github.pr_get", "github.pr_files", "github.file", "github.review_comments"))
+                self.assertIn(st["uses"], ("github.pr_get", "github.pr_files", "github.file", "github.review_comments", "github.pr_snapshot"))
 
     def test_a_replay_can_ignore_the_prs_existing_comments(self):
         code = flow_step(load(), "review-team", "prior")["code"]
