@@ -159,6 +159,62 @@ by one reviewer's comment doesn't leave another's changes-request blocking the
 merge. Bots, the PR's author, approvers and reviewers already requested are
 never pinged.
 
+### Moved head: the PR branch moved while a fixer worked
+
+Conductor pushes a fixer's commits at the end of its step, fast-forward only.
+When someone pushed to the PR branch meanwhile (its author, another fixer),
+that push is refused: the commits are still in the fixer's workspace and the
+step's `push` output says how many (`unpushed_commits`). The pack takes it
+from there, with a [git-land](https://github.com/NodeSpy/conductor-plugins/blob/main/docs/connectors/git-land.md)
+connector:
+
+1. **Keep** (`kept`): the commits are copied out of the fixer's workspace into
+   git-land's own repository, under
+   `refs/kept/<owner>/<repo>/pr-<n>/<agent>`. This is a fetch, so nothing runs
+   in the workspace. From here on, removing the workspace loses nothing.
+2. **Replay** (`replayed`): the commits are replayed onto the branch's new
+   head, without a working tree or hooks.
+3. **Clean → push** (`landed`): the replayed commits are pushed, still a
+   fast-forward and never forced. One agent, one run. On
+   `on_changes_requested`, `resolve` then resolves the threads the change
+   addressed.
+4. **Conflict → run it again, once** (`refix`): the same fixer step runs one
+   more time with the same task, on the new head. Its task also says that
+   this is a second attempt, which files conflicted, the first attempt's diff
+   (fenced as data), and the kept commit to cherry-pick from. Conductor
+   pushes its work as usual. If that push fails too, the run fails (the
+   change was never pushed). There is no third attempt, and nothing is
+   forced. `moved_head_guidance` is the note's text.
+5. **Not moved** (`unpushed`): the push failed for some other reason. The run
+   fails (`step "unpushed" failed`), and the commits stay at the kept ref.
+
+**Setup.** Add a git-land connector with a directory of its own and
+credentials that can push to your repos. With one git-land connector, the pack
+binds it on its own:
+
+```yaml
+connectors:
+  gh: { use: github, … }
+  land:
+    use: git-land
+    dir: /var/lib/conductor/land.git        # created on first use; never a workspace
+    ssh_key_path: /etc/conductor/deploy_key  # push access to the repos you arm
+    strict_host_key_checking: accept-new
+    # sign: true                             # sign replayed commits; key via config:
+    # config: { gpg.format: ssh, user.signingkey: /etc/conductor/signing_key }
+```
+
+`push_remote` (default `git@github.com:{{.repo}}.git`) is where git-land
+fetches the branch from and pushes to. Set it for an HTTPS remote or a
+GitHub Enterprise host. Kept refs accumulate in `dir`, so prune them when you
+like.
+
+The steps are plain `uses:` steps in [`conductor-pack.yaml`](conductor-pack.yaml)
+(the `kept`, `pr_now`, `replayed`, `landed` and `unpushed` templates). The
+fixer steps reach them through `continue_on_error:
+"<step>.push.unpushed_commits > 0"`: the run goes on past a fixer whose push
+left commits behind, and stops on any other failure.
+
 ### The same hooks on your own triggers
 
 They're ordinary hooks, so copy them onto any trigger (use your github
@@ -197,6 +253,23 @@ the run. Conductor never reads a status it posted back as CI, so a `failure`
 row can't trigger the next fix.
 
 ## Upgrading
+
+v2.0.0 handles a PR branch that moved while a fixer worked ([Moved
+head](#moved-head-the-pr-branch-moved-while-a-fixer-worked)). It needs
+**conductor ≥ 0.81.0** (`continue_on_error` with a condition) and a
+**git-land connector plugin ≥ 1.0.0** bound to the pack. Without one the
+pack doesn't load (`requires.connectors`). Add the connector first. Other
+changes:
+
+- The fixer steps of `on_failing_checks`, `on_merge_conflict` and
+  `on_new_comment` now have the id `fix` (they had none; `on_changes_requested`'s is still
+  `address`). An overlay that targets a step by id needs the new one.
+- A fixer no longer sets `archive_when_done: true`. Its agent is kept until
+  the run ends, so the moved-head steps can read its workspace, and then
+  released.
+- A fix left unpushed on a branch that did **not** move now fails as
+  `step "unpushed" failed` instead of "the change was never pushed". Its
+  commits are kept at the ref above.
 
 v1.7.0 lets the `on_changes_requested` and `on_new_comment` agents answer on
 the PR. Both steps now grant `github.reply` and `github.comment`, pinned to the
