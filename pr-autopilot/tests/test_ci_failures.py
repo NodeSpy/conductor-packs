@@ -164,11 +164,22 @@ class Wiring(unittest.TestCase):
         # The re-run before an agent is engaged stays.
         self.assertEqual(t["options"]["flaky_rerun"], {"enabled": True, "max": 1})
 
+    def test_every_fixer_is_told_its_git_has_no_network(self):
+        # A fixer that runs git fetch spawns ssh, which the sandbox stops
+        # (and, under detect.action kill, ends the run with).
+        for name in ("on_failing_checks", "on_merge_conflict", "on_changes_requested", "on_new_comment"):
+            for s in trigger(name)["steps"]:
+                if s.get("type") == "agent":
+                    self.assertIn("${settings.workspace_git}", s["guidance"], name + "/" + s["id"])
+
     def test_the_fixer_reads_it_and_may_re_read_it(self):
         fixer = trigger("on_failing_checks")["steps"][2]
         self.assertEqual(fixer["type"], "agent")
-        self.assertIn("{{.ci_text.text}}", fixer["guidance"])
-        self.assertIn("no GitHub access of your own", fixer["guidance"])
+        task, workspace = fixer["guidance"]
+        self.assertIn("{{.ci_text.text}}", task)
+        self.assertIn("no GitHub access of your own", task)
+        # Every fixer is told its git has no network (see test_every_fixer_*).
+        self.assertEqual(workspace, "${settings.workspace_git}")
         # Its only conductor verb: check_failures, scoped to the dispatch's
         # own repo (no repo list widens it).
         self.assertEqual(fixer["skill"], {"verbs": {"github.check_failures": {}}})
