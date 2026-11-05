@@ -90,12 +90,12 @@ pack:
     # conductor's own report of the end-of-step push of a sandboxed agent's
     # work — which `resolve` gates on instead of the agent's report (1.6.0).
     #
-    # 0.81.0: continue_on_error with a condition, a failed step's outputs
+    # 0.82.0: continue_on_error with a condition, a failed step's outputs
     # (its diff, its push report) kept when the run continues past it, and an
     # agent kept for a later step released when the run ends. That is how a
     # fixer whose PR branch moved under it hands its change to the steps that
     # land it (2.0.0). An older conductor refuses the condition at load.
-    conductor: ">=0.81.0"
+    conductor: ">=0.82.0"
     # github 2.2.0: github.check_failures (each failing check's output,
     # annotations, and an Actions job's failed-step log), and the
     # failing_checks event's ignore_checks. 2.1.0: changes_requested carries

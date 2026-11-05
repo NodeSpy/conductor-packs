@@ -252,7 +252,7 @@ row can't trigger the next fix.
 
 v2.0.0 handles a PR branch that moved while a fixer worked ([Moved
 head](#moved-head-the-pr-branch-moved-while-a-fixer-worked)). It needs
-**conductor ≥ 0.81.0** (`continue_on_error` with a condition) and the
+**conductor ≥ 0.82.0** (`continue_on_error` with a condition) and the
 **github connector plugin ≥ 2.6.0** (`github.apply_diff`). Without them the
 pack doesn't load (`requires`). The fixer steps of `on_failing_checks`,
 `on_merge_conflict` and `on_new_comment` now have the id `fix` (they had none;
