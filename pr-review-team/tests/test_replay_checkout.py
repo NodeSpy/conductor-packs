@@ -2,7 +2,7 @@
 ("manual:<name>"), so a step with `checkout: checkout-pr` that a manual run
 reaches must say which PR to check out (`checkout_pr:`) — else the daemon
 clones "manual:<name>" and the step fails. review-eval's replay is that run:
-it calls review-team, whose `tree` step clones the PR for the lenses, named
+it calls review-team, whose `snapshot` step fetches the PR for the lenses, named
 by the workflow's inputs — never the run's own target.
 
     python3 -m unittest discover -s pr-review-team/tests
@@ -59,8 +59,8 @@ class ReplayCheckoutTest(unittest.TestCase):
         replay = next(s for s in next(t for t in self.man["triggers"] if t["name"] == "review-eval")["steps"] if s.get("id") == "replay")
         self.assertEqual(replay["workflow"], "review-team")
         self.assertEqual((replay["with"]["repo"], replay["with"]["pr"]), ("{{.item.repo}}", "{{.item.pr}}"))
-        tree = next(s for s in self.workflows["review-team"]["steps"] if s.get("id") == "tree")
-        self.assertEqual(tree["uses"], "github.pr_clone")
+        tree = next(s for s in self.workflows["review-team"]["steps"] if s.get("id") == "snapshot")
+        self.assertEqual(tree["uses"], "github.pr_snapshot")
         # the replayed PR, as the workflow received it — not the run's own target
         self.assertEqual(tree["options"], {"repo": "{{.inputs.repo}}", "pr": "{{.inputs.pr}}"})
 

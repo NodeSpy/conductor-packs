@@ -58,9 +58,9 @@ and cloning each PR uses its read credential.
 
 ## What it needs (`requires:`)
 
-- **`conductor: >=0.81.0`**: the lens panel shares one PR tree. `blob.put`
-  stores the directory as one artifact, and each lens starts from its own
-  copy (`workspace: { from: }`). Since 0.70.0 a step's `checkout_pr:` lets a
+- **`conductor: >=0.81.0`**: the lens panel shares one PR tree. A plugin
+  verb returns it as an archive that conductor stores as one artifact, and
+  each lens starts from its own copy (`workspace: { from: }`). Since 0.70.0 a step's `checkout_pr:` lets a
   manual run check out the PR it names. And, since 0.69.0,
   memory scope keys that are templates over the
   step's facts (`standard:{{.repo}}`, `org:{{.owner}}`), and `ctx.memory.key`
@@ -74,8 +74,8 @@ and cloning each PR uses its read credential.
   `github.pr_files[].patch`), 0.54.0 for `decide:` steps, 0.33.0 for the
   reactive hand-off.
 - **A `github` connector, plugin v2.5.0 or newer.** The only bind.
-  `review-team`'s `tree` step clones each PR with its `pr_clone`, once per
-  review, over HTTPS with the connector's own read credential (the App, a
+  `review-team`'s `snapshot` step fetches each PR with its `pr_snapshot`,
+  once per review, over HTTPS with the connector's own read credential (the App, a
   token or your `gh` login): nothing new to configure. It retries a fetch
   that fails on the network and never retries an auth or not-found failure.
 - **`memory`** — conductor's built-in memory (declared, binds to itself). The
@@ -571,8 +571,8 @@ conductor run review/review-eval --input repos=owner/app --input control=false  
 It **posts nothing** (it runs the review engine, never the posting flow or
 the hand-off), **writes no memory** (notes are only read), and replays each PR
 as if it had no comments yet — the pack's own earlier comments would
-otherwise hide exactly the findings being compared. The review's `tree` step
-clones the replayed PR (the workflow's `repo`/`pr` inputs) and every lens
+otherwise hide exactly the findings being compared. The review's `snapshot` step
+fetches the replayed PR (the workflow's `repo`/`pr` inputs) and every lens
 starts from a copy of it, exactly as in a live review. Its one write is the
 report, `<state_dir>/pr-review-team/eval/<date>.md`; the summary line is the
 `report` step's output and goes to the daemon log.
@@ -695,18 +695,17 @@ Re-export and push to update it.
   PR out itself: lenses × passes fetches of the same head at once (six to
   eighteen with the defaults). A forge answers a burst like that by timing
   some ssh connections out, and each one failed a lens attempt. Now
-  `review-team` clones the PR once. The new `tree` step is the github
-  connector's `pr_clone`: the PR head and its base branch in a temp
-  directory, deepened until their merge-base is in it, over HTTPS with the
-  connector's own read credential. `snapshot` stores the clone, `.git` included, as
-  one artifact (`blob.put` of the directory) and then discards it. Every lens
-  session starts from its own fresh copy
-  (`workspace: { from: "{{.snapshot.blob}}" }`). A lens still has the real,
+  `review-team` fetches the PR once. The new `snapshot` step is the github
+  connector's `pr_snapshot`: the PR head and its base branch, deepened until
+  their merge-base is in it, over HTTPS with the connector's own read
+  credential, returned with `.git` included as one archive that conductor
+  keeps as a run-scoped artifact. Every lens session starts from its own
+  fresh copy (`workspace: { from: "{{.snapshot.archive}}" }`). A lens still has the real,
   uncapped tree and its git, so `git diff origin/<base>...HEAD`, `log` and
   `blame` work as before. No lens can see what another did in its copy,
   nothing is fetched per lens, and conductor never pushes from a copy. A
-  failed clone stops the review with its error.
-- **Needs the github plugin v2.5.0 or newer** (`pr_clone`). No new
+  failed fetch stops the review with its error.
+- **Needs the github plugin v2.5.0 or newer** (`pr_snapshot`). No new
   connector, credential or setting.
 - **Needs conductor >= 0.81.0**, and a local conductor-launched runtime for
   the lenses (cli, acp, …). An artifact workspace is unpacked on the daemon's
@@ -715,7 +714,7 @@ Re-export and push to update it.
 - **If you override `review-team/review`**: drop any `checkout:` or
   `checkout_pr:` from the override. `conductor validate` refuses them beside
   `workspace.from`. To point the review at another PR or repo, override
-  `review-team/tree` instead.
+  `review-team/snapshot` instead.
 
 ## 3.1.1 — lens sessions end with their step
 

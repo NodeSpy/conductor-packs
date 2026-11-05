@@ -59,8 +59,8 @@ pack:
   license: Apache-2.0
   requires:
     # The daemon versions this pack supports. 0.81.0 is the floor for 3.2:
-    # the lens panel shares one PR tree, stored with blob.put of a directory
-    # and handed to every lens as `workspace: { from: }`. 0.70.0 was the floor for 3.0.1:
+    # the lens panel shares one PR tree, a plugin verb's binary output stored
+    # as a blob and handed to every lens as `workspace: { from: }`. 0.70.0 was the floor for 3.0.1:
     # a step's `checkout_pr:`, so review-eval's replays (a manual run) check
     # out the PR they replay. 0.69.0 was the floor for 3.0:
     # memory scope keys are templates over the step's facts
@@ -80,15 +80,13 @@ pack:
     # socket list: the pack's skill.verbs may name no connector outside it,
     # and its wildcards are bounded to it.
     connectors:
-      # 2.5.0: pr_clone / pr_clone_discard, the PR tree the lenses share (3.2).
+      # 2.5.0: pr_snapshot, the PR tree the lenses share (3.2).
       github: ">=2.5.0"
       # Built-in, binds to itself: assess reads emphasis entries, and the
       # calibration triggers read existing entries and write new ones — all
       # through the js code binding (ctx.memory), so a config without a
       # memory: section still loads.
       memory: "*"
-      # Built-in too: review-team stores the PR tree its lenses share.
-      blob: "*"
 
 # Every setting is substituted as TEXT (`${settings.NAME}`), so the pack
 # compares them as strings ("14") wherever it reads one. `auto` is the
@@ -1079,30 +1077,24 @@ workflows:
       # ONE fetch for the whole panel (3.2). Every lens used to check the PR
       # out itself: lenses × passes fetches of the same head at once, and a
       # forge times out some of the ssh connections in a burst like that.
-      # Now `tree` clones it once, `snapshot` stores the tree as one
-      # artifact, and every lens starts from its own copy of it.
+      # Now `snapshot` fetches it once, as one artifact, and every lens
+      # starts from its own copy of it.
       #
-      # The clone is the github connector's pr_clone, with its own
+      # The snapshot is the github connector's pr_snapshot, with its own
       # credentials over HTTPS, retrying a fetch that fails on the network:
-      # the PR head and its base branch in a temp directory, deepened until
-      # their merge-base is in it. It keeps its .git, so a lens can still
-      # diff origin/<base>...HEAD, log and blame. It is a self-contained
-      # shallow clone, so the artifact is the tree plus that much history,
-      # and borrows from no other clone. Once stored it is discarded,
-      # whether the store worked or not.
+      # the PR head and its base branch, deepened until their merge-base is
+      # in it, returned as an archive that conductor keeps as a run-scoped
+      # blob. It keeps its .git, so a lens can still diff
+      # origin/<base>...HEAD, log and blame. It is a self-contained shallow
+      # clone, so the artifact is the tree plus that much history, and
+      # borrows from no other clone.
       #
       # The repo and PR are this workflow's own inputs. On a review request
       # that is the event's own PR; on a review-eval replay (a manual run,
       # whose own target is synthetic) it is the PR being replayed.
-      - id: tree
-        uses: github.pr_clone
-        options: { repo: "{{.inputs.repo}}", pr: "{{.inputs.pr}}" }
       - id: snapshot
-        uses: blob.put
-        options: { path: "{{.tree.dir}}", name: "pr-{{.inputs.pr}}.tar" }
-        hooks:
-          - { at: done, uses: github.pr_clone_discard, options: { dir: "{{.tree.dir}}" } }
-          - { at: fail, uses: github.pr_clone_discard, options: { dir: "{{.tree.dir}}" } }
+        uses: github.pr_snapshot
+        options: { repo: "{{.inputs.repo}}", pr: "{{.inputs.pr}}" }
       # The lens panel. `extends:` (not `<<:`) so this step's own guidance
       # stacks UNDER the house voice rather than replacing it — and so a
       # consumer's `review-team/review` override stacks under both.
@@ -1118,7 +1110,7 @@ workflows:
       # `git` work happen inside the jail.
       - id: review
         extends: *panelist
-        workspace: { from: "{{.snapshot.blob}}" }
+        workspace: { from: "{{.snapshot.archive}}" }
         # one session per lens per pass (lenses.runs = the lenses, review_passes
         # times over); the prompt never names the pass, so the passes are the
         # same review run independently
