@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# A stand-in for the claude CLI (the cli runtime's claude-code recipe:
+# `claude -p --output-format json < prompt`): the fixer's edit, made without
+# a model. It commits a change in its worktree, then waits for the harness to
+# move the PR branch under it (READY → GO), so conductor's end-of-step push
+# finds the branch diverged. A second run (refix) sees MOVED_HEAD in its task.
+set -euo pipefail
+prompt="$(cat)"
+printf '%s' "$prompt" > .e2e-prompt-$$
+git config user.email fixer@example.invalid
+git config user.name fixer
+if grep -q "second attempt" .e2e-prompt-$$; then
+  # The second attempt, on the new head: redo the change by hand.
+  sed -i 's/return 99/return 10/; s/return 1$/return 10/' main.go
+  git add main.go && git commit -qm "fix a() on the new head"
+  rm -f .e2e-prompt-$$
+  echo '{"session_id":"e2e-refix","result":"done again"}'
+  exit 0
+fi
+sed -i 's/return 1$/return 10/' main.go
+if grep -q "and add the big table" .e2e-prompt-$$ 2>/dev/null; then
+  # A change past the diff output's 64 KiB cap.
+  for i in $(seq 1 3000); do echo "row $i: the quick brown fox jumps over the lazy dog"; done > table.txt
+  git add table.txt
+fi
+git add main.go && git commit -qm "fix a()"
+rm -f .e2e-prompt-$$
+touch .e2e-ready
+for _ in $(seq 1 300); do [ -e .e2e-go ] && break; sleep 0.1; done
+rm -f .e2e-ready .e2e-go
+echo '{"session_id":"e2e-fix","result":"done"}'

@@ -33,3 +33,18 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: bash .github/scripts/lint-packs.sh
+
+  e2e:
+    # pr-autopilot's moved-head steps through the real conductor, the real
+    # github plugin and the GitHub fake (pr-autopilot/e2e/moved-head.sh).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v6
+        with: { go-version: stable }
+      - name: allow unprivileged user namespaces (the agent sandbox)
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          sudo sysctl -w kernel.unprivileged_userns_clone=1 || true
+      - name: pr-autopilot moved-head e2e
+        run: bash pr-autopilot/e2e/moved-head.sh
