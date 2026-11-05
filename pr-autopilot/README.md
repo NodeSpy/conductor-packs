@@ -163,57 +163,53 @@ never pinged.
 
 Conductor pushes a fixer's commits at the end of its step, fast-forward only.
 When someone pushed to the PR branch meanwhile (its author, another fixer),
-that push is refused: the commits are still in the fixer's workspace and the
-step's `push` output says how many (`unpushed_commits`). The pack takes it
-from there, with a [git-land](https://github.com/NodeSpy/conductor-plugins/blob/main/docs/connectors/git-land.md)
-connector:
+that push is refused: the step's `push` output says the branch diverged and how
+many commits were left unpushed, and its `diff` output holds the change. The
+pack takes it from there, with the github plugin's `apply_diff` (github ≥ 2.6.0):
 
-1. **Keep** (`kept`): the commits are copied out of the fixer's workspace into
-   git-land's own repository, under
-   `refs/kept/<owner>/<repo>/pr-<n>/<agent>`. This is a fetch, so nothing runs
-   in the workspace. From here on, removing the workspace loses nothing.
-2. **Replay** (`replayed`): the commits are replayed onto the branch's new
-   head, without a working tree or hooks.
-3. **Clean → push** (`landed`): the replayed commits are pushed, still a
-   fast-forward and never forced. One agent, one run. On
-   `on_changes_requested`, `resolve` then resolves the threads the change
-   addressed.
-4. **Conflict → run it again, once** (`refix`): the same fixer step runs one
-   more time with the same task, on the new head. Its task also says that
-   this is a second attempt, which files conflicted, the first attempt's diff
-   (fenced as data), and the kept commit to cherry-pick from. Conductor
-   pushes its work as usual. If that push fails too, the run fails (the
-   change was never pushed). There is no third attempt, and nothing is
-   forced. `moved_head_guidance` is the note's text.
-5. **Not moved** (`unpushed`): the push failed for some other reason. The run
-   fails (`step "unpushed" failed`), and the commits stay at the kept ref.
+1. **Keep** (`kept`): the change (the fixer's `diff`) is stored as a run
+   artifact (`blob.put`), beside the step outputs that keep it in the run's
+   history.
+2. **Apply** (`landed`): `github.apply_diff` applies the committed change to
+   the branch's **current** head as one commit, through GitHub's API, as you
+   (the github connector's write identity, the same one conductor pushes
+   as). It is a fast-forward and never forced: a branch that moved yet again
+   is `rejected`. A hunk the new head already has is skipped. One agent, one
+   run. On `on_changes_requested`, `resolve` then resolves the threads the
+   change addressed.
+3. **Conflict or moved again → run it again, once** (`refix`): the same
+   fixer step runs one more time with the same task, on the new head. Its
+   task also says that this is a second attempt, which files conflicted, and
+   the first attempt's diff (fenced as data). Conductor pushes its work as
+   usual. If that push fails too, the run fails (the change was never
+   pushed). There is no third attempt, and nothing is forced.
+   `moved_head_guidance` is the note's text.
+4. **CI config** (`unpushed`): a change to CI config (`.github/workflows/`
+   and the other CI paths conductor's own push refuses by default) is never
+   applied. The run fails, and the change stays in the run's artifact and
+   the step's `diff`.
 
-**Setup.** Add a git-land connector with a directory of its own and
-credentials that can push to your repos. With one git-land connector, the pack
-binds it on its own:
+**What is never applied.** The `diff` output is capped at 64 KiB, and any
+secret in it is redacted. A clipped or redacted diff is not the whole change,
+so the fixer does not go on past its push: the run fails as before, with its
+agent and workspace kept, and the commits are still in that workspace.
+Uncommitted edits (the diff's `# uncommitted` section) are not applied, just
+as conductor's push never pushes them.
 
-```yaml
-connectors:
-  gh: { use: github, … }
-  land:
-    use: git-land
-    dir: /var/lib/conductor/land.git        # created on first use; never a workspace
-    ssh_key_path: /etc/conductor/deploy_key  # push access to the repos you arm
-    strict_host_key_checking: accept-new
-    # sign: true                             # sign replayed commits; key via config:
-    # config: { gpg.format: ssh, user.signingkey: /etc/conductor/signing_key }
-```
-
-`push_remote` (default `git@github.com:{{.repo}}.git`) is where git-land
-fetches the branch from and pushes to. Set it for an HTTPS remote or a
-GitHub Enterprise host. Kept refs accumulate in `dir`, so prune them when you
-like.
+**Setup.** None beyond the github connector: `apply_diff` uses its existing
+auth, so the commit is yours. `moved_head_message` is the commit's message.
 
 The steps are plain `uses:` steps in [`conductor-pack.yaml`](conductor-pack.yaml)
-(the `kept`, `pr_now`, `replayed`, `landed` and `unpushed` templates). The
-fixer steps reach them through `continue_on_error:
-"<step>.push.unpushed_commits > 0"`: the run goes on past a fixer whose push
-left commits behind, and stops on any other failure.
+(the `kept`, `pr_now`, `landed` and `unpushed` templates). The fixer steps
+reach them through a `continue_on_error:` condition: the run goes on past a
+fixer whose push was refused because the branch diverged, with a whole diff,
+and stops on any other failure.
+
+[`e2e/moved-head.sh`](e2e/moved-head.sh) runs these steps end to end: the
+real conductor (`conductor once`), this pack, and the github plugin against a
+GitHub fake. A sandboxed stand-in fixer commits while the branch moves under
+it, and the script checks a clean landing, a conflict's second attempt, and a
+clipped diff that is never applied.
 
 ### The same hooks on your own triggers
 
@@ -256,20 +252,15 @@ row can't trigger the next fix.
 
 v2.0.0 handles a PR branch that moved while a fixer worked ([Moved
 head](#moved-head-the-pr-branch-moved-while-a-fixer-worked)). It needs
-**conductor ≥ 0.81.0** (`continue_on_error` with a condition) and a
-**git-land connector plugin ≥ 1.0.0** bound to the pack. Without one the
-pack doesn't load (`requires.connectors`). Add the connector first. Other
-changes:
-
-- The fixer steps of `on_failing_checks`, `on_merge_conflict` and
-  `on_new_comment` now have the id `fix` (they had none; `on_changes_requested`'s is still
-  `address`). An overlay that targets a step by id needs the new one.
-- A fixer no longer sets `archive_when_done: true`. Its agent is kept until
-  the run ends, so the moved-head steps can read its workspace, and then
-  released.
-- A fix left unpushed on a branch that did **not** move now fails as
-  `step "unpushed" failed` instead of "the change was never pushed". Its
-  commits are kept at the ref above.
+**conductor ≥ 0.81.0** (`continue_on_error` with a condition) and the
+**github connector plugin ≥ 2.6.0** (`github.apply_diff`). Without them the
+pack doesn't load (`requires`). The fixer steps of `on_failing_checks`,
+`on_merge_conflict` and `on_new_comment` now have the id `fix` (they had none;
+`on_changes_requested`'s is still `address`). An overlay that targets a step
+by id needs the new one. A fixer no longer sets `archive_when_done: true`:
+one that finishes cleanly is still released when its step ends, but a failed
+one keeps its agent and workspace (its unpushed work is in it), and one the
+run goes on past is released when the run ends.
 
 v1.7.0 lets the `on_changes_requested` and `on_new_comment` agents answer on
 the PR. Both steps now grant `github.reply` and `github.comment`, pinned to the
