@@ -745,8 +745,12 @@ class EvalTest(unittest.TestCase):
         for bad in ("submit_review", "remember(", "memory.remember", "handoff", "skill"):
             self.assertNotIn(bad, blob)
         for st in engine:
+            if st.get("uses") == "blob.put":
+                # the lenses' shared PR tree: a run-scoped artifact, gone with the run
+                self.assertEqual(st.get("id"), "snapshot")
+                continue
             self.assertNotIn("uses", st) if not str(st.get("uses", "")).startswith("github.") else \
-                self.assertIn(st["uses"], ("github.pr_get", "github.pr_files", "github.file", "github.review_comments"))
+                self.assertIn(st["uses"], ("github.pr_get", "github.pr_files", "github.file", "github.review_comments", "github.pr_clone"))
 
     def test_a_replay_can_ignore_the_prs_existing_comments(self):
         code = flow_step(load(), "review-team", "prior")["code"]

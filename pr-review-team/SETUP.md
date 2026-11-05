@@ -17,7 +17,7 @@ This sets up conductor to review PRs you're requested on, posting as you.
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/NodeSpy/conductor/main/scripts/install-release.sh | bash
-conductor version        # needs v0.70.0 or newer
+conductor version        # needs v0.81.0 or newer
 ```
 
 Accept the offer to install the background service (systemd/launchd).
@@ -60,7 +60,7 @@ memory:
 packs:
   review:
     use: conductor-packs/pr-review-team
-    version: "~> 3.1"
+    version: "~> 3.2"
     settings:
       auto: true            # never hand off: every review posts as you, approvals included
       review_passes: 2      # each lens reviews twice; findings are merged

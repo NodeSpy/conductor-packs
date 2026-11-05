@@ -53,12 +53,15 @@ conductor validate
 
 The github connector auto-binds when it is your only one; with several, bind
 it: `connectors: { github: <your-connector> }`. The pack carries no
-connectors and no secrets — posting uses your connector's own write identity.
+connectors and no secrets: posting uses your connector's own write identity,
+and cloning each PR uses its read credential.
 
 ## What it needs (`requires:`)
 
-- **`conductor: >=0.70.0`** — a step's `checkout_pr:`, so `review-eval`'s
-  replays (a manual run) check out the PR they replay. And, since 0.69.0,
+- **`conductor: >=0.81.0`**: the lens panel shares one PR tree. `blob.put`
+  stores the directory as one artifact, and each lens starts from its own
+  copy (`workspace: { from: }`). Since 0.70.0 a step's `checkout_pr:` lets a
+  manual run check out the PR it names. And, since 0.69.0,
   memory scope keys that are templates over the
   step's facts (`standard:{{.repo}}`, `org:{{.owner}}`), and `ctx.memory.key`
   — core's scope-key renderer, which the pack renders every key it computes
@@ -70,7 +73,11 @@ connectors and no secrets — posting uses your connector's own write identity.
   0.57.0 for whole-PR review (the agent workspace jail and
   `github.pr_files[].patch`), 0.54.0 for `decide:` steps, 0.33.0 for the
   reactive hand-off.
-- **A `github` connector.** The only bind.
+- **A `github` connector, plugin v2.5.0 or newer.** The only bind.
+  `review-team`'s `tree` step clones each PR with its `pr_clone`, once per
+  review, over HTTPS with the connector's own read credential (the App, a
+  token or your `gh` login): nothing new to configure. It retries a fetch
+  that fails on the network and never retries an auth or not-found failure.
 - **`memory`** — conductor's built-in memory (declared, binds to itself). The
   review works without a top-level `memory:` section — it then reads no
   memory — and the calibration triggers stop with a message asking for one.
@@ -520,8 +527,8 @@ can agree on only about half their findings (measure yours with
 (or 3) has every lens review the PR that many times:
 
 - **Independent passes.** Each pass is its own agent session, run in
-  parallel, with the same prompt, learned notes and checkout. No pass sees
-  another's output.
+  parallel, with the same prompt, learned notes and PR tree (each session in
+  its own copy). No pass sees another's output.
 - **Merged before verify.** The findings of all passes and lenses are matched
   with `review-eval`'s matcher — same file and lines at most 5 apart, or
   another file with close text — and identical text or the light judge's
@@ -564,9 +571,9 @@ conductor run review/review-eval --input repos=owner/app --input control=false  
 It **posts nothing** (it runs the review engine, never the posting flow or
 the hand-off), **writes no memory** (notes are only read), and replays each PR
 as if it had no comments yet — the pack's own earlier comments would
-otherwise hide exactly the findings being compared. Each lens checks out the
-replayed PR itself (`checkout_pr:` on the lens step), exactly as a live review
-does. Its one write is the
+otherwise hide exactly the findings being compared. The review's `tree` step
+clones the replayed PR (the workflow's `repo`/`pr` inputs) and every lens
+starts from a copy of it, exactly as in a live review. Its one write is the
 report, `<state_dir>/pr-review-team/eval/<date>.md`; the summary line is the
 `report` step's output and goes to the daemon log.
 
@@ -647,7 +654,7 @@ the report. Some limits:
 
 - A replay reviews the PR's current diff, not the commit each comment was
   made on.
-- The lens reviewers keep their read-only `gh` in the checkout, so nothing
+- The lens reviewers keep their read-only `gh` in their copy of the PR tree, so nothing
   but the prompt stops one from reading the PR's comments. Treat a
   suspiciously high recall with that in mind.
 
@@ -681,6 +688,34 @@ packs:
 
 Its manifest is just pack metadata plus `memory: { entries: memory }`.
 Re-export and push to update it.
+
+## 3.2.0 — one clone per review
+
+- **The lens panel shares one clone.** Every lens session used to check the
+  PR out itself: lenses × passes fetches of the same head at once (six to
+  eighteen with the defaults). A forge answers a burst like that by timing
+  some ssh connections out, and each one failed a lens attempt. Now
+  `review-team` clones the PR once. The new `tree` step is the github
+  connector's `pr_clone`: the PR head and its base branch in a temp
+  directory, deepened until their merge-base is in it, over HTTPS with the
+  connector's own read credential. `snapshot` stores the clone, `.git` included, as
+  one artifact (`blob.put` of the directory) and then discards it. Every lens
+  session starts from its own fresh copy
+  (`workspace: { from: "{{.snapshot.blob}}" }`). A lens still has the real,
+  uncapped tree and its git, so `git diff origin/<base>...HEAD`, `log` and
+  `blame` work as before. No lens can see what another did in its copy,
+  nothing is fetched per lens, and conductor never pushes from a copy. A
+  failed clone stops the review with its error.
+- **Needs the github plugin v2.5.0 or newer** (`pr_clone`). No new
+  connector, credential or setting.
+- **Needs conductor >= 0.81.0**, and a local conductor-launched runtime for
+  the lenses (cli, acp, …). An artifact workspace is unpacked on the daemon's
+  machine, so a lens on paseo or on another `host:` fails with a message
+  saying so.
+- **If you override `review-team/review`**: drop any `checkout:` or
+  `checkout_pr:` from the override. `conductor validate` refuses them beside
+  `workspace.from`. To point the review at another PR or repo, override
+  `review-team/tree` instead.
 
 ## 3.1.1 — lens sessions end with their step
 

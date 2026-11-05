@@ -96,6 +96,11 @@ class OnePassIsTheOldReviewTest(unittest.TestCase):
         now["extends"] = dict(now["extends"])
         self.assertIs(now["extends"].pop("archive_when_done"), True)
         self.assertNotIn("archive_when_done", then["extends"])
+        # 3.2: a lens starts from the review's one shared snapshot of the PR
+        # tree instead of checking the PR out itself
+        self.assertEqual(now.pop("workspace"), {"from": "{{.snapshot.blob}}"})
+        self.assertEqual((then.pop("checkout"), then.pop("checkout_pr")),
+                         ("checkout-pr", {"repo": "{{.inputs.repo}}", "pr": "{{.inputs.pr}}"}))
         self.assertEqual(now, then)
 
     def test_one_pass_ignores_an_agreement_a_lens_made_up(self):
@@ -126,7 +131,8 @@ class DispatchTest(unittest.TestCase):
         self.assertTrue(st["parallel"])
         self.assertNotIn(".item.pass", json.dumps(st))                          # the prompt never names the pass
         self.assertNotIn(".review.", json.dumps(st))                            # nor reads another session's output
-        self.assertEqual((st["checkout"], st["memory"]), ("checkout-pr", False))
+        # every pass starts from its own copy of the one snapshot (3.2)
+        self.assertEqual((st["workspace"], st["memory"]), ({"from": "{{.snapshot.blob}}"}, False))
 
     def test_the_passes_input_overrides_the_setting(self):
         self.assertEqual(base_ctx([lens("Security")], passes="2", setting="1")["lenses"]["passes"], 2)
