@@ -222,6 +222,26 @@ GitHub fake. A sandboxed stand-in fixer commits while the branch moves under
 it, and the script checks a clean landing, a conflict's second attempt, and a
 clipped diff that is never applied.
 
+### One fixer per PR
+
+The four fixer triggers (`on_failing_checks`, `on_merge_conflict`,
+`on_changes_requested`, `on_new_comment`) share one `serialize:` key,
+`{{.repo}}#{{.pr}}`. So only one autopilot fixer works a PR at a time. When a
+second event arrives on a PR a fixer is working (a review lands while a comment
+is being handled, say), its run waits, and the daemon logs
+`waiting on <repo>#<pr> (held by autopilot/on_new_comment)`. It runs once the
+first ends, on the PR's head as it is then. Conductor reads the PR's current head
+when the fixer's step dispatches, so the fixer starts from what the first one
+pushed and its own push is a plain fast-forward.
+
+To change the key for a trigger, set it in that trigger's arm, e.g.
+`on_new_comment: { …, serialize: { key: "…" } }`. To let that trigger's runs
+overlap again, use `serialize: { key: "" }`.
+
+[`e2e/moved-head.sh`](e2e/moved-head.sh) runs it through the daemon: a
+comment's fixer is working when a changes-requested review arrives, and the
+review's fixer waits, then runs on the pushed head and fast-forwards it.
+
 ### Merged PRs: the head branch is deleted
 
 Armed, `on_merged` takes every PR close in its repos, and acts only when:
@@ -279,6 +299,10 @@ the run. Conductor never reads a status it posted back as CI, so a `failure`
 row can't trigger the next fix.
 
 ## Upgrading
+
+v2.3.0: one fixer per PR ([One fixer per PR](#one-fixer-per-pr)). It needs
+**conductor ≥ 0.86.0** (a trigger's `serialize:`). An older conductor refuses
+the pack at load, so keep v2.2.x there.
 
 v2.2.0 adds `on_merged` ([Merged
 PRs](#merged-prs-the-head-branch-is-deleted)), which ships disarmed like the
