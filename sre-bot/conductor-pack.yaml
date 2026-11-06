@@ -1,0 +1,133 @@
+# sre-bot — a distributable conductor pack: a BOT TEMPLATE.
+#
+# A first-line SRE as a conductor bot (conductor wiki: Bots, Bot-Templates):
+# the charter, the typed runbooks and watch documents its memory starts with,
+# the connectors it needs, the verbs it requests — each with the most autonomy
+# you may ever grant it — and suggested triggers and proactive checks.
+#
+# A template only REQUESTS. You instantiate it into a real bot, and the bot
+# starts in practice (shadow) mode with only its read-only verbs; everything
+# above observe is a widening you grant yourself, one verb at a time:
+#
+#   packs:
+#     sre: { use: conductor-packs/sre-bot, version: "~> 2.0" }
+#   bots:
+#     platform-sre:
+#       use: sre/sre                                   # <pack instance>/<template>
+#       connectors: { pagerduty: pd, aws: aws, chat: slack, schedule: timer }
+#       grant: { pagerduty.get_incident: observe, … }  # `conductor bot new` writes these
+#
+# or let conductor write it, on a copy of your config, shown as a diff:
+#
+#   conductor init
+#   conductor bot new platform-sre --from sre/sre        # --write when the diff looks right
+#
+# Your operators, team, connector bindings, autonomy (promotion,
+# spend cap), Terraform repos and roles stay yours: a template cannot set
+# them. A newer version of this pack never overwrites the bot's memory — its
+# charter and runbook changes arrive as a proposal for you to approve.
+
+pack:
+  name: sre-bot
+  version: 2.0.0
+  description: A first-line SRE bot template — charter, runbooks, the connectors it needs, the verbs it requests with their maximum tiers, and suggested routing and proactive checks. Proposes Terraform applies, env var and scaling changes, and RI / Savings Plans purchases for operator approval.
+  tags: [sre, oncall, bots, pagerduty, aws, terraform]
+  homepage: https://github.com/NodeSpy/conductor-packs
+  license: Apache-2.0
+  requires:
+    # Bots and bot templates ship in the first conductor release that
+    # contains them (NodeSpy/conductor#172 and the community-bots work on
+    # its branch). That release is NOT TAGGED YET — the newest tag is
+    # v0.65.0, which has neither (and refuses this manifest's bots: section
+    # by name), so the earliest this can be is v0.66.0. Re-check this floor
+    # when it is released.
+    conductor: ">=0.66.0"
+
+bots:
+  sre:
+    description: First-line SRE — triages pages and chat requests, investigates read-only, and proposes every change (Terraform, env vars, scaling, commitments) for its operator's signed approval.
+    charter_file: charter.md
+    # Its memory starts with these typed documents (runbooks/, watch/).
+    seed: seed
+    collections:
+      postmortems: { from: collections/postmortems.yaml }
+
+    # What it needs. You bind each to one of your connectors (bots.<b>.connectors);
+    # one you have exactly one of binds itself.
+    connectors:
+      pagerduty:
+        use: pagerduty
+        version: ">=1.0.0"
+        desc: "pages (the incident source) and, once released, the incident verbs"
+      aws:
+        use: aws-cost
+        required: false
+        desc: "spend reads and commitment purchases (the aws-cost plugin, not released yet)"
+      chat:
+        use: slack
+        required: false
+        desc: "@-mentions of your Slack app reach the bot as chat requests"
+      schedule:
+        use: cron
+        required: false
+        desc: "your cron connector: schedules named weekly-review and weekly-consolidate drive the weekly triggers"
+
+    # What it asks for, each with the most autonomy you may grant (observe runs;
+    # reversible may be promoted to run unapproved; propose always waits for you;
+    # commit_money waits for you, under your spend cap). A new bot gets the
+    # observe ones; the rest are yours to grant.
+    verbs:
+      pagerduty.get_incident: observe
+      pagerduty.list_incidents: observe
+      pagerduty.acknowledge: { max: reversible, why: "stop the page from re-notifying while it investigates" }
+      pagerduty.add_note: { max: reversible, why: "write what it found onto the incident" }
+      pagerduty.resolve: { max: propose, why: "close an incident it mitigated" }
+      pagerduty.escalate: { max: propose, why: "page the next level per its escalation policy" }
+      aws.cost_*: observe
+      aws.reservation_*: observe
+      aws.savings_plans*: observe
+      aws.reserved_*: observe
+      aws.purchase_savings_plan: { max: commit_money, amount: total_commitment_usd, why: "a Savings Plans purchase the weekly review found worthwhile" }
+      aws.purchase_reserved_instances: { max: commit_money, amount: total_cost_usd, why: "a reserved-instance purchase the weekly review found worthwhile" }
+      chat.post: { max: propose, why: "answer in the channel it was asked in" }
+
+    # Suggested routes into the bot. `conductor bot new` writes them into your
+    # config DISARMED (enabled: false) — turn on the ones you want.
+    triggers:
+      - name: page
+        desc: "a page: an urgent case, and a worker on it at once"
+        on: pagerduty.incident
+        filter: { event_types: [incident.triggered, incident.escalated] }
+        title: "page: {{.title}}"
+        text: |
+          PagerDuty incident {{index . "pagerduty.id"}} (#{{index . "pagerduty.number"}}) on service {{index . "pagerduty.service"}}
+          event {{index . "pagerduty.event_type"}} · urgency {{index . "pagerduty.urgency"}} · priority {{index . "pagerduty.priority"}}
+          {{.url}}
+          Triage per runbooks/page-triage.md.
+        urgent: true
+      - name: chat-request
+        desc: "an @-mention: a case on the asker's trust, never yours"
+        on: chat.app_mention
+        title: "chat request from {{.user}}"
+        text: "{{.text}}"
+        requester: "slack:{{.user}}"
+      - name: weekly-review
+        desc: "the weekly spend & commitment review (runbooks/spend-review.md)"
+        on: schedule.weekly-review
+        title: "weekly spend & commitment review"
+        text: "Weekly review: last week's spend against reservations and Savings Plans, utilization and coverage, and whether a purchase is warranted. Follow runbooks/spend-review.md; propose any purchase within the spend cap."
+      - name: weekly-consolidate
+        desc: "weekly memory consolidation (raw case logs → a digest and knowledge)"
+        on: schedule.weekly-consolidate
+        action: consolidate
+
+    # Suggested proactive checks: on for a bot whose operator writes
+    # `proactive: {}` (and a budget:, which is always the operator's).
+    proactive:
+      every: 4h
+      quiet_hours: "22:00-07:00"
+      checklist: { section: "Proactive checks" }
+      notify_at: high
+
+    model: claude-opus-5
+    runtime: "a use: cli runtime with claude-code for its workers; the home session runs on paseo"

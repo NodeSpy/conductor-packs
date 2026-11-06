@@ -1,0 +1,23 @@
+# The `postmortems` collection: one document per incident review, in the bot's
+# memory (bots.<b>.collections) — or a team's knowledge (teams.<t>.collections,
+# with writers: [operator, proposal]). Use it with:
+#   collections: { postmortems: { from: .conductor/packs/<instance>/collections/postmortems.yaml } }
+dir: postmortems
+fields:
+  title:        { type: string, required: true }
+  incident:     { type: string, required: true }   # the page / case it reviews
+  severity:     { type: enum, values: [sev1, sev2, sev3, sev4], required: true }
+  date:         { type: string, required: true }   # YYYY-MM-DD
+  impact:       { type: text, required: true }
+  root_cause:   { type: text, required: true }
+  action_items: { type: list }
+template: |
+  ## Timeline
+
+  ## What went well
+
+  ## What went wrong
+
+  ## Follow-ups
+free_paths: false
+writers: [operator, bots]
