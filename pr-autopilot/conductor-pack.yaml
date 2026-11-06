@@ -37,6 +37,7 @@
 #           # RECOMMENDED: don't respond to bot chatter (CI bots, dependabot, …).
 #           # Quote the logins — the trailing [bot] is a YAML flow-sequence trap:
 #           filter: { not_comment_author: ["github-actions[bot]", "dependabot[bot]"] }
+#         on_merged:           { enabled: true, repos: [your-org/app] }  # deletes your merged PRs' branches
 #   Then: `conductor init` (vendor + lock), `conductor pack plan`, `conductor validate`.
 #
 # Progress on the PR. Every flow here carries plain `hooks:` that show, as you,
@@ -65,7 +66,7 @@
 
 pack:
   name: pr-autopilot
-  version: 2.1.0
+  version: 2.2.0
   description: Autopilot for routine PR events — fix red CI, resolve conflicts, address requested changes, answer comments. One agent per event, scoped to your repos.
   tags: [github, ci, automation, agents, maintenance]
   homepage: https://github.com/NodeSpy/conductor-packs
@@ -102,12 +103,15 @@ pack:
     # every review still waiting on you (review_comments with ids,
     # outstanding_reviews, feedback_cursor), github.resolve_threads, and
     # rerequest_review's all_outstanding. 2.6.0: github.apply_diff, which
-    # lands a fixer's change on a PR branch that moved under it (2.0.0). An
-    # older plugin refuses this pack's steps at load.
+    # lands a fixer's change on a PR branch that moved under it (2.0.0).
+    # 2.9.0: github.delete_branch, and the close event's head facts (author,
+    # mine, head_ref, head_sha, same_repo, default_branch) for a trigger on
+    # it — on_merged (2.2.0). An older plugin refuses this pack's steps at
+    # load.
     #
     # blob: conductor's built-in run artifacts — a moved-head run keeps the
     # fixer's change as one (binds to itself; nothing to configure).
-    connectors: { github: ">=2.6.0", blob: "*" }
+    connectors: { github: ">=2.9.0", blob: "*" }
 
 # The worker model as a fleet — conductor resolves it against your runtime's
 # roster best-first, so the pack ships no provider-specific ids. Override with
@@ -137,6 +141,7 @@ settings:
   status_stopped:   { type: string, default: "stopped — {{.run.reason}}", desc: "success description when the PR merged/closed under the run (on the commit the run started on)" }
   stop_unreact:     { type: boolean, default: true, desc: "when the PR merged/closed under the run, take the 👀 back off the review/comment" }
   resolve_threads:  { type: boolean, default: true, desc: "after a changes_requested or new_comment run whose change conductor pushed, resolve the review threads its agent reports that change addressed (never ones it only replied to or disagreed with, nor, for changes_requested, ones with newer feedback; nothing when nothing was pushed)" }
+  delete_merged_branch: { type: boolean, default: true, desc: "on_merged: delete the head branch of your PR once it merged (never a fork's branch, the default branch, a protected branch, or a branch pushed to since the merge)" }
   # Moved head — the PR branch moved while a fixer worked (see below).
   moved_head_message: { type: string, default: "Apply the autopilot's fix onto the PR branch's new head", desc: "the commit message of a fixer's change landed by github.apply_diff when the PR branch moved under it" }
   moved_head_guidance:
@@ -568,3 +573,16 @@ triggers:
         if: "${settings.resolve_threads} && refix.push.pushed"
         uses: github.resolve_threads
         options: { repo: "{{.repo}}", pr: "{{.pr}}", comments: "{{.refix.addressed_comments}}" }
+
+  - name: on_merged
+    # A PR closed. Only YOUR merged PR whose branch is in this repo (not a
+    # fork's) and isn't the default branch is acted on: its head branch is
+    # deleted, but only while it still points at the merged head, so a branch
+    # someone pushed to since is left alone. The plugin also refuses a
+    # protected branch. No agent; off with settings.delete_merged_branch.
+    on: github._closed
+    steps:
+      - id: delete
+        if: "${settings.delete_merged_branch} && merged && mine && same_repo && head_ref != default_branch"
+        uses: github.delete_branch
+        options: { repo: "{{.repo}}", branch: "{{.head_ref}}", expect_sha: "{{.head_sha}}" }
