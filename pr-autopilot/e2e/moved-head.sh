@@ -7,6 +7,10 @@
 # lands the change with github.apply_diff — or, when it conflicts, runs the
 # fixer once more.
 #
+# Then a reviewer's inline thread: the fixer reports the comment its change
+# addressed, and once conductor has pushed it (straight, or landed on a moved
+# head) the pack resolves that thread.
+#
 # Git: the agent clones and pushes over a local bare repository (a git
 # insteadOf in the harness's own HOME); GitHub's API is the fake, holding the
 # same files. The network is used only for builds and for the released js
@@ -69,10 +73,11 @@ fake() { curl -fsS -X POST "$FAKE/_fake/$1" -H 'content-type: application/json' 
 q() { curl -fsS "$FAKE/_fake/q?$1"; }
 json() { python3 -c 'import json,sys; d=json.load(sys.stdin); print(eval(sys.argv[1], {"d": d}))' "$1"; }
 
-# scenario <name> <theirs main.go> [<comment>]: a fresh world; their push
-# lands while the fixer works.
+# scenario <name> <theirs main.go> [<comment>] [review]: a fresh world; their
+# push lands while the fixer works (none when <theirs> is empty). With
+# `review`, the comment is an inline thread of a COMMENT review on main.go.
 scenario() {
-  local name="$1" theirs="$2" comment="${3:-please make a() return 10}" w="$WORK/$1"
+  local name="$1" theirs="$2" comment="${3:-please make a() return 10}" kind="${4:-comment}" w="$WORK/$1"
   mkdir -p "$w"
   [ -n "$FAKE_PID" ] && kill "$FAKE_PID" 2>/dev/null && wait "$FAKE_PID" 2>/dev/null || true
   rm -f "$WORK/fake.url"
@@ -114,20 +119,30 @@ packs:
 YAML
   # The event: the fake's own webhook for a reviewer's comment (delivered
   # nowhere; read back from the fake), as `once`'s fixture.
-  python3 - "$comment" <<'PY' | fake act @- >/dev/null
-import json,sys; print(json.dumps({"op":"comment","repo":"acme/w","number":1,"by":"rev","body":sys.argv[1]}))
+  python3 - "$comment" "$kind" <<'PY' | fake act @- > "$w/act.json"
+import json,sys
+body, kind = sys.argv[1], sys.argv[2]
+if kind == "review":
+    print(json.dumps({"op":"review","repo":"acme/w","number":1,"by":"rev","state":"COMMENTED","body":"","comments":[{"path":"main.go","line":4,"body":body}]}))
+else:
+    print(json.dumps({"op":"comment","repo":"acme/w","number":1,"by":"rev","body":body}))
 PY
   fake act '{"op":"flush"}' >/dev/null
+  local ev=issue_comment; [ "$kind" = review ] && ev=pull_request_review_comment
   curl -fsS "$FAKE/_fake/deliveries" | python3 -c '
 import json,sys
-d=[x for x in json.load(sys.stdin) if x["event"]=="issue_comment"][-1]
-print(json.dumps({"event": d["event"], "body": d["payload"]}))' > "$w/event.json"
+d=[x for x in json.load(sys.stdin) if x["event"]==sys.argv[1]][-1]
+print(json.dumps({"event": d["event"], "body": d["payload"]}))' "$ev" > "$w/event.json"
 
   "$WORK/bin/conductor" init --config "$w/config.yaml" >"$w/init.log" 2>&1 || { echo "init failed:"; cat "$w/init.log"; return 1; }
 
   # Their push, the moment the fixer has committed: the git branch and GitHub's.
   ( for _ in $(seq 1 600); do
       ready="$(find "$WORK/xdg" "$w" -name .e2e-ready 2>/dev/null | head -1)"
+      if [ -n "$ready" ] && [ -z "$theirs" ]; then
+        touch "$(dirname "$ready")/.e2e-go"
+        exit 0
+      fi
       if [ -n "$ready" ]; then
         rm -rf "$WORK/theirs" && git clone -q "$WORK/forge/acme/w.git" -b feat "$WORK/theirs"
         printf '%s' "$theirs" > "$WORK/theirs/main.go"
@@ -152,8 +167,9 @@ ran() { grep -q "^  [✓✗] $2 " "$WORK/$1/once.log"; }
 outcome() { sed -n 's/^outcome: //p' "$WORK/$1/once.log" | head -1; }
 show() { echo "    --- $1/once.log"; grep -v '^plugin ' "$WORK/$1/once.log" | cut -c1-300 | tail -30 | sed 's/^/    /'; }
 
-echo "== clean: their change elsewhere in the file; the fix lands on the new head =="
 THEIRS_CLEAN="${BASE_GO/return 2/return 20}"
+[ -n "${ONLY_THREAD:-}" ] || {
+echo "== clean: their change elsewhere in the file; the fix lands on the new head =="
 scenario clean "$THEIRS_CLEAN"
 got="$(q 'what=files&repo=acme/w&branch=feat')"
 main="$(echo "$got" | json 'd["files"]["main.go"]')"
@@ -179,6 +195,27 @@ scenario clipped "$THEIRS_CLEAN" "please make a() return 10 and add the big tabl
 ran clipped landed && bad "landed ran on a clipped diff" || ok "landed did not run"
 [ "$(q 'what=files&repo=acme/w&branch=feat' | json 'd["author"]')" = rev ] && ok "GitHub's branch is untouched" || bad "GitHub's branch moved"
 case "$(outcome clipped)" in failed*) ok "the run failed" ;; *) bad "outcome: $(outcome clipped)"; show clipped ;; esac
+
+}
+# thread_resolved <scenario>: whether the review's inline thread is resolved
+# on GitHub (the fake's GraphQL, as the plugin reads it).
+thread_resolved() {
+  curl -fsS "$FAKE/graphql" -H 'Authorization: Bearer tok-me' -H 'content-type: application/json' \
+    -d '{"query":"query{repository(owner:\"acme\",name:\"w\"){pullRequest(number:1){reviewThreads(first:10){nodes{isResolved}}}}}"}' |
+    json 'd["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"][0]["isResolved"]'
+}
+
+echo "== review thread: the fix is pushed, the thread it addressed is resolved =="
+scenario thread "" "please make a() return 10" review
+[ "$(git -C "$WORK/forge/acme/w.git" show feat:main.go | grep -c 'return 10')" = 1 ] && ok "conductor pushed the fix" || bad "the fix was not pushed"
+ran thread resolve && ok "resolve ran" || bad "resolve did not run"
+[ "$(thread_resolved)" = True ] && ok "the thread is resolved" || { bad "the thread is still open"; show thread; }
+[ "$(outcome thread)" = ok ] && ok "the run's outcome is ok" || { bad "outcome: $(outcome thread)"; show thread; }
+
+echo "== review thread, moved head: the change lands on the new head, the thread is resolved =="
+scenario thread-moved "$THEIRS_CLEAN" "please make a() return 10" review
+ran thread-moved landed && ok "landed ran" || bad "landed did not run"
+[ "$(thread_resolved)" = True ] && ok "the thread is resolved" || { bad "the thread is still open"; show thread-moved; }
 
 echo "== $pass passed, $fail failed =="
 [ "$fail" = 0 ]

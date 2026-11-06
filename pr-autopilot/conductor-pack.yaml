@@ -65,7 +65,7 @@
 
 pack:
   name: pr-autopilot
-  version: 2.0.0
+  version: 2.1.0
   description: Autopilot for routine PR events — fix red CI, resolve conflicts, address requested changes, answer comments. One agent per event, scoped to your repos.
   tags: [github, ci, automation, agents, maintenance]
   homepage: https://github.com/NodeSpy/conductor-packs
@@ -136,7 +136,7 @@ settings:
   status_failed:    { type: string, default: "gave up: {{.run.reason}}", desc: "failure description (on the PR's current head)" }
   status_stopped:   { type: string, default: "stopped — {{.run.reason}}", desc: "success description when the PR merged/closed under the run (on the commit the run started on)" }
   stop_unreact:     { type: boolean, default: true, desc: "when the PR merged/closed under the run, take the 👀 back off the review/comment" }
-  resolve_threads:  { type: boolean, default: true, desc: "after a changes_requested run whose change conductor pushed, resolve the review threads its agent reports that change addressed (never ones it only replied to or disagreed with, nor ones with newer feedback; nothing when nothing was pushed)" }
+  resolve_threads:  { type: boolean, default: true, desc: "after a changes_requested or new_comment run whose change conductor pushed, resolve the review threads its agent reports that change addressed (never ones it only replied to or disagreed with, nor, for changes_requested, ones with newer feedback; nothing when nothing was pushed)" }
   # Moved head — the PR branch moved while a fixer worked (see below).
   moved_head_message: { type: string, default: "Apply the autopilot's fix onto the PR branch's new head", desc: "the commit message of a fixer's change landed by github.apply_diff when the PR branch moved under it" }
   moved_head_guidance:
@@ -465,7 +465,7 @@ triggers:
         # (delivered with step.done, or as its final reply where step.done
         # is unavailable). Every field is optional, so a run with nothing
         # to report still validates.
-        output_schema:
+        output_schema: &review_report
           type: object
           properties:
             addressed_comments: { type: array, items: { type: integer }, description: "ids of review comments your pushed change fully addresses" }
@@ -539,9 +539,12 @@ triggers:
         id: fix
         <<: *fixer
         continue_on_error: 'contains(fix.push.reason, "diverged") && !contains(fix.diff, "(diff clipped)") && !contains(fix.diff, "«redacted»")'
-        guidance: &comment_task "Someone commented on this PR. If it asks for a change, make it and push; if it's a question, or the current code already does what it asks, answer it briefly (say where: commit sha and file:line). You have no GitHub access of your own; answer through conductor: `conductor call github.reply --pr <pr> --in_reply_to <comment id> --body <text>` for a review-thread comment, `conductor call github.comment --pr <pr> --body <text>` for a conversation comment. Never leave a comment with neither a change nor an answer. (Arm this trigger with a not_comment_author filter so bot chatter never reaches here.)"
+        guidance: &comment_task "Someone commented on this PR. If it asks for a change, make it and push; if it's a question, or the current code already does what it asks, answer it briefly (say where: commit sha and file:line). You have no GitHub access of your own; answer through conductor: `conductor call github.reply --pr <pr> --in_reply_to <comment id> --body <text>` for a review-thread comment, `conductor call github.comment --pr <pr> --body <text>` for a conversation comment. Never leave a comment with neither a change nor an answer. When you finish, report addressed_comments: the id of every review comment (comment_id, or review_comments[].id for a review) whose point your pushed change fully addresses, and replied_comments: the ids you replied to instead. Leave anything you only replied to out of addressed_comments: those threads stay open. (Arm this trigger with a not_comment_author filter so bot chatter never reaches here.)"
+        # A fixer that also reports a result (see on_changes_requested).
+        expect_push: true
         skill:
           verbs: { github.reply: {}, github.comment: {} }
+        output_schema: *review_report
       - *first_fix
       - *kept
       - *pr_now
@@ -552,3 +555,16 @@ triggers:
         continue_on_error: false
         guidance: [*comment_task, "${settings.moved_head_guidance}"]
       - *unpushed
+      - id: resolve
+        # As on_changes_requested: resolve exactly the review threads the
+        # agent reported its pushed change addressed (a conversation comment
+        # has no thread: naming one is a no-op). new_comment carries no
+        # feedback_cursor, so no seen_through: the ids are the event's own
+        # comments. Off with settings.resolve_threads: false.
+        if: "${settings.resolve_threads} && (fix.push.pushed || landed.pushed)"
+        uses: github.resolve_threads
+        options: { repo: "{{.repo}}", pr: "{{.pr}}", comments: "{{.fix.addressed_comments}}" }
+      - id: resolve_refix
+        if: "${settings.resolve_threads} && refix.push.pushed"
+        uses: github.resolve_threads
+        options: { repo: "{{.repo}}", pr: "{{.pr}}", comments: "{{.refix.addressed_comments}}" }

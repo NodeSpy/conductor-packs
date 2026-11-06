@@ -7,6 +7,15 @@
 set -euo pipefail
 prompt="$(cat)"
 printf '%s' "$prompt" > .e2e-prompt-$$
+# Its report: the inline review comment it was asked about (the event's
+# comment_id, when comment_kind is review), as addressed by its change.
+addressed=""
+if grep -q '"comment_kind": *"review"' .e2e-prompt-$$; then
+  addressed="$(grep -o '"comment_id": *[0-9]*' .e2e-prompt-$$ | head -1 | grep -o '[0-9]*$')"
+fi
+report() { # report <session> <summary>: the cli result, the structured report as JSON text
+  python3 -c 'import json,sys; ids=[int(sys.argv[3])] if sys.argv[3] else []; print(json.dumps({"session_id":sys.argv[1],"result":json.dumps({"addressed_comments":ids,"summary":sys.argv[2]})}))' "$1" "$2" "$addressed"
+}
 git config user.email fixer@example.invalid
 git config user.name fixer
 if grep -q "second attempt" .e2e-prompt-$$; then
@@ -14,7 +23,7 @@ if grep -q "second attempt" .e2e-prompt-$$; then
   sed -i 's/return 99/return 10/; s/return 1$/return 10/' main.go
   git add main.go && git commit -qm "fix a() on the new head"
   rm -f .e2e-prompt-$$
-  echo '{"session_id":"e2e-refix","result":"done again"}'
+  report e2e-refix "done again"
   exit 0
 fi
 sed -i 's/return 1$/return 10/' main.go
@@ -28,4 +37,4 @@ rm -f .e2e-prompt-$$
 touch .e2e-ready
 for _ in $(seq 1 300); do [ -e .e2e-go ] && break; sleep 0.1; done
 rm -f .e2e-ready .e2e-go
-echo '{"session_id":"e2e-fix","result":"done"}'
+report e2e-fix done

@@ -8,7 +8,7 @@ to the repos you arm:
 | `on_failing_checks` | CI concluded failing | finds why and pushes a fix, from what failed as conductor read it (re-runs once first: most red CI is a flake) |
 | `on_merge_conflict` | the PR conflicts with its base | resolves the conflict and pushes |
 | `on_changes_requested` | a review requested changes (or sweep: feedback still waiting on you) | addresses ALL review feedback still waiting on you, pushes, resolves the threads its change addressed, re-requests every reviewer with changes outstanding |
-| `on_new_comment` | a comment, or a review no changes-requested trigger takes | makes the change or answers the question |
+| `on_new_comment` | a comment, or a review no changes-requested trigger takes | makes the change or answers the question; resolves the threads its pushed change addressed |
 
 Install and arm it in your config's `packs:` block. The example is in the
 header of [`conductor-pack.yaml`](conductor-pack.yaml).
@@ -81,7 +81,7 @@ packs:
 | `status_failed` | `gave up: {{.run.reason}}` |
 | `status_stopped` | `stopped — {{.run.reason}}` |
 | `stop_unreact` | `true`: on a stop, remove the 👀 |
-| `resolve_threads` | `true`: after a changes-requested run whose change conductor pushed, resolve the threads its agent reports addressed (see below) |
+| `resolve_threads` | `true`: after a changes-requested or new-comment run whose change conductor pushed, resolve the threads its agent reports addressed (see below) |
 
 Contexts and descriptions are templates rendered per run. `{{.run.reason}}`
 is a short public-safe phrase ("the agent couldn't be started", "timed out",
@@ -152,6 +152,15 @@ leaves a thread open when:
 
 `resolve_threads: false` turns the step off; threads are then left for you or
 the reviewer to resolve.
+
+A `new_comment` run (a comment, or a review with inline threads that no
+changes-requested trigger takes) resolves the same way: the agent reports
+`addressed_comments`, and the `resolve` step resolves those threads only when
+conductor pushed the change, including when the branch had moved and the change
+landed on its new head, or a second attempt was pushed. A conversation comment
+has no thread, so nothing is resolved for it. A `new_comment` event carries no
+`feedback_cursor`, so the newer-feedback check above does not apply: the ids
+the agent can report are the event's own comments.
 
 The `rerequest` step pings back the event's reviewer and every other reviewer
 whose latest review still requests changes on an older commit, so a run fired
@@ -249,6 +258,13 @@ the run. Conductor never reads a status it posted back as CI, so a `failure`
 row can't trigger the next fix.
 
 ## Upgrading
+
+v2.1.0: `on_new_comment` resolves the review threads its pushed change
+addressed, as `on_changes_requested` does ([Changes
+requested](#changes-requested-what-a-run-covers-resolves-and-re-requests));
+`resolve_threads: false` turns it off for both. Its fixer now reports a result
+(`addressed_comments`, `replied_comments`, `summary`) and declares
+`expect_push`. Same requirements as v2.0.0.
 
 v2.0.0 handles a PR branch that moved while a fixer worked ([Moved
 head](#moved-head-the-pr-branch-moved-while-a-fixer-worked)). It needs
