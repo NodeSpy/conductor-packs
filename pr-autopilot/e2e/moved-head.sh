@@ -295,6 +295,18 @@ serial() {
   port="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1])')"
   HOOK_URL="http://127.0.0.1:$port/webhook" start_fake "$w/ghfake.log"
   start_forge
+  # GitHub learns of a push to the branch as it lands, as it would: the
+  # forge's hook moves the fake's copy of the branch (and the PR's head) to
+  # the pushed commit before the push returns.
+  cat > "$WORK/forge/acme/w.git/hooks/post-receive" <<HOOK
+#!/usr/bin/env bash
+while read -r old new ref; do
+  [ "\$ref" = refs/heads/feat ] || continue
+  curl -fsS -X POST "$FAKE/_fake/act" -H 'content-type: application/json' \\
+    -d "{\"op\":\"push_sha\",\"repo\":\"acme/w\",\"branch\":\"feat\",\"by\":\"me\",\"sha\":\"\$new\"}" >/dev/null
+done
+HOOK
+  chmod +x "$WORK/forge/acme/w.git/hooks/post-receive"
   cat > "$w/config.yaml" <<YAML
 connectors:
   gh:
@@ -340,14 +352,18 @@ YAML
   kill "$mover" 2>/dev/null; wait "$mover" 2>/dev/null || true
   kill "$DAEMON_PID" 2>/dev/null; wait "$DAEMON_PID" 2>/dev/null || true
   DAEMON_PID="" # reaped: its pid may be reused, so cleanup must not kill it
-  # The first fixer's push went to the branch (git). The second started on the
-  # event's head, so its push found the branch moved and the pack landed its
-  # change through the API (apply_diff) instead — the fake's copy of the
-  # branch, which git pushes don't reach.
+  # The second fixer worked on the head the first pushed (read when its step
+  # dispatched, not its event's), so its push is a plain fast-forward: both
+  # fixes are on the branch, and nothing went through the moved-head steps.
   local main; main="$(git -C "$WORK/forge/acme/w.git" show feat:main.go 2>/dev/null)"
-  case "$main" in *"return 10"*) ok "the first fix was pushed" ;; *) bad "main.go on the branch: $main" ;; esac
-  main="$(q 'what=files&repo=acme/w&branch=feat' | json 'd["files"]["main.go"]')"
-  case "$main" in *"return 20"*) ok "the second fix landed" ;; *) bad "main.go on GitHub: $main" ;; esac
+  case "$main" in *"return 10"*"return 20"*) ok "both fixes are on the branch" ;; *) bad "main.go on the branch: $main" ;; esac
+  grep -q "changes_requested\].*the target moved since its event" "$w/daemon.log" &&
+    ok "the second fixer started on the current head" || bad "the second fixer did not read the current head"
+  if grep -q "changes_requested\].*diverged\|changes_requested\].*step landed" "$w/daemon.log"; then
+    bad "the second fixer's push was not a fast-forward"; grep 'changes_requested\]' "$w/daemon.log" | cut -c1-250 | sed 's/^/    /'
+  else
+    ok "the second fixer's push was a fast-forward"
+  fi
   # The review's run started only after the comment's run ended.
   local a_end b_start
   a_end="$(grep -n 'new_comment\].* step ' "$w/daemon.log" | tail -1 | cut -d: -f1)"

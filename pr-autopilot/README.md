@@ -230,9 +230,9 @@ The four fixer triggers (`on_failing_checks`, `on_merge_conflict`,
 second event arrives on a PR a fixer is working (a review lands while a comment
 is being handled, say), its run waits, and the daemon logs
 `waiting on <repo>#<pr> (held by autopilot/on_new_comment)`. It runs once the
-first ends. Its change then lands on what the first pushed: through
-`apply_diff` when its branch moved ([Moved
-head](#moved-head-the-pr-branch-moved-while-a-fixer-worked)).
+first ends, on the PR's head as it is then. Conductor reads the PR's current head
+when the fixer's step dispatches, so the fixer starts from what the first one
+pushed and its own push is a plain fast-forward.
 
 To change the key for a trigger, set it in that trigger's arm, e.g.
 `on_new_comment: { …, serialize: { key: "…" } }`. To let that trigger's runs
@@ -240,7 +240,7 @@ overlap again, use `serialize: { key: "" }`.
 
 [`e2e/moved-head.sh`](e2e/moved-head.sh) runs it through the daemon: a
 comment's fixer is working when a changes-requested review arrives, and the
-review's fixer waits, then runs.
+review's fixer waits, then runs on the pushed head and fast-forwards it.
 
 ### Merged PRs: the head branch is deleted
 
