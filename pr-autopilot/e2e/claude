@@ -26,13 +26,17 @@ if grep -q "second attempt" .e2e-prompt-$$; then
   report e2e-refix "done again"
   exit 0
 fi
-sed -i 's/return 1$/return 10/' main.go
+if grep -q "make b() return 20" .e2e-prompt-$$; then
+  sed -i 's/return 2$/return 20/' main.go # another fixer's change, elsewhere
+else
+  sed -i 's/return 1$/return 10/' main.go
+fi
 if grep -q "and add the big table" .e2e-prompt-$$ 2>/dev/null; then
   # A change past the diff output's 64 KiB cap.
   for i in $(seq 1 3000); do echo "row $i: the quick brown fox jumps over the lazy dog"; done > table.txt
   git add table.txt
 fi
-git add main.go && git commit -qm "fix a()"
+git add main.go && git commit -qm "fix main.go"
 rm -f .e2e-prompt-$$
 touch .e2e-ready
 for _ in $(seq 1 300); do [ -e .e2e-go ] && break; sleep 0.1; done

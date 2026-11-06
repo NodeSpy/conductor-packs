@@ -28,7 +28,8 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 PACK="$(cd "$HERE/.." && pwd)"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/autopilot-e2e.XXXXXX")"
 FAKE_PID=""
-cleanup() { [ -n "$FAKE_PID" ] && kill "$FAKE_PID" 2>/dev/null; [ -n "${KEEP:-}" ] && echo "kept $WORK" || rm -rf "$WORK"; }
+DAEMON_PID=""
+cleanup() { [ -n "$DAEMON_PID" ] && kill "$DAEMON_PID" 2>/dev/null; [ -n "$FAKE_PID" ] && kill "$FAKE_PID" 2>/dev/null; [ -n "${KEEP:-}" ] && echo "kept $WORK" || rm -rf "$WORK"; }
 trap cleanup EXIT
 . "$HERE/pins.env"
 
@@ -83,10 +84,23 @@ start_fake() {
   "$WORK/bin/ghfake" -url-file "$WORK/fake.url" >"$1" 2>&1 & FAKE_PID=$!
   for _ in $(seq 1 100); do [ -s "$WORK/fake.url" ] && break; sleep 0.05; done
   FAKE="$(cat "$WORK/fake.url")"
-  fake seed '{"users":[{"login":"acme","type":"Organization"},{"login":"me"},{"login":"rev"}],"tokens":{"tok-me":"me","tok-rev":"rev"},"repos":[{"name":"acme/w","collaborators":["rev"]}],"hooks":[{"url":"http://127.0.0.1:9/nowhere","secret":"e2e"}],"prs":[{"repo":"acme/w","author":"'"${2:-me}"'","head":"feat","base":"main","title":"feature"}]}' >/dev/null
+  fake seed '{"users":[{"login":"acme","type":"Organization"},{"login":"me"},{"login":"rev"}],"tokens":{"tok-me":"me","tok-rev":"rev"},"repos":[{"name":"acme/w","collaborators":["rev"]}],"hooks":[{"url":"'"${HOOK_URL:-http://127.0.0.1:9/nowhere}"'","secret":"e2e"}],"prs":[{"repo":"acme/w","author":"'"${2:-me}"'","head":"feat","base":"main","title":"feature"}]}' >/dev/null
   python3 - "$BASE_GO" <<'PY' | fake act @- >/dev/null
 import json,sys; print(json.dumps({"op":"commit_files","repo":"acme/w","branch":"feat","by":"me","message":"base","files":{"main.go":sys.argv[1],"FEATURE.md":"the feature\n"}}))
 PY
+}
+
+# start_forge: PR #1's branch in git, as start_fake seeds it on GitHub.
+start_forge() {
+  rm -rf "$WORK/forge" "$WORK/seed" "$XDG_STATE_HOME/conductor/state.json" "$XDG_STATE_HOME/conductor/worktrees" "$XDG_STATE_HOME/conductor/checkouts"
+  mkdir -p "$WORK/forge/acme"
+  git init -q --bare "$WORK/forge/acme/w.git"
+  git init -q "$WORK/seed" && printf '%s' "$BASE_GO" > "$WORK/seed/main.go"
+  git -C "$WORK/seed" add main.go && git -C "$WORK/seed" commit -qm base
+  git -C "$WORK/seed" push -q "$WORK/forge/acme/w.git" main
+  printf 'the feature\n' > "$WORK/seed/FEATURE.md"
+  git -C "$WORK/seed" add FEATURE.md && git -C "$WORK/seed" commit -qm feature
+  git -C "$WORK/seed" push -q "$WORK/forge/acme/w.git" main:feat main:refs/pull/1/head
 }
 
 # scenario <name> <theirs main.go> [<comment>] [review]: a fresh world; their
@@ -97,16 +111,7 @@ scenario() {
   mkdir -p "$w"
   start_fake "$w/ghfake.log"
 
-  # The same branch in git.
-  rm -rf "$WORK/forge" "$WORK/seed" "$XDG_STATE_HOME/conductor/state.json" "$XDG_STATE_HOME/conductor/worktrees" "$XDG_STATE_HOME/conductor/checkouts"
-  mkdir -p "$WORK/forge/acme"
-  git init -q --bare "$WORK/forge/acme/w.git"
-  git init -q "$WORK/seed" && printf '%s' "$BASE_GO" > "$WORK/seed/main.go"
-  git -C "$WORK/seed" add main.go && git -C "$WORK/seed" commit -qm base
-  git -C "$WORK/seed" push -q "$WORK/forge/acme/w.git" main
-  printf 'the feature\n' > "$WORK/seed/FEATURE.md"
-  git -C "$WORK/seed" add FEATURE.md && git -C "$WORK/seed" commit -qm feature
-  git -C "$WORK/seed" push -q "$WORK/forge/acme/w.git" main:feat main:refs/pull/1/head
+  start_forge
 
   cat > "$w/config.yaml" <<YAML
 connectors:
@@ -176,7 +181,7 @@ outcome() { sed -n 's/^outcome: //p' "$WORK/$1/once.log" | head -1; }
 show() { echo "    --- $1/once.log"; grep -v '^plugin ' "$WORK/$1/once.log" | cut -c1-300 | tail -30 | sed 's/^/    /'; }
 
 THEIRS_CLEAN="${BASE_GO/return 2/return 20}"
-[ -n "${ONLY_THREAD:-}${ONLY_MERGED:-}" ] || {
+[ -n "${ONLY_THREAD:-}${ONLY_MERGED:-}${ONLY_SERIAL:-}" ] || {
 echo "== clean: their change elsewhere in the file; the fix lands on the new head =="
 scenario clean "$THEIRS_CLEAN"
 got="$(q 'what=files&repo=acme/w&branch=feat')"
@@ -213,7 +218,7 @@ thread_resolved() {
     json 'd["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"][0]["isResolved"]'
 }
 
-[ -n "${ONLY_MERGED:-}" ] || {
+[ -n "${ONLY_MERGED:-}${ONLY_SERIAL:-}" ] || {
 echo "== review thread: the fix is pushed, the thread it addressed is resolved =="
 scenario thread "" "please make a() return 10" review
 [ "$(git -C "$WORK/forge/acme/w.git" show feat:main.go | grep -c 'return 10')" = 1 ] && ok "conductor pushed the fix" || bad "the fix was not pushed"
@@ -262,6 +267,7 @@ YAML
 # branch_status: GitHub's answer for the PR's branch (200, or 404 once deleted).
 branch_status() { curl -s -o /dev/null -w '%{http_code}' -H 'Authorization: token tok-me' "$FAKE/repos/acme/w/branches/feat"; }
 
+[ -n "${ONLY_SERIAL:-}" ] || {
 echo "== merged: your merged PR's branch is deleted =="
 merged merged me
 ran merged delete && ok "delete ran" || bad "delete did not run"
@@ -277,6 +283,83 @@ echo "== merged, someone else's PR: nothing is deleted =="
 merged merged-theirs rev
 [ "$(branch_status)" = 200 ] && ok "the branch is kept" || { bad "the branch was deleted"; show merged-theirs; }
 grep -q "delete" "$WORK/merged-theirs/once.log" && ! ran merged-theirs delete && ok "delete was skipped" || { bad "delete ran on someone else's PR"; show merged-theirs; }
+
+}
+
+# serial: two fixers on one PR, through the daemon. A comment starts
+# on_new_comment; while its agent works, a changes-requested review arrives,
+# and on_changes_requested waits on the PR's key until the first run ends.
+serial() {
+  local w="$WORK/serial" port
+  mkdir -p "$w"
+  port="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1])')"
+  HOOK_URL="http://127.0.0.1:$port/webhook" start_fake "$w/ghfake.log"
+  start_forge
+  cat > "$w/config.yaml" <<YAML
+connectors:
+  gh:
+    use: $WORK/bin/conductor-github
+    api_base: $FAKE
+    identity: { read_token: tok-me, write_token: tok-me }
+    me: { logins: [me] }
+    webhook: { listen: "127.0.0.1:$port", secret: e2e }
+    sweep: { enabled: false }
+sandbox:
+  push: { sign: false }
+runtimes:
+  claude-cli: { use: cli, tool: claude-code, bin: $WORK/bin/claude, default: true }
+packs:
+  autopilot:
+    source: $PACK
+    triggers:
+      on_new_comment:       { enabled: true, repos: [acme/w] }
+      on_changes_requested: { enabled: true, repos: [acme/w] }
+YAML
+  "$WORK/bin/conductor" init --config "$w/config.yaml" >"$w/init.log" 2>&1 || { echo "init failed:"; cat "$w/init.log"; return 1; }
+  PATH="$WORK/bin:$PATH" "$WORK/bin/conductor" run --config "$w/config.yaml" >"$w/daemon.log" 2>&1 & DAEMON_PID=$!
+  for _ in $(seq 1 300); do (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null && break; sleep 0.1; done
+
+  fake act '{"op":"comment","repo":"acme/w","number":1,"by":"rev","body":"please make a() return 10"}' >/dev/null
+  local ready=""
+  for _ in $(seq 1 600); do
+    ready="$(find "$WORK/xdg" -name .e2e-ready 2>/dev/null | head -1)"; [ -n "$ready" ] && break; sleep 0.1
+  done
+  [ -n "$ready" ] && ok "the comment's fixer is working" || bad "no fixer started for the comment"
+  fake act '{"op":"review","repo":"acme/w","number":1,"by":"rev","state":"CHANGES_REQUESTED","body":"please make b() return 20","comments":[]}' >/dev/null
+  for _ in $(seq 1 300); do grep -q "waiting on acme/w#1 (held by autopilot/on_new_comment)" "$w/daemon.log" && break; sleep 0.1; done
+  grep -q "waiting on acme/w#1 (held by autopilot/on_new_comment)" "$w/daemon.log" &&
+    ok "the review's fixer waits on the PR" || bad "the review's fixer did not wait"
+  # Let every fixer finish, the first and then the second.
+  ( for _ in $(seq 1 1200); do
+      for r in $(find "$WORK/xdg" -name .e2e-ready 2>/dev/null); do touch "$(dirname "$r")/.e2e-go"; done
+      sleep 0.1
+    done ) & local mover=$!
+  for _ in $(seq 1 1200); do
+    grep -q 'notify \[complete\] acme/w#1 changes_requested' "$w/daemon.log" && break; sleep 0.1
+  done
+  kill "$mover" 2>/dev/null; wait "$mover" 2>/dev/null || true
+  kill "$DAEMON_PID" 2>/dev/null; wait "$DAEMON_PID" 2>/dev/null || true
+  DAEMON_PID="" # reaped: its pid may be reused, so cleanup must not kill it
+  # The first fixer's push went to the branch (git). The second started on the
+  # event's head, so its push found the branch moved and the pack landed its
+  # change through the API (apply_diff) instead — the fake's copy of the
+  # branch, which git pushes don't reach.
+  local main; main="$(git -C "$WORK/forge/acme/w.git" show feat:main.go 2>/dev/null)"
+  case "$main" in *"return 10"*) ok "the first fix was pushed" ;; *) bad "main.go on the branch: $main" ;; esac
+  main="$(q 'what=files&repo=acme/w&branch=feat' | json 'd["files"]["main.go"]')"
+  case "$main" in *"return 20"*) ok "the second fix landed" ;; *) bad "main.go on GitHub: $main" ;; esac
+  # The review's run started only after the comment's run ended.
+  local a_end b_start
+  a_end="$(grep -n 'new_comment\].* step ' "$w/daemon.log" | tail -1 | cut -d: -f1)"
+  b_start="$(grep -n 'changes_requested\].* step ' "$w/daemon.log" | head -1 | cut -d: -f1)"
+  [ -n "$a_end" ] && [ -n "$b_start" ] && [ "$b_start" -gt "$a_end" ] &&
+    ok "the second fixer ran after the first" || { bad "runs overlapped (first ended at line ${a_end:-?}, second started at ${b_start:-?})"; grep -v '^plugin ' "$w/daemon.log" | cut -c1-250 | tail -40 | sed 's/^/    /'; }
+}
+
+[ -n "${ONLY_THREAD:-}${ONLY_MERGED:-}" ] || {
+echo "== one fixer per PR: a second event's fixer waits for the first =="
+serial
+}
 
 echo "== $pass passed, $fail failed =="
 [ "$fail" = 0 ]

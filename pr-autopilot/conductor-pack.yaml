@@ -66,7 +66,7 @@
 
 pack:
   name: pr-autopilot
-  version: 2.2.0
+  version: 2.3.0
   description: Autopilot for routine PR events — fix red CI, resolve conflicts, address requested changes, answer comments. One agent per event, scoped to your repos.
   tags: [github, ci, automation, agents, maintenance]
   homepage: https://github.com/NodeSpy/conductor-packs
@@ -96,7 +96,11 @@ pack:
     # agent kept for a later step released when the run ends. That is how a
     # fixer whose PR branch moved under it hands its change to the steps that
     # land it (2.0.0). An older conductor refuses the condition at load.
-    conductor: ">=0.82.0"
+    #
+    # 0.86.0: a trigger's serialize: key, shared by every fixer here so one
+    # works a PR at a time (2.3.0). An older conductor refuses the field at
+    # load.
+    conductor: ">=0.86.0"
     # github 2.2.0: github.check_failures (each failing check's output,
     # annotations, and an Actions job's failed-step log), and the
     # failing_checks event's ignore_checks. 2.1.0: changes_requested carries
@@ -268,6 +272,11 @@ x-templates:
 triggers:
   - name: on_failing_checks
     on: github.failing_checks
+    # One autopilot fixer works a PR at a time: every fixer trigger shares
+    # this key, so a run on a PR another fixer is working waits for it, then
+    # runs on what it pushed (README: "One fixer per PR"). Override in the
+    # trigger's arm; `serialize: { key: "" }` turns it off.
+    serialize: &one_fixer { key: "{{.repo}}#{{.pr}}" }
     options:
       # Re-run once before engaging an agent — most red CI is a flake.
       flaky_rerun: { enabled: true, max: 1 }
@@ -393,6 +402,7 @@ triggers:
 
   - name: on_merge_conflict
     on: github.merge_conflict
+    serialize: *one_fixer
     hooks:
       - { at: start, if: "${settings.conflict_status}", uses: github.set_status,
           options: { repo: "{{.repo}}", sha: "{{.run.start_sha}}", state: pending, context: "${settings.conflict_context}", description: "${settings.conflict_working}" } }
@@ -428,6 +438,7 @@ triggers:
 
   - name: on_changes_requested
     on: github.changes_requested
+    serialize: *one_fixer
     hooks:
       - { at: start, if: "${settings.review_status}", uses: github.set_status,
           options: { repo: "{{.repo}}", sha: "{{.run.start_sha}}", state: pending, context: "${settings.review_context}", description: "${settings.review_working}" } }
@@ -519,6 +530,7 @@ triggers:
 
   - name: on_new_comment
     on: github.new_comment
+    serialize: *one_fixer
     hooks:
       - { at: start, if: "${settings.comment_status}", uses: github.set_status,
           options: { repo: "{{.repo}}", sha: "{{.run.start_sha}}", state: pending, context: "${settings.comment_context}", description: "${settings.comment_working}" } }
