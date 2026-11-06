@@ -300,6 +300,8 @@ row can't trigger the next fix.
 
 ## Upgrading
 
+v2.3.1: a fixer replies on every review thread it changes code for ("Fixed in <sha>: ..."), not only the ones it answers without a change, before the thread is resolved.
+
 v2.3.0: one fixer per PR ([One fixer per PR](#one-fixer-per-pr)). It needs
 **conductor ≥ 0.86.0** (a trigger's `serialize:`). An older conductor refuses
 the pack at load, so keep v2.2.x there.
