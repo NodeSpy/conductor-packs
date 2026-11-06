@@ -11,6 +11,9 @@
 # addressed, and once conductor has pushed it (straight, or landed on a moved
 # head) the pack resolves that thread.
 #
+# Last, on_merged: your merged PR's branch is deleted, but not once someone
+# pushed to it after the merge, nor for someone else's PR. No agent.
+#
 # Git: the agent clones and pushes over a local bare repository (a git
 # insteadOf in the harness's own HOME); GitHub's API is the fake, holding the
 # same files. The network is used only for builds and for the released js
@@ -73,21 +76,26 @@ fake() { curl -fsS -X POST "$FAKE/_fake/$1" -H 'content-type: application/json' 
 q() { curl -fsS "$FAKE/_fake/q?$1"; }
 json() { python3 -c 'import json,sys; d=json.load(sys.stdin); print(eval(sys.argv[1], {"d": d}))' "$1"; }
 
+# start_fake <log> [<pr author>]: a fresh fake, seeded with PR #1 (feat → main).
+start_fake() {
+  [ -n "$FAKE_PID" ] && kill "$FAKE_PID" 2>/dev/null && wait "$FAKE_PID" 2>/dev/null || true
+  rm -f "$WORK/fake.url"
+  "$WORK/bin/ghfake" -url-file "$WORK/fake.url" >"$1" 2>&1 & FAKE_PID=$!
+  for _ in $(seq 1 100); do [ -s "$WORK/fake.url" ] && break; sleep 0.05; done
+  FAKE="$(cat "$WORK/fake.url")"
+  fake seed '{"users":[{"login":"acme","type":"Organization"},{"login":"me"},{"login":"rev"}],"tokens":{"tok-me":"me","tok-rev":"rev"},"repos":[{"name":"acme/w","collaborators":["rev"]}],"hooks":[{"url":"http://127.0.0.1:9/nowhere","secret":"e2e"}],"prs":[{"repo":"acme/w","author":"'"${2:-me}"'","head":"feat","base":"main","title":"feature"}]}' >/dev/null
+  python3 - "$BASE_GO" <<'PY' | fake act @- >/dev/null
+import json,sys; print(json.dumps({"op":"commit_files","repo":"acme/w","branch":"feat","by":"me","message":"base","files":{"main.go":sys.argv[1],"FEATURE.md":"the feature\n"}}))
+PY
+}
+
 # scenario <name> <theirs main.go> [<comment>] [review]: a fresh world; their
 # push lands while the fixer works (none when <theirs> is empty). With
 # `review`, the comment is an inline thread of a COMMENT review on main.go.
 scenario() {
   local name="$1" theirs="$2" comment="${3:-please make a() return 10}" kind="${4:-comment}" w="$WORK/$1"
   mkdir -p "$w"
-  [ -n "$FAKE_PID" ] && kill "$FAKE_PID" 2>/dev/null && wait "$FAKE_PID" 2>/dev/null || true
-  rm -f "$WORK/fake.url"
-  "$WORK/bin/ghfake" -url-file "$WORK/fake.url" >"$w/ghfake.log" 2>&1 & FAKE_PID=$!
-  for _ in $(seq 1 100); do [ -s "$WORK/fake.url" ] && break; sleep 0.05; done
-  FAKE="$(cat "$WORK/fake.url")"
-  fake seed '{"users":[{"login":"acme","type":"Organization"},{"login":"me"},{"login":"rev"}],"tokens":{"tok-me":"me","tok-rev":"rev"},"repos":[{"name":"acme/w","collaborators":["rev"]}],"hooks":[{"url":"http://127.0.0.1:9/nowhere","secret":"e2e"}],"prs":[{"repo":"acme/w","author":"me","head":"feat","base":"main","title":"feature"}]}' >/dev/null
-  python3 - "$BASE_GO" <<'PY' | fake act @- >/dev/null
-import json,sys; print(json.dumps({"op":"commit_files","repo":"acme/w","branch":"feat","by":"me","message":"base","files":{"main.go":sys.argv[1],"FEATURE.md":"the feature\n"}}))
-PY
+  start_fake "$w/ghfake.log"
 
   # The same branch in git.
   rm -rf "$WORK/forge" "$WORK/seed" "$XDG_STATE_HOME/conductor/state.json" "$XDG_STATE_HOME/conductor/worktrees" "$XDG_STATE_HOME/conductor/checkouts"
@@ -168,7 +176,7 @@ outcome() { sed -n 's/^outcome: //p' "$WORK/$1/once.log" | head -1; }
 show() { echo "    --- $1/once.log"; grep -v '^plugin ' "$WORK/$1/once.log" | cut -c1-300 | tail -30 | sed 's/^/    /'; }
 
 THEIRS_CLEAN="${BASE_GO/return 2/return 20}"
-[ -n "${ONLY_THREAD:-}" ] || {
+[ -n "${ONLY_THREAD:-}${ONLY_MERGED:-}" ] || {
 echo "== clean: their change elsewhere in the file; the fix lands on the new head =="
 scenario clean "$THEIRS_CLEAN"
 got="$(q 'what=files&repo=acme/w&branch=feat')"
@@ -205,6 +213,7 @@ thread_resolved() {
     json 'd["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"][0]["isResolved"]'
 }
 
+[ -n "${ONLY_MERGED:-}" ] || {
 echo "== review thread: the fix is pushed, the thread it addressed is resolved =="
 scenario thread "" "please make a() return 10" review
 [ "$(git -C "$WORK/forge/acme/w.git" show feat:main.go | grep -c 'return 10')" = 1 ] && ok "conductor pushed the fix" || bad "the fix was not pushed"
@@ -216,6 +225,58 @@ echo "== review thread, moved head: the change lands on the new head, the thread
 scenario thread-moved "$THEIRS_CLEAN" "please make a() return 10" review
 ran thread-moved landed && ok "landed ran" || bad "landed did not run"
 [ "$(thread_resolved)" = True ] && ok "the thread is resolved" || { bad "the thread is still open"; show thread-moved; }
+
+}
+
+# merged <name> <pr author> [moved]: PR #1 merges (and, with `moved`, someone
+# pushes to its branch afterwards); on_merged runs on the close event.
+merged() {
+  local w="$WORK/$1"
+  mkdir -p "$w"
+  start_fake "$w/ghfake.log" "$2"
+  # A push (start_fake's commit_files doesn't move the PR's head), then the merge.
+  fake act '{"op":"push","repo":"acme/w","branch":"feat","by":"me","message":"work","paths":["main.go"]}' >/dev/null
+  fake act '{"op":"merge","repo":"acme/w","number":1,"by":"me"}' >/dev/null
+  [ "${3:-}" = moved ] && fake act '{"op":"commit_files","repo":"acme/w","branch":"feat","by":"rev","message":"after","files":{"LATE.md":"late\n"}}' >/dev/null
+  fake act '{"op":"flush"}' >/dev/null
+  curl -fsS "$FAKE/_fake/deliveries" | python3 -c '
+import json,sys
+d=[x for x in json.load(sys.stdin) if x["event"]=="pull_request" and x["payload"].get("action")=="closed"][-1]
+print(json.dumps({"event": d["event"], "body": d["payload"]}))' > "$w/event.json"
+  cat > "$w/config.yaml" <<YAML
+connectors:
+  gh:
+    use: $WORK/bin/conductor-github
+    api_base: $FAKE
+    identity: { read_token: tok-me, write_token: tok-me }
+    me: { logins: [me] }
+packs:
+  autopilot:
+    source: $PACK
+    triggers:
+      on_merged: { enabled: true, repos: [acme/w] }
+YAML
+  "$WORK/bin/conductor" init --config "$w/config.yaml" >"$w/init.log" 2>&1 || { echo "init failed:"; cat "$w/init.log"; return 1; }
+  "$WORK/bin/conductor" once autopilot/on_merged --config "$w/config.yaml" --state-dir "$XDG_STATE_HOME/conductor" --fail-on none --fixture "$w/event.json" >"$w/once.log" 2>&1 || true
+}
+# branch_status: GitHub's answer for the PR's branch (200, or 404 once deleted).
+branch_status() { curl -s -o /dev/null -w '%{http_code}' -H 'Authorization: token tok-me' "$FAKE/repos/acme/w/branches/feat"; }
+
+echo "== merged: your merged PR's branch is deleted =="
+merged merged me
+ran merged delete && ok "delete ran" || bad "delete did not run"
+[ "$(branch_status)" = 404 ] && ok "the branch is gone" || { bad "the branch is still there"; show merged; }
+[ "$(outcome merged)" = ok ] && ok "the run's outcome is ok" || { bad "outcome: $(outcome merged)"; show merged; }
+
+echo "== merged, then pushed to: the branch moved since the merge and is kept =="
+merged merged-moved me moved
+ran merged-moved delete && ok "delete ran" || bad "delete did not run"
+[ "$(branch_status)" = 200 ] && ok "the branch is kept" || { bad "the branch was deleted"; show merged-moved; }
+
+echo "== merged, someone else's PR: nothing is deleted =="
+merged merged-theirs rev
+[ "$(branch_status)" = 200 ] && ok "the branch is kept" || { bad "the branch was deleted"; show merged-theirs; }
+grep -q "delete" "$WORK/merged-theirs/once.log" && ! ran merged-theirs delete && ok "delete was skipped" || { bad "delete ran on someone else's PR"; show merged-theirs; }
 
 echo "== $pass passed, $fail failed =="
 [ "$fail" = 0 ]

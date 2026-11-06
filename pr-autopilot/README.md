@@ -9,6 +9,7 @@ to the repos you arm:
 | `on_merge_conflict` | the PR conflicts with its base | resolves the conflict and pushes |
 | `on_changes_requested` | a review requested changes (or sweep: feedback still waiting on you) | addresses ALL review feedback still waiting on you, pushes, resolves the threads its change addressed, re-requests every reviewer with changes outstanding |
 | `on_new_comment` | a comment, or a review no changes-requested trigger takes | makes the change or answers the question; resolves the threads its pushed change addressed |
+| `on_merged` | your PR merged | no agent: deletes its head branch ([Merged PRs](#merged-prs-the-head-branch-is-deleted)) |
 
 Install and arm it in your config's `packs:` block. The example is in the
 header of [`conductor-pack.yaml`](conductor-pack.yaml).
@@ -82,6 +83,7 @@ packs:
 | `status_stopped` | `stopped — {{.run.reason}}` |
 | `stop_unreact` | `true`: on a stop, remove the 👀 |
 | `resolve_threads` | `true`: after a changes-requested or new-comment run whose change conductor pushed, resolve the threads its agent reports addressed (see below) |
+| `delete_merged_branch` | `true`: `on_merged` deletes your merged PR's head branch (see [Merged PRs](#merged-prs-the-head-branch-is-deleted)) |
 
 Contexts and descriptions are templates rendered per run. `{{.run.reason}}`
 is a short public-safe phrase ("the agent couldn't be started", "timed out",
@@ -220,6 +222,25 @@ GitHub fake. A sandboxed stand-in fixer commits while the branch moves under
 it, and the script checks a clean landing, a conflict's second attempt, and a
 clipped diff that is never applied.
 
+### Merged PRs: the head branch is deleted
+
+Armed, `on_merged` takes every PR close in its repos, and acts only when:
+
+- the PR merged;
+- it's yours (its author is the connector's identity, `me`);
+- its branch is in the repo, not a fork's;
+- and its branch isn't the default branch.
+
+It then calls `github.delete_branch` with the merged head as `expect_sha`. If
+someone pushed to the branch after the merge, the branch is left alone. A
+protected branch is refused, and a branch that's already gone counts as done.
+The setting `delete_merged_branch` is `true` by default; `false` keeps the
+trigger armed but deletes nothing.
+
+[`e2e/moved-head.sh`](e2e/moved-head.sh) checks this against the GitHub fake:
+your merged PR's branch is deleted, a branch pushed to after the merge is
+kept, and so is the branch of someone else's PR.
+
 ### The same hooks on your own triggers
 
 They're ordinary hooks, so copy them onto any trigger (use your github
@@ -258,6 +279,12 @@ the run. Conductor never reads a status it posted back as CI, so a `failure`
 row can't trigger the next fix.
 
 ## Upgrading
+
+v2.2.0 adds `on_merged` ([Merged
+PRs](#merged-prs-the-head-branch-is-deleted)), which ships disarmed like the
+other triggers. It needs the **github connector plugin ≥ 2.9.0**
+(`github.delete_branch` and the close event's head facts). The conductor
+requirement is unchanged.
 
 v2.1.0: `on_new_comment` resolves the review threads its pushed change
 addressed, as `on_changes_requested` does ([Changes
