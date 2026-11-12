@@ -329,7 +329,9 @@ packs:
 YAML
   "$WORK/bin/conductor" init --config "$w/config.yaml" >"$w/init.log" 2>&1 || { echo "init failed:"; cat "$w/init.log"; return 1; }
   PATH="$WORK/bin:$PATH" "$WORK/bin/conductor" run --config "$w/config.yaml" >"$w/daemon.log" 2>&1 & DAEMON_PID=$!
-  for _ in $(seq 1 300); do (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null && break; sleep 0.1; done
+  # The plugin's listener is up (its port answers before the jailed plugin
+  # behind it does).
+  for _ in $(seq 1 600); do grep -qs "webhook listener on" "$w/daemon.log" && break; sleep 0.1; done
 
   fake act '{"op":"comment","repo":"acme/w","number":1,"by":"rev","body":"please make a() return 10"}' >/dev/null
   local ready=""
