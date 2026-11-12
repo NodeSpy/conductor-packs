@@ -181,7 +181,7 @@ outcome() { sed -n 's/^outcome: //p' "$WORK/$1/once.log" | head -1; }
 show() { echo "    --- $1/once.log"; grep -v '^plugin ' "$WORK/$1/once.log" | cut -c1-300 | tail -30 | sed 's/^/    /'; }
 
 THEIRS_CLEAN="${BASE_GO/return 2/return 20}"
-[ -n "${ONLY_THREAD:-}${ONLY_MERGED:-}${ONLY_SERIAL:-}" ] || {
+[ -n "${ONLY_THREAD:-}${ONLY_MERGED:-}${ONLY_SERIAL:-}${ONLY_PROGRESS:-}" ] || {
 echo "== clean: their change elsewhere in the file; the fix lands on the new head =="
 scenario clean "$THEIRS_CLEAN"
 got="$(q 'what=files&repo=acme/w&branch=feat')"
@@ -218,7 +218,7 @@ thread_resolved() {
     json 'd["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"][0]["isResolved"]'
 }
 
-[ -n "${ONLY_MERGED:-}${ONLY_SERIAL:-}" ] || {
+[ -n "${ONLY_MERGED:-}${ONLY_SERIAL:-}${ONLY_PROGRESS:-}" ] || {
 echo "== review thread: the fix is pushed, the thread it addressed is resolved =="
 scenario thread "" "please make a() return 10" review
 [ "$(git -C "$WORK/forge/acme/w.git" show feat:main.go | grep -c 'return 10')" = 1 ] && ok "conductor pushed the fix" || bad "the fix was not pushed"
@@ -267,7 +267,7 @@ YAML
 # branch_status: GitHub's answer for the PR's branch (200, or 404 once deleted).
 branch_status() { curl -s -o /dev/null -w '%{http_code}' -H 'Authorization: token tok-me' "$FAKE/repos/acme/w/branches/feat"; }
 
-[ -n "${ONLY_SERIAL:-}" ] || {
+[ -n "${ONLY_SERIAL:-}${ONLY_PROGRESS:-}" ] || {
 echo "== merged: your merged PR's branch is deleted =="
 merged merged me
 ran merged delete && ok "delete ran" || bad "delete did not run"
@@ -372,9 +372,127 @@ YAML
     ok "the second fixer ran after the first" || { bad "runs overlapped (first ended at line ${a_end:-?}, second started at ${b_start:-?})"; grep -v '^plugin ' "$w/daemon.log" | cut -c1-250 | tail -40 | sed 's/^/    /'; }
 }
 
-[ -n "${ONLY_THREAD:-}${ONLY_MERGED:-}" ] || {
+[ -n "${ONLY_THREAD:-}${ONLY_MERGED:-}${ONLY_PROGRESS:-}" ] || {
 echo "== one fixer per PR: a second event's fixer waits for the first =="
 serial
+}
+
+# progress: the PR's status rows while runs wait and work, through the
+# daemon. A comment's fixer says what it is doing (step.progress); a
+# changes-requested review arrives meanwhile and waits on the PR. Every
+# status GitHub got is read back in order: the sequence a person watching the
+# PR saw.
+prhead() { curl -fsS "$FAKE/_fake/q?what=pr&repo=acme/w&number=1" | python3 -c 'import json,sys; print(json.load(sys.stdin)["head_sha"])'; }
+progress_run() {
+  local w="$WORK/progress" port dport
+  mkdir -p "$w"
+  port="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1])')"
+  dport="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1])')"
+  HOOK_URL="http://127.0.0.1:$port/webhook" start_fake "$w/ghfake.log"
+  start_forge
+  cat > "$WORK/forge/acme/w.git/hooks/post-receive" <<HOOK
+#!/usr/bin/env bash
+while read -r old new ref; do
+  [ "\$ref" = refs/heads/feat ] || continue
+  curl -fsS -X POST "$FAKE/_fake/act" -H 'content-type: application/json' \\
+    -d "{\"op\":\"push_sha\",\"repo\":\"acme/w\",\"branch\":\"feat\",\"by\":\"me\",\"sha\":\"\$new\"}" >/dev/null
+done
+HOOK
+  chmod +x "$WORK/forge/acme/w.git/hooks/post-receive"
+  # The dashboard serves localhost only here; public_url is where a person
+  # would reach it, so a run's link is built from it.
+  cat > "$w/config.yaml" <<YAML
+connectors:
+  gh:
+    use: $WORK/bin/conductor-github
+    api_base: $FAKE
+    identity: { read_token: tok-me, write_token: tok-me }
+    me: { logins: [me] }
+    webhook: { listen: "127.0.0.1:$port", secret: e2e }
+    sweep: { enabled: false }
+sandbox:
+  push: { sign: false }
+runtimes:
+  claude-cli: { use: cli, tool: claude-code, bin: $WORK/bin/claude, default: true }
+dashboard:
+  enabled: true
+  port: $dport
+  public_url: https://dash.example.invalid
+packs:
+  autopilot:
+    source: $PACK
+    triggers:
+      on_new_comment:       { enabled: true, repos: [acme/w] }
+      on_changes_requested: { enabled: true, repos: [acme/w] }
+YAML
+  "$WORK/bin/conductor" init --config "$w/config.yaml" >"$w/init.log" 2>&1 || { echo "init failed:"; cat "$w/init.log"; return 1; }
+  PATH="$WORK/bin:$PATH" "$WORK/bin/conductor" run --config "$w/config.yaml" >"$w/daemon.log" 2>&1 & DAEMON_PID=$!
+  # The plugin's listener is up (its port answers before the jailed plugin
+  # behind it does).
+  for _ in $(seq 1 600); do grep -qs "webhook listener on" "$w/daemon.log" && break; sleep 0.1; done
+
+  # The PR's heads over the scenario: statuses go on the head a run saw.
+  local start_sha heads; start_sha="$(prhead)"; heads="$start_sha"
+  fake act '{"op":"comment","repo":"acme/w","number":1,"by":"rev","body":"PROGRESS-E2E: please make a() return 10"}' >/dev/null
+  for _ in $(seq 1 300); do grep -q "notify \[dispatch\] acme/w#1 new_comment" "$w/daemon.log" && break; sleep 0.1; done
+  sleep 3
+  fake act '{"op":"review","repo":"acme/w","number":1,"by":"rev","state":"CHANGES_REQUESTED","body":"please make b() return 20","comments":[]}' >/dev/null
+  # The review's fixer (not a progress one) waits for the harness's go.
+  ( for _ in $(seq 1 3000); do
+      for r in $(find "$WORK/xdg" -name .e2e-ready 2>/dev/null); do touch "$(dirname "$r")/.e2e-go"; done
+      sleep 0.1
+    done ) & local mover=$!
+  for _ in $(seq 1 3000); do
+    grep -q 'notify \[complete\] acme/w#1 new_comment' "$w/daemon.log" && break; sleep 0.1
+  done
+  heads="$heads $(prhead)"
+  for _ in $(seq 1 3000); do
+    grep -q 'notify \[complete\] acme/w#1 changes_requested' "$w/daemon.log" && break; sleep 0.1
+  done
+  heads="$heads $(prhead)"
+  kill "$mover" 2>/dev/null; wait "$mover" 2>/dev/null || true
+  kill "$DAEMON_PID" 2>/dev/null; wait "$DAEMON_PID" 2>/dev/null || true
+  DAEMON_PID=""
+  # Every status, oldest first, on every head the PR had.
+  for sha in $(echo $heads | tr ' ' '\n' | awk '!seen[$0]++'); do
+    curl -fsS -H 'Authorization: token tok-me' "$FAKE/repos/acme/w/commits/$sha/statuses?per_page=100" 2>/dev/null |
+      python3 -c '
+import json,sys
+for s in json.load(sys.stdin):
+    print("%d\t%s\t%s\t%s\t%s\t%s" % (s["id"], sys.argv[1][:7], s["context"], s["state"], s.get("description") or "", s.get("target_url") or ""))
+' "$sha" || true
+  done | sort -n | cut -f2- > "$w/statuses.tsv"
+  echo "    --- the PR's status rows, in the order GitHub got them"
+  cut -f1-4 "$w/statuses.tsv" | sed 's/	/  |  /g; s/^/    /'
+  comment="$(awk -F'	' '$2=="me / comment"' "$w/statuses.tsv")"
+  review="$(awk -F'	' '$2=="me / review"' "$w/statuses.tsv")"
+  echo "$comment" | head -1 | grep -q $'pending	replying to rev.s comment	' && ok "the comment row starts pending" || bad "first comment row: $(echo "$comment" | head -1)"
+  for note in "reading the comment" "editing main.go" "running the tests"; do
+    echo "$comment" | grep -q "pending	replying to rev.s comment: $note · " && ok "the comment row said: $note" || bad "the comment row never said: $note"
+  done
+  echo "$comment" | grep -qE "pending	replying to rev.s comment: [^	]* · [0-9]+m	" && ok "elapsed time shows in minutes" || bad "no elapsed minutes on the comment row"
+  [ "$(echo "$comment" | tail -1 | cut -f3)" = success ] && ok "the comment row ends success" || bad "last comment row: $(echo "$comment" | tail -1)"
+  [ "$(echo "$comment" | awk -F'	' '$3=="pending"' | tail -1 | cut -f1)" = "${start_sha:0:7}" ] && ok "progress went on the commit the run started on" || bad "progress on another commit"
+  echo "$review" | grep -q "pending	addressing rev.s review: queued — waiting for a run of autopilot/on_new_comment to finish · " &&
+    ok "the review row said it was queued, and behind what" || bad "the review row never said queued: $(echo "$review" | head -3)"
+  [ "$(echo "$review" | tail -1 | cut -f3)" = success ] && ok "the review row ends success" || bad "last review row: $(echo "$review" | tail -1)"
+  # A queued run has no page yet: its rows link nothing until it starts.
+  if awk -F'\t' '$4 !~ /queued/ && $5 !~ /^https:\/\/dash\.example\.invalid\/#\/runs\/r/' "$w/statuses.tsv" | grep -q .; then
+    bad "a status without the run's link: $(awk -F'\t' '$4 !~ /queued/ && $5 !~ /dash/' "$w/statuses.tsv" | head -2)"
+  else
+    ok "every status of a started run links the run on the dashboard"
+  fi
+  # Pacing: no two progress rows of one run less than 30s apart is not
+  # observable here (the fake has no clock), but the count is: one row per
+  # change, not one per tick.
+  n="$(echo "$comment" | wc -l)"
+  [ "$n" -le 12 ] && ok "the comment row changed $n times (no spam)" || bad "the comment row changed $n times"
+  grep -q "step.progress failed" "$(find "$WORK/xdg" -name .e2e-progress.log 2>/dev/null | head -1)" 2>/dev/null && bad "a step.progress call failed" || true
+}
+
+[ -n "${ONLY_THREAD:-}${ONLY_MERGED:-}${ONLY_SERIAL:-}" ] || {
+echo "== progress: the PR's status says what each run is doing, and since when =="
+progress_run
 }
 
 echo "== $pass passed, $fail failed =="
