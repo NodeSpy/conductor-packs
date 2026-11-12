@@ -52,7 +52,7 @@
 
 pack:
   name: pr-review-team
-  version: 3.3.0
+  version: 3.3.1
   description: Multi-lens PR review (correctness / security / design …) with refute-verify, deterministic reconcile, an optional human hand-off, and calibration that learns memory, under a scope key you choose, from past reviews.
   tags: [review, github, code-quality, agents, memory]
   homepage: https://github.com/NodeSpy/conductor-packs
@@ -177,7 +177,7 @@ settings:
     desc: "review-backfill: the date (YYYY-MM-DD) this pack started posting under your account. From then on your own comments count as yours only when the audit log shows the pack did not post them; from before the audit log's oldest record they are dropped (empty = the first review this pack posted, from the audit log)"
 
   # The review's commit status: one row on the PR while a review runs, as
-  # you, saying where the review is ("reviewing: 9/18 done · 4m"), then how
+  # you, saying where the review is ("lenses: 9/18 done · 4m"), then how
   # it ended. Every word is a setting.
   status:
     type: boolean
@@ -198,7 +198,7 @@ settings:
   status_progress:
     type: string
     default: "{{.progress.text}} · {{.progress.elapsed}}"
-    desc: "appended to the pending description while the review goes (after \": \"): conductor's progress report — queued and why, the step, lenses done of the total — and how long it has been at it"
+    desc: "appended to the pending description while the review goes (after \" · \"): conductor's progress report — queued and why, the step, lenses done of the total — and how long it has been at it"
   status_link:
     type: boolean
     default: true
@@ -1153,7 +1153,7 @@ workflows:
       # profiles), and it is granted no write verbs. `gh` reads and local
       # `git` work happen inside the jail.
       - id: review
-        progress: "reviewing"
+        progress: "lenses"
         extends: *panelist
         workspace: { from: "{{.snapshot.archive}}" }
         # one session per lens per pass (lenses.runs = the lenses, review_passes
@@ -1961,7 +1961,7 @@ triggers:
       - { at: start, if: "${settings.status}", uses: github.set_status,
           options: { repo: "{{.repo}}", sha: "{{.run.start_sha}}", state: pending, context: "${settings.status_context}", description: "${settings.status_working}", target_url: "{{if ${settings.status_link}}}{{.run.url}}{{end}}" } }
       - { at: progress, if: "${settings.status} && ${settings.progress}", every: 30s, uses: github.set_status,
-          options: { repo: "{{.repo}}", sha: "{{.run.start_sha}}", state: pending, context: "${settings.status_context}", description: "${settings.status_working}: ${settings.status_progress}", target_url: "{{if ${settings.status_link}}}{{.run.url}}{{end}}" } }
+          options: { repo: "{{.repo}}", sha: "{{.run.start_sha}}", state: pending, context: "${settings.status_context}", description: "${settings.status_working} · ${settings.status_progress}", target_url: "{{if ${settings.status_link}}}{{.run.url}}{{end}}" } }
       - { at: done, if: "${settings.status}", uses: github.set_status,
           options: { repo: "{{.repo}}", sha: "{{.run.start_sha}}", state: success, context: "${settings.status_context}", description: "${settings.status_done}", target_url: "{{if ${settings.status_link}}}{{.run.url}}{{end}}" } }
       - { at: fail, if: "${settings.status}", uses: github.set_status,
@@ -1970,6 +1970,7 @@ triggers:
           options: { repo: "{{.repo}}", sha: "{{.run.start_sha}}", state: success, context: "${settings.status_context}", description: "${settings.status_stopped}", target_url: "{{if ${settings.status_link}}}{{.run.url}}{{end}}" } }
     steps:
       - id: run
+        progress: "starting the review"
         workflow: review-flow
         with: { repo: "{{.repo}}", pr: "{{.number}}", title: "{{.title}}" }
 
