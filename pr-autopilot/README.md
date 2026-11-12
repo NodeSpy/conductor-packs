@@ -22,7 +22,9 @@ taken and how it went. None of it is hidden or automatic: the hooks are in
 
 | when | reaction (review/comment flows only) | commit status (one row per flow) |
 |---|---|---|
+| queued: the run waits for a slot or for another run on the PR | — | `pending`, "…: queued — waiting for …" |
 | start, before any worktree or agent exists | 👀 on the review or comment | `pending` on the commit the run starts on |
+| while it works, at most every 30s | — | `pending`, updated with what it is doing and for how long |
 | done, pushed | 🚀 | `success` on that **start** commit |
 | done, nothing pushed | 👍 | `success` on that start commit (= the PR's head) |
 | fail (including a dispatch that never came up, and a park) | 😕 | `failure` on the PR's **current** head, "gave up: …" |
@@ -39,6 +41,32 @@ is when the run gives up, so it's what you see.
 a run is on it, conductor stops the agent, and the `stop` hooks resolve the
 pending row ("stopped — the PR merged" / "… closed") and take the 👀 back off.
 A daemon restart is not a stop: the run resumes and ends normally.
+
+**The pending row moves while the run works.** Each row's description is
+the flow's pending line, then what the run is doing and for how long:
+
+```
+replying to bob's comment: queued — waiting for a run of autopilot/on_changes_requested to finish · <1m
+replying to bob's comment: starting · <1m
+replying to bob's comment: agent started · 1m
+replying to bob's comment: editing adapters/adapter.go · 3m
+replying to bob's comment: running the tests · 6m
+replying to bob's comment: pushing · 9m
+pushed 4f2a9c1
+```
+
+"What it is doing" is, in order of preference: the fixer's own words (it is
+asked to say what it is doing with `conductor call step.progress`), the tool
+the agent last used (on runtimes that show it), and the step it is on. A
+row is updated at most every 30 seconds, and only when its text changed; a
+change of state (queued → working) shows at once. GitHub lists every status
+as an event on the commit, not on the PR's conversation, so the updates
+don't fill the PR's timeline.
+
+Each row's **Details** link opens the run on your dashboard, when the
+dashboard has a `public_url` (conductor ≥ 0.97.0; see the dashboard docs).
+Anyone who can see the PR sees that address; switch the link off with
+`status_link: false`, or the moving text with `progress: false`.
 
 Rows are named after you, one context per flow:
 
@@ -81,6 +109,10 @@ packs:
 | `status_done` | `{{if .run.pushed}}pushed {{.run.head_short}}{{else}}done — no changes pushed{{end}}` |
 | `status_failed` | `gave up: {{.run.reason}}` |
 | `status_stopped` | `stopped — {{.run.reason}}` |
+| `progress` | `true`: update the pending row as the run works |
+| `status_progress` | `{{.progress.text}} · {{.progress.elapsed}}`: what follows the pending line while it works ([fields](https://github.com/NodeSpy/conductor/wiki/Workflows#progress)) |
+| `status_link` | `true`: link each row to the run on the dashboard (`{{.run.url}}`; nothing without a `public_url`) |
+| `progress_guidance` | the fixer's instruction to report what it is doing with `step.progress`; set `""` to drop it |
 | `stop_unreact` | `true`: on a stop, remove the 👀 |
 | `resolve_threads` | `true`: after a changes-requested or new-comment run whose change conductor pushed, resolve the threads its agent reports addressed (see below) |
 | `delete_merged_branch` | `true`: `on_merged` deletes your merged PR's head branch (see [Merged PRs](#merged-prs-the-head-branch-is-deleted)) |
@@ -273,12 +305,17 @@ hooks:
   - { at: start, uses: gh.set_status,
       options: { repo: "{{.repo}}", sha: "{{.run.start_sha}}", state: pending,
                  context: "{{.me.login}} / mine", description: "working" } }
+  # while it runs (and while it waits to start): every 30s at most
+  - { at: progress, every: 30s, uses: gh.set_status,
+      options: { repo: "{{.repo}}", sha: "{{.run.start_sha}}", state: pending,
+                 context: "{{.me.login}} / mine", target_url: "{{.run.url}}",
+                 description: "working: {{.progress.text}} · {{.progress.elapsed}}" } }
   - { at: done, if: reaction_subjects, uses: gh.react,
       options: { repo: "{{.repo}}", pr: "{{.pr}}", subjects: "{{.reaction_subjects}}",
                  content: "{{if .run.pushed}}rocket{{else}}+1{{end}}" } }
   - { at: done, uses: gh.set_status,
       options: { repo: "{{.repo}}", sha: "{{.run.start_sha}}", state: success,
-                 context: "{{.me.login}} / mine", description: "done" } }
+                 context: "{{.me.login}} / mine", description: "done", target_url: "{{.run.url}}" } }
   - { at: fail, if: reaction_subjects, uses: gh.react,
       options: { repo: "{{.repo}}", pr: "{{.pr}}", subjects: "{{.reaction_subjects}}", content: confused } }
   - { at: fail, uses: gh.set_status,
@@ -299,6 +336,11 @@ the run. Conductor never reads a status it posted back as CI, so a `failure`
 row can't trigger the next fix.
 
 ## Upgrading
+
+v2.4.0: the pending row says what the run is doing and for how long, and
+links the run on your dashboard ([Progress on the PR](#progress-on-the-pr)).
+It needs **conductor ≥ 0.97.0** (`at: progress` hooks, `{{.run.url}}`). An
+older conductor refuses the pack at load, so keep v2.3.x there.
 
 v2.3.1: a fixer replies on every review thread it changes code for ("Fixed in <sha>: ..."), not only the ones it answers without a change, before the thread is resolved.
 

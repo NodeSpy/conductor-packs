@@ -48,7 +48,11 @@
 #     or 😕 at fail;
 #   - a commit status, one context per flow ("<you> / review", "<you> /
 #     comment", "<you> / ci-fix", "<you> / conflict"): `pending` at start, on
-#     the commit the run starts on. At done that SAME commit turns `success`.
+#     the commit the run starts on. While the run waits and works, that row
+#     keeps saying what it is doing now and for how long ("replying to bob's
+#     comment: queued — waiting for an agent slot (2 ahead) · 3m", then
+#     "…: running go test ./... · 12m"), and its Details link opens the run
+#     on your conductor dashboard. At done that SAME commit turns `success`.
 #     So when the run pushed, the PR's new head carries no row of this
 #     context, and the row simply disappears from the PR (GitHub has no way to
 #     delete a status; this is how it goes away). When it didn't push, a green
@@ -62,11 +66,12 @@
 #         ci_status:    false                       # no status for failing-checks runs
 #         reactions:    false                       # no reactions at all
 #         status_failed: "autopilot gave up: {{.run.reason}}"
+#         progress:     false                       # the pending line stays as the run started it
 # The same hooks work on any trigger of your own; see the README.
 
 pack:
   name: pr-autopilot
-  version: 2.3.1
+  version: 2.4.0
   description: Autopilot for routine PR events — fix red CI, resolve conflicts, address requested changes, answer comments. One agent per event, scoped to your repos.
   tags: [github, ci, automation, agents, maintenance]
   homepage: https://github.com/NodeSpy/conductor-packs
@@ -100,7 +105,12 @@ pack:
     # 0.86.0: a trigger's serialize: key, shared by every fixer here so one
     # works a PR at a time (2.3.0). An older conductor refuses the field at
     # load.
-    conductor: ">=0.86.0"
+    #
+    # 0.97.0: `at: progress` hooks and {{.progress.*}} (a run's live report:
+    # queued and why, the step, what the agent says it is doing, elapsed),
+    # a step's `progress:` phrase, the step.progress verb every agent gets,
+    # and {{.run.url}} (2.4.0). An older conductor refuses the hooks at load.
+    conductor: ">=0.97.0"
     # github 2.2.0: github.check_failures (each failing check's output,
     # annotations, and an Actions job's failed-step log), and the
     # failing_checks event's ignore_checks. 2.1.0: changes_requested carries
@@ -140,6 +150,10 @@ settings:
   conflict_status:  { type: boolean, default: true, desc: "post a status for merge_conflict runs" }
   conflict_context: { type: string, default: "{{.me.login}} / conflict", desc: "the status context for merge_conflict runs" }
   conflict_working: { type: string, default: "resolving the merge conflict", desc: "pending description, merge_conflict" }
+  progress:         { type: boolean, default: true, desc: "while a run waits and works, keep its pending status saying what it is doing and for how long (status_progress), at most every 30s; off: the pending line stays as the run started it" }
+  status_progress:  { type: string, default: "{{.progress.text}} · {{.progress.elapsed}}", desc: "appended to a flow's pending description while the run goes (after \": \"): conductor's progress report — queued and why, the step, what the agent says it is doing — and how long it has been at it" }
+  status_link:      { type: boolean, default: true, desc: "point each status's Details link at the run's page on your conductor dashboard ({{.run.url}}), when the dashboard has an address a person can reach (its tailnet HTTPS listener, a bind: entry with a certificate, or dashboard.public_url); off: no link" }
+  progress_guidance: { type: string, default: "As you work, say what you are doing now with the step.progress verb (`conductor call step.progress --text \"<a few words>\"`), e.g. \"reading the review comments\", \"editing adapter.go\", \"running go test ./adapters/...\", each time you start a new part of the task. It shows on the PR while you work; keep it to the work itself.", desc: "appended to every fixer's task: asks it to report what it is doing (step.progress); \"\" to leave it out" }
   status_done:      { type: string, default: "{{if .run.pushed}}pushed {{.run.head_short}}{{else}}done — no changes pushed{{end}}", desc: "success description (on the commit the run started on)" }
   status_failed:    { type: string, default: "gave up: {{.run.reason}}", desc: "failure description (on the PR's current head)" }
   status_stopped:   { type: string, default: "stopped — {{.run.reason}}", desc: "success description when the PR merged/closed under the run (on the commit the run started on)" }
@@ -189,6 +203,7 @@ x-templates:
   # what the first attempt did (`refix`). Nothing is ever forced.
   fixer: &fixer
     type: agent
+    progress: "agent started"
     model: heavy
     workspace: worktree
     wait_timeout: 30m
@@ -209,12 +224,14 @@ x-templates:
   # already hold it in the run's history.
   kept: &kept
     id: kept
+    progress: "the PR branch moved: keeping the change"
     if: "{{.first.diff}}"
     uses: blob.put
     options: { text: "{{.first.diff}}", name: "pr-{{.pr}}-unpushed.diff", media_type: "text/x-diff" }
   # The PR's branch, as GitHub has it now.
   pr_now: &pr_now
     id: pr_now
+    progress: "reading the PR branch's new head"
     if: "kept.digest"
     uses: github.pr_get
     options: { repo: "{{.repo}}", pr: "{{.pr}}" }
@@ -225,6 +242,7 @@ x-templates:
   # by default (sandbox.push.deny_ci_changes).
   landed: &landed
     id: landed
+    progress: "applying the change on the new head"
     if: "pr_now.head"
     uses: github.apply_diff
     options:
@@ -282,20 +300,25 @@ triggers:
       flaky_rerun: { enabled: true, max: 1 }
     hooks:
       - { at: start, if: "${settings.ci_status}", uses: github.set_status,
-          options: { repo: "{{.repo}}", sha: "{{.run.start_sha}}", state: pending, context: "${settings.ci_context}", description: "${settings.ci_working}" } }
+          options: { repo: "{{.repo}}", sha: "{{.run.start_sha}}", state: pending, context: "${settings.ci_context}", description: "${settings.ci_working}", target_url: "{{if ${settings.status_link}}}{{.run.url}}{{end}}" } }
+      # While the run waits and works: the same row, saying what it is doing
+      # now and for how long (conductor's progress report): at most every
+      # 30s, only when what it says changed.
+      - { at: progress, if: "${settings.ci_status} && ${settings.progress}", every: 30s, uses: github.set_status,
+          options: { repo: "{{.repo}}", sha: "{{.run.start_sha}}", state: pending, context: "${settings.ci_context}", description: "${settings.ci_working}: ${settings.status_progress}", target_url: "{{if ${settings.status_link}}}{{.run.url}}{{end}}" } }
       # Success goes on the commit the run STARTED on, never the new head: after
       # a push the PR's head has no row of this context, so the row is gone.
       - { at: done, if: "${settings.ci_status}", uses: github.set_status,
-          options: { repo: "{{.repo}}", sha: "{{.run.start_sha}}", state: success, context: "${settings.ci_context}", description: "${settings.status_done}" } }
+          options: { repo: "{{.repo}}", sha: "{{.run.start_sha}}", state: success, context: "${settings.ci_context}", description: "${settings.status_done}", target_url: "{{if ${settings.status_link}}}{{.run.url}}{{end}}" } }
       - { at: fail, if: "${settings.ci_status}", uses: github.set_status,
-          options: { repo: "{{.repo}}", pr: "{{.pr}}", state: failure, context: "${settings.ci_context}", description: "${settings.status_failed}" } }
+          options: { repo: "{{.repo}}", pr: "{{.pr}}", state: failure, context: "${settings.ci_context}", description: "${settings.status_failed}", target_url: "{{if ${settings.status_link}}}{{.run.url}}{{end}}" } }
       # Pushed, then failed: the start commit's pending would be left behind.
       - { at: fail, if: "${settings.ci_status} && run.pushed", uses: github.set_status,
-          options: { repo: "{{.repo}}", sha: "{{.run.start_sha}}", state: success, context: "${settings.ci_context}", description: "${settings.status_done}" } }
+          options: { repo: "{{.repo}}", sha: "{{.run.start_sha}}", state: success, context: "${settings.ci_context}", description: "${settings.status_done}", target_url: "{{if ${settings.status_link}}}{{.run.url}}{{end}}" } }
       # The PR merged/closed under the run: resolve the pending so nothing is
       # left spinning on the closed PR.
       - { at: stop, if: "${settings.ci_status}", uses: github.set_status,
-          options: { repo: "{{.repo}}", sha: "{{.run.start_sha}}", state: success, context: "${settings.ci_context}", description: "${settings.status_stopped}" } }
+          options: { repo: "{{.repo}}", sha: "{{.run.start_sha}}", state: success, context: "${settings.ci_context}", description: "${settings.status_stopped}", target_url: "{{if ${settings.status_link}}}{{.run.url}}{{end}}" } }
     steps:
       # What failed, read by conductor with your github connector's
       # credentials: the fixer runs sandboxed, with no GitHub token and no
@@ -305,6 +328,7 @@ triggers:
       # the run.
       - id: ci
         uses: github.check_failures
+        progress: "reading the CI results"
         continue_on_error: true
         options: { repo: "{{.repo}}", pr: "{{.pr}}", ignore: "{{.ignore_checks}}" }
       # The same failures as text the fixer can read, fenced as DATA. A test
@@ -374,13 +398,15 @@ triggers:
         # Past a push refused because the branch moved, with a whole diff: the
         # moved-head steps.
         continue_on_error: 'contains(fix.push.reason, "diverged") && !contains(fix.diff, "(diff clipped)") && !contains(fix.diff, "«redacted»")'
-        guidance: &ci_task |-
-          CI is red on this PR. Find why and push a fix on the PR branch. Don't touch unrelated code; if it's genuinely a flake and a re-run cleared it, do nothing.
+        guidance:
+          - &ci_task |-
+            CI is red on this PR. Find why and push a fix on the PR branch. Don't touch unrelated code; if it's genuinely a flake and a re-run cleared it, do nothing.
 
-          You have no GitHub access of your own: conductor read the failing checks for you, just before you started.
-          {{if .ci_text.text}}{{.ci_text.text}}{{else}}conductor could not prepare this PR's CI results for this run. Ask for them with the check_failures verb.{{end}}
+            You have no GitHub access of your own: conductor read the failing checks for you, just before you started.
+            {{if .ci_text.text}}{{.ci_text.text}}{{else}}conductor could not prepare this PR's CI results for this run. Ask for them with the check_failures verb.{{end}}
 
-          After you push, the check_failures verb reads the new head's checks the same way (pass the PR's number; checks still running are listed as pending). Use it to confirm your fix rather than guessing.
+            After you push, the check_failures verb reads the new head's checks the same way (pass the PR's number; checks still running are listed as pending). Use it to confirm your fix rather than guessing.
+          - "${settings.progress_guidance}"
         # The fixer's one conductor verb: the same read, on demand, scoped to
         # this PR's repo (a verb's repo is the dispatch's own unless listed).
         skill:
@@ -396,8 +422,9 @@ triggers:
         <<: *ci_fix
         id: refix
         if: 'landed.status == "conflict" || landed.status == "rejected"'
+        progress: "second attempt, on the new head"
         continue_on_error: false
-        guidance: [*ci_task, "${settings.moved_head_guidance}"]
+        guidance: [*ci_task, "${settings.progress_guidance}", "${settings.moved_head_guidance}"]
       - *unpushed
 
   - name: on_merge_conflict
@@ -405,26 +432,33 @@ triggers:
     serialize: *one_fixer
     hooks:
       - { at: start, if: "${settings.conflict_status}", uses: github.set_status,
-          options: { repo: "{{.repo}}", sha: "{{.run.start_sha}}", state: pending, context: "${settings.conflict_context}", description: "${settings.conflict_working}" } }
+          options: { repo: "{{.repo}}", sha: "{{.run.start_sha}}", state: pending, context: "${settings.conflict_context}", description: "${settings.conflict_working}", target_url: "{{if ${settings.status_link}}}{{.run.url}}{{end}}" } }
+      # While the run waits and works: the same row, saying what it is doing
+      # now and for how long (conductor's progress report): at most every
+      # 30s, only when what it says changed.
+      - { at: progress, if: "${settings.conflict_status} && ${settings.progress}", every: 30s, uses: github.set_status,
+          options: { repo: "{{.repo}}", sha: "{{.run.start_sha}}", state: pending, context: "${settings.conflict_context}", description: "${settings.conflict_working}: ${settings.status_progress}", target_url: "{{if ${settings.status_link}}}{{.run.url}}{{end}}" } }
       # Success goes on the commit the run STARTED on, never the new head: after
       # a push the PR's head has no row of this context, so the row is gone.
       - { at: done, if: "${settings.conflict_status}", uses: github.set_status,
-          options: { repo: "{{.repo}}", sha: "{{.run.start_sha}}", state: success, context: "${settings.conflict_context}", description: "${settings.status_done}" } }
+          options: { repo: "{{.repo}}", sha: "{{.run.start_sha}}", state: success, context: "${settings.conflict_context}", description: "${settings.status_done}", target_url: "{{if ${settings.status_link}}}{{.run.url}}{{end}}" } }
       - { at: fail, if: "${settings.conflict_status}", uses: github.set_status,
-          options: { repo: "{{.repo}}", pr: "{{.pr}}", state: failure, context: "${settings.conflict_context}", description: "${settings.status_failed}" } }
+          options: { repo: "{{.repo}}", pr: "{{.pr}}", state: failure, context: "${settings.conflict_context}", description: "${settings.status_failed}", target_url: "{{if ${settings.status_link}}}{{.run.url}}{{end}}" } }
       # Pushed, then failed: the start commit's pending would be left behind.
       - { at: fail, if: "${settings.conflict_status} && run.pushed", uses: github.set_status,
-          options: { repo: "{{.repo}}", sha: "{{.run.start_sha}}", state: success, context: "${settings.conflict_context}", description: "${settings.status_done}" } }
+          options: { repo: "{{.repo}}", sha: "{{.run.start_sha}}", state: success, context: "${settings.conflict_context}", description: "${settings.status_done}", target_url: "{{if ${settings.status_link}}}{{.run.url}}{{end}}" } }
       # The PR merged/closed under the run: resolve the pending so nothing is
       # left spinning on the closed PR.
       - { at: stop, if: "${settings.conflict_status}", uses: github.set_status,
-          options: { repo: "{{.repo}}", sha: "{{.run.start_sha}}", state: success, context: "${settings.conflict_context}", description: "${settings.status_stopped}" } }
+          options: { repo: "{{.repo}}", sha: "{{.run.start_sha}}", state: success, context: "${settings.conflict_context}", description: "${settings.status_stopped}", target_url: "{{if ${settings.status_link}}}{{.run.url}}{{end}}" } }
     steps:
       - &conflict_fix
         id: fix
         <<: *fixer
         continue_on_error: 'contains(fix.push.reason, "diverged") && !contains(fix.diff, "(diff clipped)") && !contains(fix.diff, "«redacted»")'
-        guidance: &conflict_task "This PR conflicts with its base branch. Resolve the conflicts faithfully (keep both sides' intent), then push."
+        guidance:
+          - &conflict_task "This PR conflicts with its base branch. Resolve the conflicts faithfully (keep both sides' intent), then push."
+          - "${settings.progress_guidance}"
       - *first_fix
       - *kept
       - *pr_now
@@ -432,8 +466,9 @@ triggers:
       - <<: *conflict_fix
         id: refix
         if: 'landed.status == "conflict" || landed.status == "rejected"'
+        progress: "second attempt, on the new head"
         continue_on_error: false
-        guidance: [*conflict_task, "${settings.moved_head_guidance}"]
+        guidance: [*conflict_task, "${settings.progress_guidance}", "${settings.moved_head_guidance}"]
       - *unpushed
 
   - name: on_changes_requested
@@ -441,20 +476,25 @@ triggers:
     serialize: *one_fixer
     hooks:
       - { at: start, if: "${settings.review_status}", uses: github.set_status,
-          options: { repo: "{{.repo}}", sha: "{{.run.start_sha}}", state: pending, context: "${settings.review_context}", description: "${settings.review_working}" } }
+          options: { repo: "{{.repo}}", sha: "{{.run.start_sha}}", state: pending, context: "${settings.review_context}", description: "${settings.review_working}", target_url: "{{if ${settings.status_link}}}{{.run.url}}{{end}}" } }
+      # While the run waits and works: the same row, saying what it is doing
+      # now and for how long (conductor's progress report): at most every
+      # 30s, only when what it says changed.
+      - { at: progress, if: "${settings.review_status} && ${settings.progress}", every: 30s, uses: github.set_status,
+          options: { repo: "{{.repo}}", sha: "{{.run.start_sha}}", state: pending, context: "${settings.review_context}", description: "${settings.review_working}: ${settings.status_progress}", target_url: "{{if ${settings.status_link}}}{{.run.url}}{{end}}" } }
       # Success goes on the commit the run STARTED on, never the new head: after
       # a push the PR's head has no row of this context, so the row is gone.
       - { at: done, if: "${settings.review_status}", uses: github.set_status,
-          options: { repo: "{{.repo}}", sha: "{{.run.start_sha}}", state: success, context: "${settings.review_context}", description: "${settings.status_done}" } }
+          options: { repo: "{{.repo}}", sha: "{{.run.start_sha}}", state: success, context: "${settings.review_context}", description: "${settings.status_done}", target_url: "{{if ${settings.status_link}}}{{.run.url}}{{end}}" } }
       - { at: fail, if: "${settings.review_status}", uses: github.set_status,
-          options: { repo: "{{.repo}}", pr: "{{.pr}}", state: failure, context: "${settings.review_context}", description: "${settings.status_failed}" } }
+          options: { repo: "{{.repo}}", pr: "{{.pr}}", state: failure, context: "${settings.review_context}", description: "${settings.status_failed}", target_url: "{{if ${settings.status_link}}}{{.run.url}}{{end}}" } }
       # Pushed, then failed: the start commit's pending would be left behind.
       - { at: fail, if: "${settings.review_status} && run.pushed", uses: github.set_status,
-          options: { repo: "{{.repo}}", sha: "{{.run.start_sha}}", state: success, context: "${settings.review_context}", description: "${settings.status_done}" } }
+          options: { repo: "{{.repo}}", sha: "{{.run.start_sha}}", state: success, context: "${settings.review_context}", description: "${settings.status_done}", target_url: "{{if ${settings.status_link}}}{{.run.url}}{{end}}" } }
       # The PR merged/closed under the run: resolve the pending so nothing is
       # left spinning on the closed PR.
       - { at: stop, if: "${settings.review_status}", uses: github.set_status,
-          options: { repo: "{{.repo}}", sha: "{{.run.start_sha}}", state: success, context: "${settings.review_context}", description: "${settings.status_stopped}" } }
+          options: { repo: "{{.repo}}", sha: "{{.run.start_sha}}", state: success, context: "${settings.review_context}", description: "${settings.status_stopped}", target_url: "{{if ${settings.status_link}}}{{.run.url}}{{end}}" } }
       - *react_start
       - *react_done
       - *react_fail
@@ -466,7 +506,9 @@ triggers:
         # Past a push refused because the branch moved, with a whole diff: the
         # moved-head steps.
         continue_on_error: 'contains(address.push.reason, "diverged") && !contains(address.diff, "(diff clipped)") && !contains(address.diff, "«redacted»")'
-        guidance: &review_task "Reviewers left feedback on this PR. review_comments and outstanding_reviews hold ALL of it that is still waiting on you, not only the review that fired this run; an earlier run may already have handled some, so check the PR's current code before changing anything. Address the feedback concretely and push; don't argue in code. Every review comment gets a reply on its thread, so the reviewer is never left with silence: `conductor call github.reply --pr <pr> --in_reply_to <comment id> --body <text>`. For one your change addresses, push first (`conductor call git.push`) and reply with the pushed commit sha and what changed, in a sentence (\"Fixed in <sha>: ...\"). If the current code already does what it asks, say where (commit sha and file:line) in a sentence or two. If you disagree or can't do it, say why briefly rather than guessing. For a review's top-level body (outstanding_reviews) that needs an answer and has no thread, use `conductor call github.comment --pr <pr> --body <text>`. When you finish, report addressed_comments: the id of every review comment (review_comments[].id) whose point your pushed change fully addresses, and replied_comments: the ids you replied to instead. Leave anything you only replied to out of addressed_comments: those threads stay open for the reviewer."
+        guidance:
+          - &review_task "Reviewers left feedback on this PR. review_comments and outstanding_reviews hold ALL of it that is still waiting on you, not only the review that fired this run; an earlier run may already have handled some, so check the PR's current code before changing anything. Address the feedback concretely and push; don't argue in code. Every review comment gets a reply on its thread, so the reviewer is never left with silence: `conductor call github.reply --pr <pr> --in_reply_to <comment id> --body <text>`. For one your change addresses, push first (`conductor call git.push`) and reply with the pushed commit sha and what changed, in a sentence (\"Fixed in <sha>: ...\"). If the current code already does what it asks, say where (commit sha and file:line) in a sentence or two. If you disagree or can't do it, say why briefly rather than guessing. For a review's top-level body (outstanding_reviews) that needs an answer and has no thread, use `conductor call github.comment --pr <pr> --body <text>`. When you finish, report addressed_comments: the id of every review comment (review_comments[].id) whose point your pushed change fully addresses, and replied_comments: the ids you replied to instead. Leave anything you only replied to out of addressed_comments: those threads stay open for the reviewer."
+          - "${settings.progress_guidance}"
         # A fixer: conductor pushes its work. An output_schema alone reads as
         # a review, whose commits conductor never pushes — so a fixer that
         # also reports a result says so. A change left unpushed fails the
@@ -496,10 +538,12 @@ triggers:
       - <<: *address
         id: refix
         if: 'landed.status == "conflict" || landed.status == "rejected"'
+        progress: "second attempt, on the new head"
         continue_on_error: false
-        guidance: [*review_task, "${settings.moved_head_guidance}"]
+        guidance: [*review_task, "${settings.progress_guidance}", "${settings.moved_head_guidance}"]
       - *unpushed
       - id: resolve
+        progress: "resolving the threads its change addressed"
         # Resolve exactly the threads the agent reported addressed, and only
         # those still without newer feedback from someone else (seen_through:
         # the latest submission this run was given) — and only when conductor
@@ -513,12 +557,14 @@ triggers:
         uses: github.resolve_threads
         options: { repo: "{{.repo}}", pr: "{{.pr}}", comments: "{{.address.addressed_comments}}", seen_through: "{{.feedback_cursor}}" }
       - id: resolve_refix
+        progress: "resolving the threads its change addressed"
         # The same, for the threads a second attempt (refix) addressed and
         # conductor pushed.
         if: "${settings.resolve_threads} && refix.push.pushed"
         uses: github.resolve_threads
         options: { repo: "{{.repo}}", pr: "{{.pr}}", comments: "{{.refix.addressed_comments}}", seen_through: "{{.feedback_cursor}}" }
       - id: rerequest
+        progress: "re-requesting review"
         # Ping the reviewers back once the changes are pushed. only_outstanding
         # (the default, spelled out) pings them only while their latest review
         # still requests changes on an older commit — not if they've approved
@@ -533,20 +579,25 @@ triggers:
     serialize: *one_fixer
     hooks:
       - { at: start, if: "${settings.comment_status}", uses: github.set_status,
-          options: { repo: "{{.repo}}", sha: "{{.run.start_sha}}", state: pending, context: "${settings.comment_context}", description: "${settings.comment_working}" } }
+          options: { repo: "{{.repo}}", sha: "{{.run.start_sha}}", state: pending, context: "${settings.comment_context}", description: "${settings.comment_working}", target_url: "{{if ${settings.status_link}}}{{.run.url}}{{end}}" } }
+      # While the run waits and works: the same row, saying what it is doing
+      # now and for how long (conductor's progress report): at most every
+      # 30s, only when what it says changed.
+      - { at: progress, if: "${settings.comment_status} && ${settings.progress}", every: 30s, uses: github.set_status,
+          options: { repo: "{{.repo}}", sha: "{{.run.start_sha}}", state: pending, context: "${settings.comment_context}", description: "${settings.comment_working}: ${settings.status_progress}", target_url: "{{if ${settings.status_link}}}{{.run.url}}{{end}}" } }
       # Success goes on the commit the run STARTED on, never the new head: after
       # a push the PR's head has no row of this context, so the row is gone.
       - { at: done, if: "${settings.comment_status}", uses: github.set_status,
-          options: { repo: "{{.repo}}", sha: "{{.run.start_sha}}", state: success, context: "${settings.comment_context}", description: "${settings.status_done}" } }
+          options: { repo: "{{.repo}}", sha: "{{.run.start_sha}}", state: success, context: "${settings.comment_context}", description: "${settings.status_done}", target_url: "{{if ${settings.status_link}}}{{.run.url}}{{end}}" } }
       - { at: fail, if: "${settings.comment_status}", uses: github.set_status,
-          options: { repo: "{{.repo}}", pr: "{{.pr}}", state: failure, context: "${settings.comment_context}", description: "${settings.status_failed}" } }
+          options: { repo: "{{.repo}}", pr: "{{.pr}}", state: failure, context: "${settings.comment_context}", description: "${settings.status_failed}", target_url: "{{if ${settings.status_link}}}{{.run.url}}{{end}}" } }
       # Pushed, then failed: the start commit's pending would be left behind.
       - { at: fail, if: "${settings.comment_status} && run.pushed", uses: github.set_status,
-          options: { repo: "{{.repo}}", sha: "{{.run.start_sha}}", state: success, context: "${settings.comment_context}", description: "${settings.status_done}" } }
+          options: { repo: "{{.repo}}", sha: "{{.run.start_sha}}", state: success, context: "${settings.comment_context}", description: "${settings.status_done}", target_url: "{{if ${settings.status_link}}}{{.run.url}}{{end}}" } }
       # The PR merged/closed under the run: resolve the pending so nothing is
       # left spinning on the closed PR.
       - { at: stop, if: "${settings.comment_status}", uses: github.set_status,
-          options: { repo: "{{.repo}}", sha: "{{.run.start_sha}}", state: success, context: "${settings.comment_context}", description: "${settings.status_stopped}" } }
+          options: { repo: "{{.repo}}", sha: "{{.run.start_sha}}", state: success, context: "${settings.comment_context}", description: "${settings.status_stopped}", target_url: "{{if ${settings.status_link}}}{{.run.url}}{{end}}" } }
       - *react_start
       - *react_done
       - *react_fail
@@ -556,7 +607,9 @@ triggers:
         id: fix
         <<: *fixer
         continue_on_error: 'contains(fix.push.reason, "diverged") && !contains(fix.diff, "(diff clipped)") && !contains(fix.diff, "«redacted»")'
-        guidance: &comment_task "Someone commented on this PR. If it asks for a change, make it, push it (`conductor call git.push`), and reply with the pushed commit sha and what changed, in a sentence (\"Fixed in <sha>: ...\"); if it's a question, or the current code already does what it asks, answer it briefly (say where: commit sha and file:line). You have no GitHub access of your own; answer through conductor: `conductor call github.reply --pr <pr> --in_reply_to <comment id> --body <text>` for a review-thread comment, `conductor call github.comment --pr <pr> --body <text>` for a conversation comment. Never leave a comment with neither a change nor an answer. When you finish, report addressed_comments: the id of every review comment (comment_id, or review_comments[].id for a review) whose point your pushed change fully addresses, and replied_comments: the ids you replied to instead. Leave anything you only replied to out of addressed_comments: those threads stay open. (Arm this trigger with a not_comment_author filter so bot chatter never reaches here.)"
+        guidance:
+          - &comment_task "Someone commented on this PR. If it asks for a change, make it, push it (`conductor call git.push`), and reply with the pushed commit sha and what changed, in a sentence (\"Fixed in <sha>: ...\"); if it's a question, or the current code already does what it asks, answer it briefly (say where: commit sha and file:line). You have no GitHub access of your own; answer through conductor: `conductor call github.reply --pr <pr> --in_reply_to <comment id> --body <text>` for a review-thread comment, `conductor call github.comment --pr <pr> --body <text>` for a conversation comment. Never leave a comment with neither a change nor an answer. When you finish, report addressed_comments: the id of every review comment (comment_id, or review_comments[].id for a review) whose point your pushed change fully addresses, and replied_comments: the ids you replied to instead. Leave anything you only replied to out of addressed_comments: those threads stay open. (Arm this trigger with a not_comment_author filter so bot chatter never reaches here.)"
+          - "${settings.progress_guidance}"
         # A fixer that also reports a result (see on_changes_requested).
         expect_push: true
         skill:
@@ -569,10 +622,12 @@ triggers:
       - <<: *comment_fix
         id: refix
         if: 'landed.status == "conflict" || landed.status == "rejected"'
+        progress: "second attempt, on the new head"
         continue_on_error: false
-        guidance: [*comment_task, "${settings.moved_head_guidance}"]
+        guidance: [*comment_task, "${settings.progress_guidance}", "${settings.moved_head_guidance}"]
       - *unpushed
       - id: resolve
+        progress: "resolving the threads its change addressed"
         # As on_changes_requested: resolve exactly the review threads the
         # agent reported its pushed change addressed (a conversation comment
         # has no thread: naming one is a no-op). new_comment carries no
@@ -582,6 +637,7 @@ triggers:
         uses: github.resolve_threads
         options: { repo: "{{.repo}}", pr: "{{.pr}}", comments: "{{.fix.addressed_comments}}" }
       - id: resolve_refix
+        progress: "resolving the threads its change addressed"
         if: "${settings.resolve_threads} && refix.push.pushed"
         uses: github.resolve_threads
         options: { repo: "{{.repo}}", pr: "{{.pr}}", comments: "{{.refix.addressed_comments}}" }

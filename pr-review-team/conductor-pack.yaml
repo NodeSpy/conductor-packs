@@ -52,7 +52,7 @@
 
 pack:
   name: pr-review-team
-  version: 3.2.0
+  version: 3.3.0
   description: Multi-lens PR review (correctness / security / design …) with refute-verify, deterministic reconcile, an optional human hand-off, and calibration that learns memory, under a scope key you choose, from past reviews.
   tags: [review, github, code-quality, agents, memory]
   homepage: https://github.com/NodeSpy/conductor-packs
@@ -73,7 +73,9 @@ pack:
     # the `checkout: checkout-pr` workspace jail and `github.pr_files`
     # patches — 0.54.0 for `decide:` steps, and 0.33.0 for the reactive
     # hand-off surface.)
-    conductor: ">=0.81.0"
+    # 0.97.0 for 3.3: the review's commit status says where the review is
+    # (`at: progress` hooks, a step's `progress:` phrase, `{{.run.url}}`).
+    conductor: ">=0.97.0"
     # Bind-only environment the pack needs — you wire this; the pack never
     # ships it.
     # requires.connectors is the pack's CAPABILITY BOUNDARY as well as its
@@ -173,6 +175,46 @@ settings:
     type: string
     default: ""
     desc: "review-backfill: the date (YYYY-MM-DD) this pack started posting under your account. From then on your own comments count as yours only when the audit log shows the pack did not post them; from before the audit log's oldest record they are dropped (empty = the first review this pack posted, from the audit log)"
+
+  # The review's commit status: one row on the PR while a review runs, as
+  # you, saying where the review is ("reviewing: 9/18 done · 4m"), then how
+  # it ended. Every word is a setting.
+  status:
+    type: boolean
+    default: true
+    desc: "post a commit status on the PR while a requested review runs, and how it ended; off: no row"
+  status_context:
+    type: string
+    default: "{{.me.login}} / reviewing"
+    desc: "the status context (the row's name)"
+  status_working:
+    type: string
+    default: "reviewing for {{.me.login}}"
+    desc: "the pending description, before the progress report"
+  progress:
+    type: boolean
+    default: true
+    desc: "while the review waits and works, keep the pending row saying where it is and for how long (status_progress), at most every 30s; off: the pending line stays as the run started it"
+  status_progress:
+    type: string
+    default: "{{.progress.text}} · {{.progress.elapsed}}"
+    desc: "appended to the pending description while the review goes (after \": \"): conductor's progress report — queued and why, the step, lenses done of the total — and how long it has been at it"
+  status_link:
+    type: boolean
+    default: true
+    desc: "point the status's Details link at the run on your conductor dashboard ({{.run.url}}), when the dashboard has an address a person can reach; off: no link"
+  status_done:
+    type: string
+    default: "review done"
+    desc: "success description"
+  status_failed:
+    type: string
+    default: "review gave up: {{.run.reason}}"
+    desc: "failure description"
+  status_stopped:
+    type: string
+    default: "stopped — {{.run.reason}}"
+    desc: "description when the PR merged/closed under the review"
 
 # MODEL TIERS as fleets. conductor resolves each against your runtime's roster
 # best-first (see the models:/fleets model), so the pack ships NO presets and NO
@@ -1038,6 +1080,7 @@ workflows:
       # (the held- tag the move keeps), read like the notes (memory on only).
       # A perspective written straight to its scope never becomes a lens.
       - id: lenses
+        progress: "choosing the lenses"
         run: js
         code: |
           const raw = String.raw`${settings.perspectives_as_lenses}`.trim().toLowerCase();
@@ -1093,6 +1136,7 @@ workflows:
       # that is the event's own PR; on a review-eval replay (a manual run,
       # whose own target is synthetic) it is the PR being replayed.
       - id: snapshot
+        progress: "snapshotting the PR"
         uses: github.pr_snapshot
         options: { repo: "{{.inputs.repo}}", pr: "{{.inputs.pr}}" }
       # The lens panel. `extends:` (not `<<:`) so this step's own guidance
@@ -1109,6 +1153,7 @@ workflows:
       # profiles), and it is granted no write verbs. `gh` reads and local
       # `git` work happen inside the jail.
       - id: review
+        progress: "reviewing"
         extends: *panelist
         workspace: { from: "{{.snapshot.archive}}" }
         # one session per lens per pass (lenses.runs = the lenses, review_passes
@@ -1316,6 +1361,7 @@ workflows:
           }
           return { list: list, exact: exact, count: list.length };
       - id: mjudge
+        progress: "merging duplicate findings"
         if: "mpairs.count > 0"
         for_each: "{{.mpairs.list}}"
         parallel: true
@@ -1415,6 +1461,7 @@ workflows:
       # rename, a delete downstream of the reviewed diff); continue_on_error
       # keeps one bad fetch from failing the whole review.
       - id: headfiles
+        progress: "reading the changed files"
         uses: github.file
         for_each: "{{.paths.value}}"
         parallel: true
@@ -1483,6 +1530,7 @@ workflows:
       # then fails the review, as before, rather than quietly posting findings
       # nothing verified.
       - id: verify
+        progress: "verifying findings"
         for_each: "{{.windows.value}}"
         parallel: true
         model: light
@@ -1523,6 +1571,7 @@ workflows:
                 false: The finding is plausible, or merely unprovable from the available context.
 
       - id: reconcile
+        progress: "reconciling the findings"
         run: js
         code: |
           const findings = (ctx.merged && ctx.merged.value) || [];
@@ -1705,6 +1754,7 @@ workflows:
       #    Skipped with `auto: true`: nothing is handed off, so there is
       #    nothing to triage.
       - id: assess
+        progress: "sizing up the PR"
         if: "!automode.auto"
         model: light
         retry: { max: 6, backoff: 30s }
@@ -1808,6 +1858,7 @@ workflows:
       # human an empty "looks good" is pure friction — and hand a manual PR
       # with real comments to a person.
       - id: gate
+        progress: "checking the draft"
         run: js
         code: |
           const mode = ctx.automode.mode;
@@ -1819,6 +1870,7 @@ workflows:
       # POST: submit the drafted review deterministically via the verb (as the
       # connector's own write identity).
       - id: post
+        progress: "posting the review"
         if: gate.post
         uses: github.submit_review
         options:
@@ -1836,6 +1888,7 @@ workflows:
       #     agent's prompt (the capability card) — so the pack does not spell out
       #     a CLI incantation that would rot the moment the surface moved.
       - id: handoff
+        progress: "handing the draft over"
         if: gate.handoff
         <<: *house
         model: light
@@ -1901,6 +1954,20 @@ workflows:
 triggers:
   - name: on_review_request
     on: github.review_requested
+    # The review's row on the PR: pending as it starts, moving while it goes
+    # (where the review is, at most every 30s), then how it ended — all on
+    # the commit the review started on.
+    hooks:
+      - { at: start, if: "${settings.status}", uses: github.set_status,
+          options: { repo: "{{.repo}}", sha: "{{.run.start_sha}}", state: pending, context: "${settings.status_context}", description: "${settings.status_working}", target_url: "{{if ${settings.status_link}}}{{.run.url}}{{end}}" } }
+      - { at: progress, if: "${settings.status} && ${settings.progress}", every: 30s, uses: github.set_status,
+          options: { repo: "{{.repo}}", sha: "{{.run.start_sha}}", state: pending, context: "${settings.status_context}", description: "${settings.status_working}: ${settings.status_progress}", target_url: "{{if ${settings.status_link}}}{{.run.url}}{{end}}" } }
+      - { at: done, if: "${settings.status}", uses: github.set_status,
+          options: { repo: "{{.repo}}", sha: "{{.run.start_sha}}", state: success, context: "${settings.status_context}", description: "${settings.status_done}", target_url: "{{if ${settings.status_link}}}{{.run.url}}{{end}}" } }
+      - { at: fail, if: "${settings.status}", uses: github.set_status,
+          options: { repo: "{{.repo}}", sha: "{{.run.start_sha}}", state: failure, context: "${settings.status_context}", description: "${settings.status_failed}", target_url: "{{if ${settings.status_link}}}{{.run.url}}{{end}}" } }
+      - { at: stop, if: "${settings.status}", uses: github.set_status,
+          options: { repo: "{{.repo}}", sha: "{{.run.start_sha}}", state: success, context: "${settings.status_context}", description: "${settings.status_stopped}", target_url: "{{if ${settings.status_link}}}{{.run.url}}{{end}}" } }
     steps:
       - id: run
         workflow: review-flow

@@ -58,7 +58,9 @@ and cloning each PR uses its read credential.
 
 ## What it needs (`requires:`)
 
-- **`conductor: >=0.81.0`**: the lens panel shares one PR tree. A plugin
+- **`conductor: >=0.97.0`**: the review's commit status moves while the
+  review runs (`at: progress` hooks, a step's `progress:` phrase,
+  `{{.run.url}}`). Since 0.81.0 the lens panel shares one PR tree. A plugin
   verb returns it as an archive that conductor stores as one artifact, and
   each lens starts from its own copy (`workspace: { from: }`). Since 0.70.0 a step's `checkout_pr:` lets a
   manual run check out the PR it names. And, since 0.69.0,
@@ -107,6 +109,13 @@ Every setting is optional. Set them under `packs.<instance>.settings`.
 | `trusted_associations` | `OWNER,MEMBER,COLLABORATOR` | Calibration and backfill learn only from comments and follow-up commits by authors with one of these GitHub `author_association` values (a commit pushed with no PR: its author's rank on the repo); your own account always counts. `none` = only yours. See [Training data and prompt injection](#training-data-and-prompt-injection). |
 | `backfill_max_pages` | `300` | Pages (100 comments each) read per repo by `review-backfill` — a safety cap. A repo that hits it is reported as truncated; raise it for a `days=all` train of a long history. |
 | `backfill_min_chars` | `40` | `review-backfill` ignores comments shorter than this. |
+| `status` | `true` | A commit status on the PR while a requested review runs, as you: `pending`, then `success` ("review done") or `failure`. `false`: no row. See [Progress on the PR](#progress-on-the-pr). |
+| `status_context` | `{{.me.login}} / reviewing` | The row's name. |
+| `status_working` | `reviewing for {{.me.login}}` | The pending description, before the progress report. |
+| `progress` | `true` | Keep the pending row saying where the review is and for how long, at most every 30s. `false`: it stays as the review started it. |
+| `status_progress` | `{{.progress.text}} · {{.progress.elapsed}}` | What follows the pending description while the review goes. |
+| `status_link` | `true` | Link the row to the run on your dashboard (`{{.run.url}}`; no link without a dashboard address). |
+| `status_done` / `status_failed` / `status_stopped` | `review done` / `review gave up: {{.run.reason}}` / `stopped — {{.run.reason}}` | How the row ends. |
 | `backfill_reviewer_since` | `""` | `review-backfill`: the date (`YYYY-MM-DD`) this pack started posting under your account. From then on your own comments count as yours only when the audit log shows the pack didn't post them; from before the audit log's oldest record they are dropped. Empty: the date of the first review this pack posted, from the audit log. |
 
 Settings are substituted as text. `auto` is read once, by the review flow's
@@ -115,6 +124,30 @@ trimmed: `true`/`yes`/`1` and `false`/`no`/`0` are accepted, so `auto: true`,
 `auto: "True"` and `auto: " yes "` all mean on. Anything else **fails the run**
 with an error naming the setting — a misspelled `auto` is never quietly read
 as "gated".
+
+## Progress on the PR
+
+While a requested review runs, the PR shows one row of yours,
+`<you> / reviewing`, that says where the review is and for how long:
+
+```
+reviewing for you: queued — waiting for an agent slot (1 ahead) · 2m
+reviewing for you: starting · <1m
+reviewing for you: sizing up the PR · <1m
+reviewing for you: reviewing: 3/6 done · 4m
+reviewing for you: verifying findings · 9m
+reviewing for you: posting the review · 11m
+review done
+```
+
+The row is updated at most every 30 seconds, and only when its text
+changed. The lens step shows how many lens sessions have finished out of all
+of them. Each step's phrase is its `progress:` field, so an override can
+reword it. The row's **Details** link opens the run on your conductor
+dashboard when the dashboard has an address a person can reach (see the
+dashboard's `public_url`); anyone who can see the PR sees that address, so
+turn it off with `status_link: false` if that matters. All of it is in the
+`on_review_request` trigger's `hooks:` and the settings above.
 
 ## Auto mode
 
@@ -688,6 +721,14 @@ packs:
 
 Its manifest is just pack metadata plus `memory: { entries: memory }`.
 Re-export and push to update it.
+
+## 3.3.0 — the review's status on the PR
+
+- **A `<you> / reviewing` row while a review runs**, saying where it is
+  ("reviewing: 3/6 done · 4m") and linking the run on your dashboard. See
+  [Progress on the PR](#progress-on-the-pr). `status: false` turns it off.
+- **Needs conductor >= 0.97.0** (`at: progress` hooks). An older conductor
+  refuses the pack at load, so keep 3.2.x there.
 
 ## 3.2.0 — one clone per review
 

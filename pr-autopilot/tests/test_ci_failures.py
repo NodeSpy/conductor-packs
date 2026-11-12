@@ -167,8 +167,11 @@ class Wiring(unittest.TestCase):
     def test_the_fixer_reads_it_and_may_re_read_it(self):
         fixer = trigger("on_failing_checks")["steps"][2]
         self.assertEqual(fixer["type"], "agent")
-        self.assertIn("{{.ci_text.text}}", fixer["guidance"])
-        self.assertIn("no GitHub access of your own", fixer["guidance"])
+        # 2.4: guidance is a list (the task, then the progress guidance)
+        task = fixer["guidance"][0]
+        self.assertIn("{{.ci_text.text}}", task)
+        self.assertIn("no GitHub access of your own", task)
+        self.assertEqual(fixer["guidance"][1], "${settings.progress_guidance}")
         # Its only conductor verb: check_failures, scoped to the dispatch's
         # own repo (no repo list widens it).
         self.assertEqual(fixer["skill"], {"verbs": {"github.check_failures": {}}})

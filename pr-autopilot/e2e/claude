@@ -18,6 +18,20 @@ report() { # report <session> <summary>: the cli result, the structured report a
 }
 git config user.email fixer@example.invalid
 git config user.name fixer
+if grep -q "PROGRESS-E2E" .e2e-prompt-$$; then
+  # The progress scenario: the fixer says what it is doing as it goes
+  # (step.progress), more than the pack's pacing (30s, checked every 5s)
+  # apart, so each note shows on the PR's status in turn.
+  say() { conductor call step.progress --text "$1" >> .e2e-progress.log 2>&1 || echo "step.progress failed" >> .e2e-progress.log; }
+  say "reading the comment"; sleep 45
+  sed -i 's/return 1$/return 10/' main.go
+  say "editing main.go"; sleep 45
+  git add main.go && git commit -qm "fix main.go"
+  say "running the tests"; sleep 45
+  rm -f .e2e-prompt-$$
+  report e2e-progress done
+  exit 0
+fi
 if grep -q "second attempt" .e2e-prompt-$$; then
   # The second attempt, on the new head: redo the change by hand.
   sed -i 's/return 99/return 10/; s/return 1$/return 10/' main.go
