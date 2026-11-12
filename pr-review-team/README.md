@@ -131,12 +131,12 @@ While a requested review runs, the PR shows one row of yours,
 `<you> / reviewing`, that says where the review is and for how long:
 
 ```
-reviewing for you: queued — waiting for an agent slot (1 ahead) · 2m
-reviewing for you: starting · <1m
-reviewing for you: sizing up the PR · <1m
-reviewing for you: reviewing: 3/6 done · 4m
-reviewing for you: verifying findings · 9m
-reviewing for you: posting the review · 11m
+reviewing for you · queued — waiting for an agent slot (1 ahead) · 2m
+reviewing for you · starting · <1m
+reviewing for you · sizing up the PR · <1m
+reviewing for you · lenses: 3/6 done · 4m
+reviewing for you · verifying findings · 9m
+reviewing for you · posting the review · 11m
 review done
 ```
 
@@ -722,10 +722,16 @@ packs:
 Its manifest is just pack metadata plus `memory: { entries: memory }`.
 Re-export and push to update it.
 
+## 3.3.1
+
+- **Plainer status wording**: "reviewing for you · lenses: 3/6 done · 4m"
+  instead of "reviewing for you: reviewing: 3/6 done", and "starting the
+  review" instead of "running step run" while the review sets up.
+
 ## 3.3.0 — the review's status on the PR
 
 - **A `<you> / reviewing` row while a review runs**, saying where it is
-  ("reviewing: 3/6 done · 4m") and linking the run on your dashboard. See
+  ("lenses: 3/6 done · 4m") and linking the run on your dashboard. See
   [Progress on the PR](#progress-on-the-pr). `status: false` turns it off.
 - **Needs conductor >= 0.97.0** (`at: progress` hooks). An older conductor
   refuses the pack at load, so keep 3.2.x there.

@@ -101,8 +101,8 @@ class OnePassIsTheOldReviewTest(unittest.TestCase):
         self.assertEqual(now.pop("workspace"), {"from": "{{.snapshot.archive}}"})
         self.assertEqual((then.pop("checkout"), then.pop("checkout_pr")),
                          ("checkout-pr", {"repo": "{{.inputs.repo}}", "pr": "{{.inputs.pr}}"}))
-        # 3.3: the step's phrase on the review's status ("reviewing: 3/6 done")
-        self.assertEqual(now.pop("progress"), "reviewing")
+        # 3.3: the step's phrase on the review's status ("lenses: 3/6 done")
+        self.assertEqual(now.pop("progress"), "lenses")
         self.assertEqual(now, then)
 
     def test_one_pass_ignores_an_agreement_a_lens_made_up(self):
