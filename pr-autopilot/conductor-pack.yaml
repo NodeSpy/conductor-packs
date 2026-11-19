@@ -71,7 +71,7 @@
 
 pack:
   name: pr-autopilot
-  version: 2.4.0
+  version: 2.5.0
   description: Autopilot for routine PR events — fix red CI, resolve conflicts, address requested changes, answer comments. One agent per event, scoped to your repos.
   tags: [github, ci, automation, agents, maintenance]
   homepage: https://github.com/NodeSpy/conductor-packs
@@ -110,7 +110,10 @@ pack:
     # queued and why, the step, what the agent says it is doing, elapsed),
     # a step's `progress:` phrase, the step.progress verb every agent gets,
     # and {{.run.url}} (2.4.0). An older conductor refuses the hooks at load.
-    conductor: ">=0.97.0"
+    #
+    # 0.105.0: a step's `cache: { key: … }` — the fixers' per-PR step cache
+    # (2.5.0). An older conductor refuses the field at load.
+    conductor: ">=0.105.0"
     # github 2.2.0: github.check_failures (each failing check's output,
     # annotations, and an Actions job's failed-step log), and the
     # failing_checks event's ignore_checks. 2.1.0: changes_requested carries
@@ -207,6 +210,12 @@ x-templates:
     model: heavy
     workspace: worktree
     wait_timeout: 30m
+    # One step cache per PR (conductor's sandbox.caches): a PR's next fixer
+    # starts from what its last successful fixer filled — module, build and
+    # package caches, learned by conductor — instead of downloading them
+    # again. Inert unless sandbox.caches.enabled; the key is the PR's own,
+    # so no PR's run ever writes another's cache.
+    cache: { key: "pr-{{.repo}}-{{.pr}}" }
     # archive_when_done unset: a fixer that finishes cleanly is released at
     # its step's end; one the run goes on past (a moved head) when the run
     # ends; and a failed one keeps its agent and workspace, so its work is

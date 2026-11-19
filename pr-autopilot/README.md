@@ -293,6 +293,18 @@ trigger armed but deletes nothing.
 your merged PR's branch is deleted, a branch pushed to after the merge is
 kept, and so is the branch of someone else's PR.
 
+### Dependency caches
+
+Every fixer step (CI, conflict, changes requested, comment, and the moved-head
+re-fix) names a step cache keyed to its PR, `pr-{{.repo}}-{{.pr}}`. With
+conductor's step caches on (`sandbox.caches.enabled: true`, which needs the
+agent sandbox), a PR's next fixer starts with the module, build and package
+caches its last successful fixer filled, and does not download them again.
+Conductor learns which directories those are from what the fixers fill, and
+never caches agent state or credentials. Each PR's runs publish only to that
+PR's own key. With caches off, the key does nothing. See conductor's
+Step-Caches page for how keys, learning and eviction work.
+
 ### The same hooks on your own triggers
 
 They're ordinary hooks, so copy them onto any trigger (use your github
@@ -336,6 +348,11 @@ the run. Conductor never reads a status it posted back as CI, so a `failure`
 row can't trigger the next fix.
 
 ## Upgrading
+
+v2.5.0: every fixer step names a per-PR step cache
+([Dependency caches](#dependency-caches)). It needs **conductor ≥ 0.105.0**
+(a step's `cache:`). An older conductor refuses the pack at load, so keep
+v2.4.x there.
 
 v2.4.0: the pending row says what the run is doing and for how long, and
 links the run on your dashboard ([Progress on the PR](#progress-on-the-pr)).
