@@ -1,0 +1,293 @@
+# calendar-busy-sync — a distributable conductor pack.
+#
+# Keeps "Busy" blocks in sync across Google calendars, the way BusyBridge's
+# Ghost-Main mode does, with no UI and no database. Two lists of
+# google-calendar connectors, as many as you like in each:
+#
+#   sources   read-only calendars (e.g. a personal Gmail, a calendar at
+#             another org you can only read)
+#   targets   the calendars that RECEIVE busy blocks; each is also a source
+#             for every other target
+#
+# Rules (BusyBridge's, see README "Rules"):
+#   source -> every target     timed events only (all-day: sync_personal_all_day)
+#                              — a Free event still blocks
+#   target -> other targets    all-day events block too; a Free event does not
+#   every calendar             skips cancelled, declined, out-of-office, and any
+#                              event whose description has `[nosync]`
+#   blocks                     "Busy", opaque, private, tagged `[Busy]` in the
+#                              description; past blocks are left as they are
+#
+# State lives in the calendars themselves: each block has a deterministic id
+# (cbs + 32 hex, from target/source/source-event) and
+# extendedProperties.private.cbs=1, so every run recomputes the full diff
+# from what Google says and is idempotent. Push (`<conn>.changed`) gives
+# seconds of latency; the cron schedule is the backstop.
+#
+# Triggers: sync (push + cron + manual), backup (nightly JSON + ICS through
+# the backup connector), verify (weekly restore test), cleanup (manual,
+# one-time: retire BusyBridge's own blocks from today on, keep the past).
+#
+# INSTALL — see README.md for the full config (connectors, auth, push).
+
+pack:
+  name: calendar-busy-sync
+  version: 1.0.0
+  description: Mirror busy time across any number of Google calendars as private "Busy" blocks (BusyBridge's rules), driven by Google push with a cron backstop; nightly ICS/JSON backups with restore tests; a one-time BusyBridge cleanup.
+  tags: [calendar, google-calendar, busy, sync, backup]
+  homepage: https://github.com/NodeSpy/conductor-packs
+  license: Apache-2.0
+  requires:
+    # >=0.106.0: list sockets (many: true) with over:/member: steps and
+    # {{.connector}}.
+    conductor: ">=0.106.0"
+    connectors:
+      # google-calendar >=1.2.0: `events` follows every result page (a 60-day
+      # window is often more than Google's first 250), and the `changed` push
+      # source.
+      sources: { many: true, type: google-calendar, version: ">=1.2.0" }
+      targets: { many: true, min: 2, type: google-calendar, version: ">=1.2.0" }
+      cron: "*"
+      backup: ">=1.0.0"
+
+settings:
+  dry_run:
+    type: boolean
+    default: true
+    desc: "Plan only: the sync reads, computes, and reports what it would write, and writes nothing. Watch a few runs, then set false."
+  lookahead_days:
+    type: integer
+    default: 60
+    desc: "How far ahead blocks are kept, in days from now."
+  busy_title:
+    type: string
+    default: Busy
+    desc: "Title of every busy block."
+  managed_tag:
+    type: string
+    default: "[Busy]"
+    desc: "Written as each block's description, so you can search a calendar for every block this pack owns."
+  nosync_tag:
+    type: string
+    default: "[nosync]"
+    desc: "An event whose description contains this (any case) is never mirrored."
+  sync_personal_all_day:
+    type: boolean
+    default: false
+    desc: "Mirror all-day events from the source (read-only) calendars. Target all-day events always mirror."
+  sync_out_of_office:
+    type: boolean
+    default: false
+    desc: "Mirror out-of-office events. Off: OOO on one calendar does not block the others."
+  max_writes:
+    type: integer
+    default: 200
+    desc: "Writes per run. The rest is deferred to the next run (the first fill takes a few)."
+  max_deletes:
+    type: integer
+    default: 50
+    desc: "A run that would delete more blocks than this fails instead (a source that read back empty looks exactly like that)."
+  max_fan_out:
+    type: integer
+    default: 100
+    desc: "Most writes of one kind (create/update/delete) per run, across all calendars. Keep it at or under your policy.max_fan_out (default 100)."
+  backup_tiers:
+    type: string
+    default: ""
+    desc: "Comma-separated backup tiers to write and verify. Empty: every tier of the bound backup connector."
+  backup_prefix:
+    type: string
+    default: calendar
+    desc: "Backup set names are <prefix>-<connector>-json / -ics (e.g. calendar-gcal-work-ics), plus <prefix>-index."
+  backup_days_back:
+    type: integer
+    default: 365
+    desc: "The backup covers events from this many days ago..."
+  backup_days_ahead:
+    type: integer
+    default: 730
+    desc: "...to this many days ahead (recurring events are kept as one series)."
+  cleanup_max_ops:
+    type: integer
+    default: 1000
+    desc: "The cleanup refuses to make more changes than this in one run."
+
+workflows:
+  # ---------------------------------------------------------------- sync
+  sync:
+    description: "Read every calendar's next lookahead_days, diff the busy blocks each target should hold against the ones it does, and write the difference."
+    steps:
+      - id: cfg
+        set:
+          mode: plan
+          dry_run: "${settings.dry_run}"
+          lookahead_days: "${settings.lookahead_days}"
+          busy_title: "${settings.busy_title}"
+          managed_tag: "${settings.managed_tag}"
+          nosync_tag: "${settings.nosync_tag}"
+          sync_personal_all_day: "${settings.sync_personal_all_day}"
+          sync_out_of_office: "${settings.sync_out_of_office}"
+          max_writes: "${settings.max_writes}"
+          max_deletes: "${settings.max_deletes}"
+          max_fan_out: "${settings.max_fan_out}"
+      - id: win
+        use: js
+        code: |
+          const days = Number(ctx.cfg.lookahead_days);
+          if (!(days > 0)) throw new Error("lookahead_days must be a positive number");
+          const now = new Date();
+          return { min: now.toISOString(), max: new Date(now.getTime() + days * 86400000).toISOString() };
+      # showDeleted: a block deleted by hand comes back cancelled, and its id
+      # can never be created again — the plan restores it instead.
+      - parallel:
+          - - { id: read_sources, uses: sources.events, over: true, parallel: true, progress: reading source calendars,
+                options: { timeMin: "{{.win.min}}", timeMax: "{{.win.max}}", singleEvents: true, showDeleted: true, maxResults: 2500 } }
+          - - { id: read_targets, uses: targets.events, over: true, parallel: true, progress: reading target calendars,
+                options: { timeMin: "{{.win.min}}", timeMax: "{{.win.max}}", singleEvents: true, showDeleted: true, maxResults: 2500 } }
+      - id: plan
+        use: js
+        code: "file:${pack.dir}/busy.js"
+      - log: "busy sync: {{.plan.summary}}{{if .plan.dry_run}} (dry run, nothing written: {{.plan.would}}){{end}}{{if .plan.deferred}} — {{.plan.deferred}} deferred to the next run{{end}}"
+      # Writes. Deletes first (they free time), then creates, then repairs.
+      # Each op names its target calendar, and member: sends it there (and
+      # only to a calendar in the targets list). Each fans out 8-wide and
+      # keeps going past a failed item; `applied` fails the run at the end if
+      # any did, and the next run retries.
+      - { id: apply_delete, for_each: "{{.plan.delete}}", parallel: true, continue_on_error: true, progress: removing stale blocks,
+          uses: targets.event_delete, member: "{{.item.target}}", options: { event_id: "{{.item.event_id}}" } }
+      - { id: apply_create, for_each: "{{.plan.create}}", parallel: true, continue_on_error: true, progress: adding blocks,
+          uses: targets.event_create, member: "{{.item.target}}", options: { event: "{{.item.event}}" } }
+      - { id: apply_update, for_each: "{{.plan.update}}", parallel: true, continue_on_error: true, progress: repairing blocks,
+          uses: targets.event_update, member: "{{.item.target}}", options: { event_id: "{{.item.event_id}}", event: "{{.item.event}}" } }
+      - id: applied
+        use: js
+        code: |
+          const bad = ["apply_delete", "apply_create", "apply_update"].filter((k) => ctx[k] && ctx[k].failed);
+          if (bad.length) throw new Error("some block writes failed, the next run retries them: " + bad.map((k) => k + ": " + ctx[k].error).join("; "));
+          return { writes: ctx.plan.writes };
+
+  # ---------------------------------------------------------------- backup
+  backup:
+    description: "Snapshot every calendar (raw API JSON, re-insertable, and ICS) into the backup connector's tiers; unchanged snapshots are skipped, each tier's retention applies."
+    steps:
+      - id: cfg
+        set: { mode: snapshots, backup_prefix: "${settings.backup_prefix}" }
+      - id: win
+        use: js
+        code: |
+          const back = Number("${settings.backup_days_back}"), ahead = Number("${settings.backup_days_ahead}");
+          const now = Date.now();
+          const tiers = "${settings.backup_tiers}".split(",").map((s) => s.trim()).filter(Boolean);
+          return { min: new Date(now - back * 86400000).toISOString(), max: new Date(now + ahead * 86400000).toISOString(), tiers: tiers };
+      - parallel:
+          - - { id: read_sources, uses: sources.events, over: true, parallel: true,
+                options: { timeMin: "{{.win.min}}", timeMax: "{{.win.max}}", singleEvents: false, maxResults: 2500, max_pages: 200 } }
+          - - { id: read_targets, uses: targets.events, over: true, parallel: true,
+                options: { timeMin: "{{.win.min}}", timeMax: "{{.win.max}}", singleEvents: false, maxResults: 2500, max_pages: 200 } }
+      - id: snap
+        use: js
+        code: "file:${pack.dir}/busy.js"
+      - id: put
+        for_each: "{{.snap.snapshots}}"
+        progress: writing backups
+        uses: backup.put
+        options: { set: "{{.item.set}}", ext: "{{.item.ext}}", text: "{{.item.text}}", tiers: "{{.win.tiers}}" }
+
+  # ---------------------------------------------------------------- verify
+  verify:
+    description: "Restore test: restore each set's newest snapshot from every tier and check it against its recorded sha256/size, plus the backend's own consistency check."
+    steps:
+      - id: names
+        use: js
+        code: |
+          const tiers = "${settings.backup_tiers}".split(",").map((s) => s.trim()).filter(Boolean);
+          return { index: "${settings.backup_prefix}-index", tiers: tiers };
+      # The nightly backup writes an index of its sets; restore it first (an
+      # integrity-checked read), then test every set it names.
+      - id: index
+        uses: backup.read
+        options: { set: "{{.names.index}}" }
+      - id: sets
+        use: js
+        code: |
+          const sets = JSON.parse(ctx.index.content).sets;
+          if (!Array.isArray(sets) || !sets.length) throw new Error("the index names no sets");
+          return { sets: [ctx.names.index].concat(sets) };
+      - id: verify
+        for_each: "{{.sets.sets}}"
+        progress: restore-testing backups
+        continue_on_error: true
+        uses: backup.verify
+        options: { set: "{{.item}}", mode: both, sample: 1, tiers: "{{.names.tiers}}" }
+      - id: verified
+        use: js
+        code: |
+          if (ctx.verify.failed) throw new Error("restore test failed: " + ctx.verify.error);
+          const bad = [];
+          (ctx.verify.items || []).forEach((r, i) => { if (!r || r.ok !== true) bad.push(ctx.sets.sets[i]); });
+          if (bad.length) throw new Error("restore test failed for: " + bad.join(", "));
+          return { verified: (ctx.verify.items || []).length };
+
+triggers:
+  # Push from any calendar, the cron backstop, or `conductor run <inst>/sync`.
+  # One sync at a time (a burst of pushes queues behind the running sync, and
+  # the queued one re-reads everything, so nothing is missed). The writes a
+  # sync makes push back a `changed` of their own; that run finds nothing to do.
+  - name: sync
+    "on":
+      - sources.changed
+      - targets.changed
+      - cron.busy_sync
+      - manual
+    serialize: { key: calendar-busy-sync }
+    steps:
+      - { id: run, workflow: sync }
+
+  - name: backup
+    "on": [cron.busy_backup, manual]
+    serialize: { key: calendar-busy-sync-backup }
+    steps:
+      - { id: run, workflow: backup }
+
+  - name: verify
+    "on": [cron.busy_verify, manual]
+    serialize: { key: calendar-busy-sync-backup }
+    steps:
+      - { id: run, workflow: verify }
+
+  # Manual only: `conductor run <inst>/cleanup` reports; add
+  # `--input apply=true` to make the changes. Shares the sync's key, so it
+  # never runs alongside a sync. Up to max_fan_out deletes and series-ends
+  # per run: a large cleanup says how many remain, so run it again.
+  - name: cleanup
+    "on": manual
+    serialize: { key: calendar-busy-sync }
+    # Inline rather than a workflow: it reads the manual run's --input apply.
+    steps:
+      - id: cfg
+        set:
+          mode: cleanup
+          cleanup_apply: "{{.inputs.apply}}"
+          cleanup_max_ops: "${settings.cleanup_max_ops}"
+          max_fan_out: "${settings.max_fan_out}"
+      - id: win
+        use: js
+        code: "return { min: new Date().toISOString() };"
+      # Not expanded: a recurring series is one master (whose RRULE gets an
+      # UNTIL) plus its exceptions, not hundreds of instances.
+      - { id: read_targets, uses: targets.events, over: true, parallel: true,
+          options: { timeMin: "{{.win.min}}", singleEvents: false, maxResults: 2500, max_pages: 200 } }
+      - id: plan
+        use: js
+        code: "file:${pack.dir}/busy.js"
+      - log: "busybridge cleanup: {{.plan.summary}}{{if not .plan.apply}} (report only — run again with --input apply=true to make these changes; sample: {{.plan.sample}}){{end}}{{if .plan.remaining}} — {{.plan.remaining}} more after this run; run cleanup again{{end}}"
+      - { id: cleanup_delete, for_each: "{{.plan.delete}}", parallel: true, continue_on_error: true,
+          uses: targets.event_delete, member: "{{.item.target}}", options: { event_id: "{{.item.event_id}}" } }
+      - { id: cleanup_end, for_each: "{{.plan.patch}}", parallel: true, continue_on_error: true,
+          uses: targets.event_update, member: "{{.item.target}}", options: { event_id: "{{.item.event_id}}", event: "{{.item.event}}" } }
+      - id: applied
+        use: js
+        code: |
+          const bad = ["cleanup_delete", "cleanup_end"].filter((k) => ctx[k] && ctx[k].failed);
+          if (bad.length) throw new Error("some cleanup writes failed (run cleanup again; it only touches what is left): " + bad.map((k) => k + ": " + ctx[k].error).join("; "));
+          return { ok: true };
