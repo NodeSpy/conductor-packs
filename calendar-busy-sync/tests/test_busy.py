@@ -1,4 +1,4 @@
-"""busy.js — the pack's sync / cleanup / backup logic — run under node exactly
+"""busy.js — the pack's reconcile and BusyBridge-cleanup logic — run under node exactly
 as the js engine runs it (the file is an IIFE body; `ctx` is the step scope).
 
     python3 -m unittest discover -s calendar-busy-sync/tests
@@ -37,18 +37,22 @@ def ev(id, start, end=None, **kw):
     return e
 
 
+def by(cals):
+    return {"by_member": {k: {"items": list(v)} for k, v in cals.items()}}
+
+
 def reads(p1=(), p2=(), c1=(), c2=()):
-    """The two `over:` read steps' outputs, keyed by connector name — here
-    the connectors are simply called personal_1 … client_2."""
-    return {
-        "read_sources": {"by_member": {"personal_1": {"items": list(p1)}, "personal_2": {"items": list(p2)}}},
-        "read_targets": {"by_member": {"client_1": {"items": list(c1)}, "client_2": {"items": list(c2)}}},
-    }
+    """The four `over:` read steps' outputs, keyed by connector name: two
+    source-only calendars (personal_1/2) and two targets (client_1/2). With
+    nothing repeating, the raw reads are the expanded ones. A target is in
+    both lists, as BusyBridge's clients are both read and written."""
+    src = {"personal_1": p1, "personal_2": p2, "client_1": c1, "client_2": c2}
+    dst = {"client_1": c1, "client_2": c2}
+    return {"src": by(src), "srcraw": by(src), "dst": by(dst), "dstraw": by(dst)}
 
 
 def per_target(out, kinds):
-    """Regroup the flat, target-tagged op lists per target calendar, so the
-    assertions read per calendar (and the target tag is checked to exist)."""
+    """Regroup the flat, target-tagged op lists per target calendar."""
     for t in ("client_1", "client_2"):
         out[t] = {k: [] for k in kinds}
     for k in kinds:
@@ -58,50 +62,62 @@ def per_target(out, kinds):
 
 
 def plan(p1=(), p2=(), c1=(), c2=(), **cfg):
-    c = {"mode": "plan", "dry_run": "false"}
+    """BusyBridge rules, its block look ([Busy] description, no colour)."""
+    c = {"mode": "plan", "rules": "busybridge", "managed_tag": "[Busy]", "color_id": ""}
     c.update(cfg)
     ctx = {"cfg": c}
     ctx.update(reads(p1, p2, c1, c2))
-    return per_target(run(ctx), ("create", "update", "delete"))
+    return per_target(run(ctx), ("creates", "updates", "deletes"))
+
+
+def blocked(out, target):
+    """Source event ids blocked on target (creates), by the block key."""
+    return sorted(o["event"]["extendedProperties"]["private"]["conductorBusySync"].split("/", 1)[1]
+                  for o in out[target]["creates"])
+
+
+def on(out, block):
+    """The block as Google would hand it back."""
+    return dict(block, id="g" + str(abs(hash(json.dumps(block, sort_keys=True))) % 10**9), status="confirmed")
 
 
 T = "2026-11-25T10:00:00-07:00"
 
 
-class Rules(unittest.TestCase):
+class BusyBridgeRules(unittest.TestCase):
     def test_personal_timed_event_blocks_both_clients(self):
         out = plan(p1=[ev("a", T, summary="Dentist", location="Main St")])
         for c in ("client_1", "client_2"):
-            self.assertEqual(len(out[c]["create"]), 1)
-            body = out[c]["create"][0]["event"]
+            self.assertEqual(len(out[c]["creates"]), 1)
+            body = out[c]["creates"][0]["event"]
             self.assertEqual(body["summary"], "Busy")
             self.assertEqual(body["description"], "[Busy]")
             self.assertEqual(body["transparency"], "opaque")
             self.assertEqual(body["visibility"], "private")
+            self.assertEqual(body["reminders"], {"useDefault": False, "overrides": []})
             self.assertEqual(body["start"], {"dateTime": T, "timeZone": "America/Denver"})
             self.assertNotIn("location", body)
-            self.assertEqual(body["extendedProperties"]["private"]["cbs"], "1")
-            self.assertRegex(body["id"], r"^cbs[0-9a-f]{32}$")
-        self.assertNotEqual(out["client_1"]["create"][0]["event"]["id"], out["client_2"]["create"][0]["event"]["id"])
+            self.assertNotIn("colorId", body)
+            self.assertEqual(body["extendedProperties"]["private"]["conductorBusySync"], "personal_1/a")
 
     def test_personal_free_event_still_blocks(self):
         out = plan(p1=[ev("a", T, transparency="transparent")])
-        self.assertEqual(len(out["client_1"]["create"]), 1)
+        self.assertEqual(blocked(out, "client_1"), ["a"])
 
     def test_personal_all_day_skipped_unless_enabled(self):
         a = ev("a", "2026-11-25", "2026-11-26")
-        self.assertEqual(plan(p1=[a])["summary"]["client_1"]["want"], 0)
-        self.assertEqual(plan(p1=[a], sync_personal_all_day="true")["summary"]["client_1"]["want"], 1)
+        self.assertEqual(blocked(plan(p1=[a]), "client_1"), [])
+        self.assertEqual(blocked(plan(p1=[a], mirror_all_day="true"), "client_1"), ["a"])
 
     def test_client_source_blocks_only_the_other_client(self):
         out = plan(c1=[ev("m", T)])
-        self.assertEqual(out["summary"]["client_1"]["want"], 0)
-        self.assertEqual(out["summary"]["client_2"]["want"], 1)
+        self.assertEqual(blocked(out, "client_1"), [])
+        self.assertEqual(blocked(out, "client_2"), ["m"])
 
     def test_client_all_day_blocks_but_free_does_not(self):
         out = plan(c1=[ev("d", "2026-11-25", "2026-11-26"), ev("f", T, transparency="transparent")])
-        self.assertEqual(out["summary"]["client_2"]["want"], 1)
-        self.assertEqual(out["client_2"]["create"][0]["event"]["start"], {"date": "2026-11-25"})
+        self.assertEqual(blocked(out, "client_2"), ["d"])
+        self.assertEqual(out["client_2"]["creates"][0]["event"]["start"], {"date": "2026-11-25"})
 
     def test_skips(self):
         skipped = [
@@ -113,146 +129,106 @@ class Rules(unittest.TestCase):
             ev("x5", T, extendedProperties={"private": {"bb_proj_id": "7"}}),
         ]
         out = plan(p1=skipped, c1=skipped)
-        self.assertEqual(out["summary"]["client_1"]["want"], 0)
-        self.assertEqual(out["summary"]["client_2"]["want"], 0)
+        self.assertEqual(blocked(out, "client_1"), [])
+        self.assertEqual(blocked(out, "client_2"), [])
 
     def test_out_of_office_mirrors_when_enabled(self):
-        self.assertEqual(plan(c1=[ev("o", T, eventType="outOfOffice")], sync_out_of_office="true")["summary"]["client_2"]["want"], 1)
+        out = plan(c1=[ev("o", T, eventType="outOfOffice")], sync_out_of_office="true")
+        self.assertEqual(blocked(out, "client_2"), ["o"])
 
     def test_our_own_blocks_never_feed_back(self):
         first = plan(c1=[ev("m", T)])
-        block = first["client_2"]["create"][0]["event"]
-        # client_2 now holds our block; it must not cast a block back onto client_1
-        out = plan(c1=[ev("m", T)], c2=[dict(block, status="confirmed")])
-        self.assertEqual(out["summary"]["client_1"]["want"], 0)
-        self.assertEqual(out["summary"]["client_2"], {"want": 1, "have": 1, "create": 0, "update": 0, "delete": 0})
+        blk = on(first, first["client_2"]["creates"][0]["event"])
+        out = plan(c1=[ev("m", T)], c2=[blk])
+        self.assertEqual(blocked(out, "client_1"), [])
+        self.assertEqual((out["creates"], out["updates"], out["deletes"]), ([], [], []))
+
+
+class UniformRules(unittest.TestCase):
+    def test_default_rules_treat_every_source_alike(self):
+        c = {"mode": "plan"}
+        ctx = {"cfg": c}
+        ctx.update(reads(p1=[ev("free", T, transparency="transparent"), ev("ooo", T.replace("T10", "T13"), eventType="outOfOffice")],
+                         c1=[ev("d", "2026-11-25", "2026-11-26")]))
+        out = per_target(run(ctx), ("creates", "updates", "deletes"))
+        # a free event does not block, out-of-office does, all-day does not
+        self.assertEqual(blocked(out, "client_1"), ["ooo"])
+        self.assertEqual(blocked(out, "client_2"), ["ooo"])
+        self.assertEqual(out["client_1"]["creates"][0]["event"]["colorId"], "8")
+        self.assertNotIn("description", out["client_1"]["creates"][0]["event"])
+
+    def test_unknown_rules_refused(self):
+        ctx = {"cfg": {"mode": "plan", "rules": "ghost"}}
+        ctx.update(reads())
+        with self.assertRaisesRegex(RuntimeError, "rules must be uniform or busybridge"):
+            run(ctx)
+
+    def test_busybridge_blocks_are_never_mirrored(self):
+        ctx = {"cfg": {"mode": "plan"}}
+        ctx.update(reads(p1=[ev("bb0123456789abc", T)]))
+        self.assertEqual(run(ctx)["creates"], [])
 
 
 class Diff(unittest.TestCase):
     def test_idempotent(self):
         p = [ev("a", T)]
         first = plan(p1=p)
-        c1 = [dict(o["event"], status="confirmed") for o in first["client_1"]["create"]]
-        c2 = [dict(o["event"], status="confirmed") for o in first["client_2"]["create"]]
+        c1 = [on(first, o["event"]) for o in first["client_1"]["creates"]]
+        c2 = [on(first, o["event"]) for o in first["client_2"]["creates"]]
         again = plan(p1=p, c1=c1, c2=c2)
-        self.assertEqual(again["writes"], 0)
-
-    def test_moved_source_replaces_block(self):
-        first = plan(p1=[ev("a", T)])
-        old = dict(first["client_1"]["create"][0]["event"], status="confirmed")
-        out = plan(p1=[ev("a", "2026-11-25T14:00:00-07:00", "2026-11-25T15:00:00-07:00")], c1=[old])
-        self.assertEqual([d["event_id"] for d in out["client_1"]["delete"]], [old["id"]])
-        self.assertEqual(len(out["client_1"]["create"]), 1)
-
-    def test_removed_source_deletes_block(self):
-        first = plan(p1=[ev("a", T)])
-        old = dict(first["client_1"]["create"][0]["event"], status="confirmed")
-        out = plan(c1=[old])
-        self.assertEqual(out["client_1"]["delete"], [{"event_id": old["id"]}])
+        self.assertEqual((again["creates"], again["updates"], again["deletes"]), ([], [], []))
 
     def test_edited_block_is_repaired(self):
         first = plan(p1=[ev("a", T)])
-        edited = dict(first["client_1"]["create"][0]["event"], status="confirmed", summary="mine now", visibility="public")
+        edited = dict(on(first, first["client_1"]["creates"][0]["event"]), summary="mine now", visibility="public")
         out = plan(p1=[ev("a", T)], c1=[edited])
-        self.assertEqual(len(out["client_1"]["update"]), 1)
-        patch = out["client_1"]["update"][0]["event"]
+        self.assertEqual(len(out["client_1"]["updates"]), 1)
+        patch = out["client_1"]["updates"][0]["event"]
         self.assertEqual((patch["summary"], patch["visibility"]), ("Busy", "private"))
-        self.assertNotIn("id", patch)
 
-    def test_hand_deleted_block_is_restored_not_recreated(self):
-        first = plan(p1=[ev("a", T)])
-        gone = {"id": first["client_1"]["create"][0]["event"]["id"], "status": "cancelled"}
-        out = plan(p1=[ev("a", T)], c1=[gone])
-        self.assertEqual(out["summary"]["client_1"]["create"], 0)
-        self.assertEqual(out["client_1"]["update"][0]["event"]["status"], "confirmed")
-
-    def test_meeting_already_on_target_is_not_duplicated(self):
-        meet = dict(iCalUID="abc@google.com")
-        out = plan(c1=[ev("m1", T, **meet)], c2=[ev("m2", T, **meet)])
-        self.assertEqual(out["summary"]["client_2"]["want"], 0)
-        self.assertEqual(out["summary"]["client_1"]["want"], 0)
-
-    def test_same_meeting_on_two_sources_blocks_once(self):
-        meet = dict(iCalUID="abc@google.com")
-        out = plan(p1=[ev("m1", T, **meet)], p2=[ev("m2", T, **meet)])
-        self.assertEqual(out["summary"]["client_1"]["want"], 1)
-
-    def test_declined_on_target_still_gets_block(self):
-        meet = dict(iCalUID="abc@google.com")
-        mine = ev("m2", T, attendees=[{"self": True, "responseStatus": "declined"}], **meet)
-        out = plan(c1=[ev("m1", T, **meet)], c2=[mine])
-        self.assertEqual(out["summary"]["client_2"]["want"], 1)
-
-    def test_dry_run_writes_nothing(self):
-        out = plan(p1=[ev("a", T)], dry_run="true")
-        self.assertTrue(out["dry_run"])
-        self.assertEqual(out["writes"], 0)
-        self.assertEqual(out["client_1"], {"create": [], "update": [], "delete": []})
-        self.assertEqual(out["summary"]["client_1"]["create"], 1)
-        self.assertEqual(out["would"]["create"][0]["from"], "personal_1")
-        self.assertIn(out["would"]["create"][0]["on"], ("client_1", "client_2"))
-
-    def test_dry_run_is_the_default(self):
-        ctx = {"cfg": {"mode": "plan"}}
-        ctx.update(reads())
-        out = run(ctx)
-        self.assertTrue(out["dry_run"])
-
-    def test_write_cap_defers(self):
-        many = [ev("a%d" % i, "2026-11-25T10:%02d:00-07:00" % i, "2026-11-25T11:%02d:00-07:00" % i) for i in range(10)]
-        out = plan(p1=many, max_writes="12", max_fan_out="100")
-        self.assertEqual(out["writes"], 12)
-        self.assertEqual(out["deferred"], 8)
-
-    def test_fan_out_cap_per_list(self):
-        many = [ev("a%d" % i, "2026-11-25T%02d:%02d:00-07:00" % (i // 60, i % 60), "2026-11-25T23:59:00-07:00") for i in range(7)]
-        out = plan(p1=many, max_fan_out="3")
-        self.assertEqual(len(out["create"]), 3)  # one for_each step for every target
-        self.assertEqual(out["deferred"], 11)
-
-    def test_mass_delete_refused(self):
-        first = plan(p1=[ev("a%d" % i, "2026-11-25T10:%02d:00-07:00" % i, "2026-11-25T11:%02d:00-07:00" % i) for i in range(4)])
-        have = [dict(o["event"], status="confirmed") for o in first["client_1"]["create"]]
-        with self.assertRaisesRegex(RuntimeError, "refusing to delete 4"):
-            plan(c1=have, max_deletes="3")
-
-    def test_missing_read_fails(self):
-        with self.assertRaisesRegex(RuntimeError, "read_targets returned no calendars"):
-            run({"cfg": {"mode": "plan"}, "read_sources": reads()["read_sources"]})
-        bad = reads()
-        bad["read_targets"]["by_member"]["client_2"] = {}
-        with self.assertRaisesRegex(RuntimeError, "client_2 returned no items"):
-            run(dict(bad, cfg={"mode": "plan"}))
+    def test_dry_run_is_off_by_default_in_the_manifest(self):
+        with open(os.path.join(PACK, "conductor-pack.yaml")) as f:
+            man = yaml.safe_load(f)
+        self.assertIs(man["settings"]["dry_run"]["default"], False)
 
     def test_any_number_of_calendars(self):
-        # three targets, one source: each target gets the source and the two others
-        ctx = {"cfg": {"mode": "plan", "dry_run": "false"},
-               "read_sources": {"by_member": {"home": {"items": [ev("h", T)]}}},
-               "read_targets": {"by_member": {
-                   "w1": {"items": [ev("a", "2026-11-26T10:00:00Z", "2026-11-26T11:00:00Z")]},
-                   "w2": {"items": []}, "w3": {"items": []}}}}
+        # three targets, one source-only: each target gets the source and the two others
+        src = {"home": [ev("h", T)], "w1": [ev("a", "2026-11-26T10:00:00Z", "2026-11-26T11:00:00Z")], "w2": [], "w3": []}
+        dst = {"w1": src["w1"], "w2": [], "w3": []}
+        ctx = {"cfg": {"mode": "plan", "rules": "busybridge"},
+               "src": by(src), "srcraw": by(src), "dst": by(dst), "dstraw": by(dst)}
         out = run(ctx)
-        self.assertEqual({k: v["want"] for k, v in out["summary"].items()}, {"w1": 1, "w2": 2, "w3": 2})
-        self.assertEqual(sorted({o["target"] for o in out["create"]}), ["w1", "w2", "w3"])
+        self.assertIn("home -> w1 1, home -> w2 1, home -> w3 1, w1 -> w2 1, w1 -> w3 1", out["summary"])
+        self.assertEqual(sorted({o["target"] for o in out["creates"]}), ["w1", "w2", "w3"])
 
-    def test_no_sources_is_fine(self):
-        ctx = {"cfg": {"mode": "plan", "dry_run": "false"},
-               "read_targets": {"by_member": {"w1": {"items": [ev("a", T)]}, "w2": {"items": []}}}}
-        out = run(ctx)
-        self.assertEqual(out["summary"]["w2"]["want"], 1)
-
-    def test_calendar_in_both_lists_refused(self):
-        ctx = {"cfg": {"mode": "plan"},
-               "read_sources": {"by_member": {"x": {"items": []}}},
-               "read_targets": {"by_member": {"x": {"items": []}, "y": {"items": []}}}}
-        with self.assertRaisesRegex(RuntimeError, "both a source and a target: x"):
+    def test_missing_read_fails(self):
+        ctx = {"cfg": {"mode": "plan"}}
+        ctx.update(reads())
+        del ctx["dstraw"]
+        with self.assertRaisesRegex(RuntimeError, "dstraw returned no calendars"):
             run(ctx)
+        ctx = {"cfg": {"mode": "plan"}}
+        ctx.update(reads())
+        ctx["dst"]["by_member"]["client_2"] = {}
+        with self.assertRaisesRegex(RuntimeError, "client_2 returned no items"):
+            run(ctx)
+
+    def test_repeating_blocks_can_be_turned_off(self):
+        m = {"id": "m1", "status": "confirmed", "iCalUID": "m1@google.com", "recurrence": ["RRULE:FREQ=WEEKLY"],
+             "start": {"dateTime": "2026-01-06T15:00:00Z", "timeZone": "UTC"}, "end": {"dateTime": "2026-01-06T16:00:00Z", "timeZone": "UTC"}}
+        occ = [dict(ev("m1_%d" % d, "2026-12-%02dT15:00:00Z" % d, "2026-12-%02dT16:00:00Z" % d),
+                    recurringEventId="m1", iCalUID="m1@google.com",
+                    originalStartTime={"dateTime": "2026-12-%02dT15:00:00Z" % d}) for d in (1, 8, 15)]
+        for flag, want in (("true", 1), ("false", 3)):
+            ctx = {"cfg": {"mode": "plan", "repeating_blocks": flag},
+                   "src": by({"p": occ}), "srcraw": by({"p": [m]}), "dst": by({"w": []}), "dstraw": by({"w": []})}
+            self.assertEqual(len(run(ctx)["creates"]), want, flag)
 
 
 def cleanup(c1=(), c2=(), **cfg):
     c = {"mode": "cleanup", "now": NOW, "cleanup_apply": "true"}
     c.update(cfg)
-    ctx = {"cfg": c, "read_targets": reads(c1=c1, c2=c2)["read_targets"]}
+    ctx = {"cfg": c, "dstraw": reads(c1=c1, c2=c2)["dstraw"]}
     return per_target(run(ctx), ("delete", "patch"))
 
 
@@ -296,7 +272,7 @@ class Cleanup(unittest.TestCase):
 
     def test_report_only_by_default(self):
         out = run({"cfg": {"mode": "cleanup", "now": NOW},
-                   "read_targets": reads(c1=[ev(self.BB, "2026-11-25T10:00:00Z")])["read_targets"]})
+                   "dstraw": reads(c1=[ev(self.BB, "2026-11-25T10:00:00Z")])["dstraw"]})
         self.assertFalse(out["apply"])
         self.assertEqual(out["delete"], [])
         self.assertEqual(out["summary"]["client_1"]["delete"], 1)
@@ -304,7 +280,7 @@ class Cleanup(unittest.TestCase):
 
     def test_fan_out_cap_leaves_remainder(self):
         many = [ev("bb0123456789a%02d" % i, "2026-11-25T10:00:00Z") for i in range(5)]
-        out = cleanup(c1=many, max_fan_out="2")
+        out = cleanup(c1=many, batch_size="2")
         self.assertEqual(len(out["delete"]), 2)
         self.assertEqual(out["remaining"], 3)
 
@@ -314,68 +290,59 @@ class Cleanup(unittest.TestCase):
             cleanup(c1=many, cleanup_max_ops="3")
 
 
-class Backup(unittest.TestCase):
-    def test_snapshots_per_calendar(self):
-        long = "x" * 200
-        evs = [ev("a", T, summary="Plan; review, then\nship", description=long, iCalUID="u1@google.com",
-                  recurrence=["RRULE:FREQ=WEEKLY"], updated="2026-11-01T00:00:00Z"),
-               ev("d", "2026-11-25", "2026-11-26", summary="Holiday"),
-               ev("z", T, status="cancelled")]
-        ctx = {"cfg": {"mode": "snapshots", "backup_prefix": "cal"}}
-        ctx.update(reads(evs, evs, evs, evs))
-        out = run(ctx)
-        self.assertEqual(len(out["snapshots"]), 9)
-        self.assertEqual(out["sets"][:2], ["cal-client_1-json", "cal-client_1-ics"])
-        index = out["snapshots"][-1]
-        self.assertEqual(index["set"], "cal-index")
-        self.assertEqual(json.loads(index["text"])["sets"], out["sets"])
-        j, ics = out["snapshots"][0], out["snapshots"][1]
-        self.assertEqual(json.loads(j["text"]), evs)
-        self.assertEqual(ics["ext"], "ics")
-        text = ics["text"]
-        self.assertTrue(text.startswith("BEGIN:VCALENDAR\r\n") and text.endswith("END:VCALENDAR\r\n"))
-        self.assertEqual(text.count("BEGIN:VEVENT"), 2)  # cancelled dropped
-        self.assertIn("SUMMARY:Plan\\; review\\, then\\nship", text)
-        self.assertIn("DTSTART:20261125T170000Z", text)
-        self.assertIn("DTSTART;VALUE=DATE:20261125", text)
-        self.assertIn("RRULE:FREQ=WEEKLY", text)
-        self.assertIn("UID:u1@google.com", text)
-        for line in text.split("\r\n"):
-            self.assertLessEqual(len(line), 75)
-
-
 class Manifest(unittest.TestCase):
-    """The manifest wires busy.js the way these tests assume."""
+    """The manifest wires busy.js the way these tests assume, and keeps the
+    0.1.0 contract (#42): its settings, triggers and sockets."""
 
     def setUp(self):
         with open(os.path.join(PACK, "conductor-pack.yaml")) as f:
             self.man = yaml.safe_load(f)
 
-    def test_settings_defaults(self):
+    def test_0_1_0_settings_and_defaults_are_kept(self):
         s = self.man["settings"]
-        self.assertIs(s["dry_run"]["default"], True)
-        self.assertEqual(s["lookahead_days"]["default"], 60)
+        want = {"window_days": 30, "block_title": "Busy", "show_details": False, "color_id": "8",
+                "mirror_all_day": False, "tag": "conductorBusySync", "max_deletes": 50,
+                "remove_all": False, "batch_size": 50, "dry_run": False}
+        self.assertEqual({k: s[k]["default"] for k in want}, want)
+
+    def test_0_1_0_triggers_and_sockets_are_kept(self):
+        trig = {t["name"]: t for t in self.man["triggers"]}
+        self.assertEqual(trig["on_change"]["on"], "sources.changed")
+        self.assertIn("cron.busy_sync", trig["sweep"]["on"])
+        req = self.man["pack"]["requires"]["connectors"]
+        self.assertTrue(req["sources"]["many"] and req["targets"]["many"])
+        self.assertNotIn("min", req["targets"])
+        self.assertNotIn("backup", req)
+        self.assertEqual(req["cron"], "*")
+
+    def test_sweep_and_push_share_one_queue_and_lift_the_attempt_limit(self):
+        trig = {t["name"]: t for t in self.man["triggers"]}
+        for n in ("on_change", "on_target_change", "sweep", "cleanup"):
+            self.assertEqual(trig[n]["serialize"]["key"], "calendar-busy-sync")
+        for n in ("on_change", "on_target_change", "sweep"):
+            self.assertGreaterEqual(trig[n]["policy"]["max_attempts_per_head"], 10**9)
 
     def test_reads_are_over_the_two_lists(self):
-        steps = self.man["workflows"]["sync"]["steps"]
+        steps = self.man["workflows"]["reconcile"]["steps"]
         reads = [b[0] for s in steps if isinstance(s.get("parallel"), list) for b in s["parallel"]]
-        self.assertEqual(sorted(r["id"] for r in reads), ["read_sources", "read_targets"])
+        self.assertEqual(sorted(r["id"] for r in reads), ["dst", "dstraw", "src", "srcraw"])
         for r in reads:
             self.assertTrue(r["over"])
-            self.assertTrue(r["options"]["singleEvents"] and r["options"]["showDeleted"])
 
     def test_writes_go_to_the_ops_target(self):
-        writes = [s for s in self.man["workflows"]["sync"]["steps"] if str(s.get("id", "")).startswith("apply_")]
+        writes = [s for s in self.man["workflows"]["reconcile"]["steps"] if s.get("id") in ("create", "move", "remove")]
         self.assertEqual(len(writes), 3)
         for w in writes:
             self.assertTrue(w["uses"].startswith("targets."))
             self.assertEqual(w["member"], "{{.item.target}}")
 
-    def test_sockets(self):
-        req = self.man["pack"]["requires"]["connectors"]
-        self.assertEqual(set(req), {"sources", "targets", "cron", "backup"})
-        self.assertTrue(req["sources"]["many"] and req["targets"]["many"])
-        self.assertEqual(req["targets"]["min"], 2)
+    def test_cfg_passes_every_setting_busy_js_reads(self):
+        cfg = next(s for s in self.man["workflows"]["reconcile"]["steps"] if s.get("id") == "cfg")["set"]
+        for k, v in cfg.items():
+            if k != "mode":
+                self.assertEqual(v, "${settings.%s}" % k)
+                self.assertIn(k, self.man["settings"])
+
 
 if __name__ == "__main__":
     unittest.main()

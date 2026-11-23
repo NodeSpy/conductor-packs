@@ -1,264 +1,270 @@
 # calendar-busy-sync — a distributable conductor pack.
 #
-# Keeps "Busy" blocks in sync across Google calendars, the way BusyBridge's
-# Ghost-Main mode does, with no UI and no database. Two lists of
-# google-calendar connectors, as many as you like in each:
+# Keep several Google calendars honest about when you are busy. Every event on
+# a SOURCE calendar gets a private "Busy" block on every other TARGET calendar,
+# so someone booking you on one calendar sees the time the others already
+# hold. Blocks follow the source: moved when it moves, removed when it is
+# cancelled, declined, or marked free. A repeating event gets one repeating
+# block.
 #
-#   sources   read-only calendars (e.g. a personal Gmail, a calendar at
-#             another org you can only read)
-#   targets   the calendars that RECEIVE busy blocks; each is also a source
-#             for every other target
+# Pure verbs + js steps — no agent, no model, no cost. No database: the
+# calendars are the state. Each block carries a private extended property
+# naming the source event it stands for, so a rerun is a no-op and a missed
+# run is caught up by the next.
 #
-# Rules (BusyBridge's, see README "Rules"):
-#   source -> every target     timed events only (all-day: sync_personal_all_day)
-#                              — a Free event still blocks
-#   target -> other targets    all-day events block too; a Free event does not
-#   every calendar             skips cancelled, declined, out-of-office, and any
-#                              event whose description has `[nosync]`
-#   blocks                     "Busy", opaque, private, tagged `[Busy]` in the
-#                              description; past blocks are left as they are
+# Two rule sets (`rules:`):
+#   uniform     (default) every source calendar is treated the same: what
+#               shows as busy, and you have not declined, blocks the others
+#   busybridge  BusyBridge's "Ghost Main" rules: a calendar only in `sources`
+#               is read-only/personal (its Free events still block, all-day
+#               only with mirror_all_day); a calendar in `targets` blocks the
+#               other targets with its all-day events too, never its Free ones
 #
-# State lives in the calendars themselves: each block has a deterministic id
-# (cbs + 32 hex, from target/source/source-event) and
-# extendedProperties.private.cbs=1, so every run recomputes the full diff
-# from what Google says and is idempotent. Push (`<conn>.changed`) gives
-# seconds of latency; the cron schedule is the backstop.
+# Triggers: on_change / on_target_change (Google push), sweep (cron backstop
+# + manual), cleanup (manual, one-time: retire BusyBridge's blocks).
+# Backups of the calendars are the sibling pack `calendar-backup`.
 #
-# Triggers: sync (push + cron + manual), backup (nightly JSON + ICS through
-# the backup connector), verify (weekly restore test), cleanup (manual,
-# one-time: retire BusyBridge's own blocks from today on, keep the past).
-#
-# INSTALL — see README.md for the full config (connectors, auth, push).
+# Install (in your config's `packs:` block — see README.md for the full config
+# and the Google OAuth setup):
+#   packs:
+#     busy:
+#       source: github.com/NodeSpy/conductor-packs//calendar-busy-sync
+#       version: "~> 1.0"
+#       connectors:
+#         sources: [cal-personal, cal-work, cal-side]   # whose events block time
+#         targets: [cal-work, cal-side]                 # where the blocks are written
+#         cron: timer
+#       triggers:
+#         sweep:     { enabled: true }   # the periodic pass; keep it armed
+#         on_change: { enabled: true }   # optional: push-driven, needs watch: on each source
 
 pack:
   name: calendar-busy-sync
   version: 1.0.0
-  description: Mirror busy time across any number of Google calendars as private "Busy" blocks (BusyBridge's rules), driven by Google push with a cron backstop; nightly ICS/JSON backups with restore tests; a one-time BusyBridge cleanup.
-  tags: [calendar, google-calendar, busy, sync, backup]
+  description: Mirror busy time across any number of Google calendars as private "Busy" blocks, kept in step by Google push plus a sweep; one repeating block per repeating event; optional BusyBridge rules and a one-time BusyBridge cleanup. Pure verbs, no agent.
+  tags: [calendar, google-calendar, busy, scheduling, sync]
   homepage: https://github.com/NodeSpy/conductor-packs
   license: Apache-2.0
   requires:
-    # >=0.106.0: list sockets (many: true) with over:/member: steps and
-    # {{.connector}}.
+    # >=0.106.0: list sockets (`many: true`) and the `over:`/`member:` step
+    # fields that address them.
     conductor: ">=0.106.0"
     connectors:
-      # google-calendar >=1.2.0: `events` follows every result page (a 60-day
-      # window is often more than Google's first 250), and the `changed` push
-      # source.
+      # List sockets: you name every calendar the pack may read and write. A
+      # calendar may sit in both lists (two work calendars that block each
+      # other); it never receives a block for its own events.
+      # google-calendar >=1.2.0: the `changed` push source and paged `events`.
       sources: { many: true, type: google-calendar, version: ">=1.2.0" }
-      targets: { many: true, min: 2, type: google-calendar, version: ">=1.2.0" }
+      targets: { many: true, type: google-calendar, version: ">=1.2.0" }
+      # The sweep schedule. Your cron connector must declare `busy_sync`.
       cron: "*"
-      backup: ">=1.0.0"
 
 settings:
-  dry_run:
-    type: boolean
-    default: true
-    desc: "Plan only: the sync reads, computes, and reports what it would write, and writes nothing. Watch a few runs, then set false."
-  lookahead_days:
+  # ---- what gets a block
+  rules:
+    type: string
+    default: uniform
+    desc: "uniform: every source is treated the same. busybridge: BusyBridge's rules — a calendar only in sources still blocks with its Free events; a target's all-day events block the other targets."
+  window_days:
     type: integer
-    default: 60
-    desc: "How far ahead blocks are kept, in days from now."
-  busy_title:
+    default: 30
+    desc: "How far ahead to mirror. Blocks beyond this appear as the window rolls forward."
+  mirror_all_day:
+    type: boolean
+    default: false
+    desc: "Also mirror all-day events that are marked busy (busybridge: all-day events of the source-only calendars; a target's always block). Off by default: most all-day events are reminders."
+  sync_out_of_office:
     type: string
-    default: Busy
-    desc: "Title of every busy block."
-  managed_tag:
-    type: string
-    default: "[Busy]"
-    desc: "Written as each block's description, so you can search a calendar for every block this pack owns."
+    default: ""
+    desc: "Mirror out-of-office events: true or false. Empty: the rules decide (uniform mirrors them, busybridge does not)."
   nosync_tag:
     type: string
     default: "[nosync]"
-    desc: "An event whose description contains this (any case) is never mirrored."
-  sync_personal_all_day:
+    desc: "An event whose description contains this (any case) is never mirrored. Empty turns it off."
+  skip_already_busy:
+    type: boolean
+    default: true
+    desc: "No block for a source event the target already shows as busy on its own (a slot you blocked by hand, or the same commitment entered on both calendars)."
+  repeating_blocks:
+    type: boolean
+    default: true
+    desc: "A repeating event gets one repeating block. Off: a block per occurrence, as BusyBridge does."
+  # ---- what a block looks like
+  block_title:
+    type: string
+    default: Busy
+    desc: "Title of a block. Used for every block unless show_details is on."
+  show_details:
     type: boolean
     default: false
-    desc: "Mirror all-day events from the source (read-only) calendars. Target all-day events always mirror."
-  sync_out_of_office:
+    desc: "Copy the source event's title onto the block instead of block_title. Blocks stay private either way."
+  color_id:
+    type: string
+    default: "8"
+    desc: "Google event colour id for blocks (1-11; 8 is graphite). Empty leaves the calendar's own colour."
+  managed_tag:
+    type: string
+    default: ""
+    desc: "Written as each block's description, so you can search a calendar for every block (e.g. [Busy]). Empty: no description."
+  tag:
+    type: string
+    default: conductorBusySync
+    desc: "Private extended-property name that marks a block as this pack's. Change it only to run two independent instances over the same calendar."
+  # ---- guards
+  dry_run:
     type: boolean
     default: false
-    desc: "Mirror out-of-office events. Off: OOO on one calendar does not block the others."
-  max_writes:
-    type: integer
-    default: 200
-    desc: "Writes per run. The rest is deferred to the next run (the first fill takes a few)."
+    desc: "Plan and log only; create, move and delete nothing. Start with it on."
   max_deletes:
     type: integer
     default: 50
-    desc: "A run that would delete more blocks than this fails instead (a source that read back empty looks exactly like that)."
-  max_fan_out:
+    desc: "Refuse a run that would delete more than this many blocks whose source events have vanished — a guard against a bad read wiping every block."
+  batch_size:
     type: integer
-    default: 100
-    desc: "Most writes of one kind (create/update/delete) per run, across all calendars. Keep it at or under your policy.max_fan_out (default 100)."
-  backup_tiers:
-    type: string
-    default: ""
-    desc: "Comma-separated backup tiers to write and verify. Empty: every tier of the bound backup connector."
-  backup_prefix:
-    type: string
-    default: calendar
-    desc: "Backup set names are <prefix>-<connector>-json / -ics (e.g. calendar-gcal-work-ics), plus <prefix>-index."
-  backup_days_back:
-    type: integer
-    default: 365
-    desc: "The backup covers events from this many days ago..."
-  backup_days_ahead:
-    type: integer
-    default: 730
-    desc: "...to this many days ahead (recurring events are kept as one series)."
+    default: 50
+    desc: "Most blocks created, moved or removed per run (each counted separately); the BusyBridge cleanup uses it too. The rest follow on the next runs. Keep it under your policy.max_fan_out (100 by default)."
+  remove_all:
+    type: boolean
+    default: false
+    desc: "Remove every block in the window (and a year back) instead of syncing. Leave it on for a few sweeps before uninstalling, then disarm."
+  # ---- BusyBridge cleanup
   cleanup_max_ops:
     type: integer
     default: 1000
-    desc: "The cleanup refuses to make more changes than this in one run."
+    desc: "The BusyBridge cleanup refuses to make more changes than this in total."
 
 workflows:
-  # ---------------------------------------------------------------- sync
-  sync:
-    description: "Read every calendar's next lookahead_days, diff the busy blocks each target should hold against the ones it does, and write the difference."
+  # One full reconcile. Stateless: it reads every source and target for the
+  # window, works out which blocks should exist, and makes the targets match.
+  # Running it twice is a no-op, so the push trigger and the sweep share it.
+  reconcile:
+    description: "Make every target calendar's busy blocks match the source calendars' events."
     steps:
+      # Settings are substituted as text, so they cross into js as strings.
       - id: cfg
         set:
           mode: plan
-          dry_run: "${settings.dry_run}"
-          lookahead_days: "${settings.lookahead_days}"
-          busy_title: "${settings.busy_title}"
+          rules: "${settings.rules}"
+          window_days: "${settings.window_days}"
+          block_title: "${settings.block_title}"
+          show_details: "${settings.show_details}"
+          color_id: "${settings.color_id}"
           managed_tag: "${settings.managed_tag}"
-          nosync_tag: "${settings.nosync_tag}"
-          sync_personal_all_day: "${settings.sync_personal_all_day}"
+          mirror_all_day: "${settings.mirror_all_day}"
           sync_out_of_office: "${settings.sync_out_of_office}"
-          max_writes: "${settings.max_writes}"
+          nosync_tag: "${settings.nosync_tag}"
+          skip_already_busy: "${settings.skip_already_busy}"
+          repeating_blocks: "${settings.repeating_blocks}"
+          tag: "${settings.tag}"
           max_deletes: "${settings.max_deletes}"
-          max_fan_out: "${settings.max_fan_out}"
-      - id: win
+          batch_size: "${settings.batch_size}"
+          remove_all: "${settings.remove_all}"
+
+      - id: window
         use: js
         code: |
-          const days = Number(ctx.cfg.lookahead_days);
-          if (!(days > 0)) throw new Error("lookahead_days must be a positive number");
+          const days = parseInt(ctx.cfg.window_days, 10);
+          if (!(days > 0)) throw new Error("window_days must be a positive integer");
           const now = new Date();
-          return { min: now.toISOString(), max: new Date(now.getTime() + days * 86400000).toISOString() };
-      # showDeleted: a block deleted by hand comes back cancelled, and its id
-      # can never be created again — the plan restores it instead.
+          if (now.getUTCFullYear() < 2025) throw new Error("js clock looks wrong: " + now.toISOString());
+          const back = String(ctx.cfg.remove_all) === "true" ? 366 : 0;
+          return {
+            timeMin: new Date(now.getTime() - back * 86400000).toISOString(),
+            timeMax: new Date(now.getTime() + days * 86400000).toISOString(),
+          };
+
+      # Every calendar is read twice. EXPANDED (singleEvents), each occurrence
+      # of a repeating event is its own item: that decides which occurrences
+      # need a block. RAW, a repeating event is one item carrying its
+      # recurrence rule, plus one item per changed or cancelled occurrence:
+      # that is what lets a repeating event get ONE repeating block.
+      # The targets are read whole (not just this pack's blocks): the plan
+      # also needs the target's own events. A failed read fails the run here —
+      # nothing is deleted on a partial picture.
       - parallel:
-          - - { id: read_sources, uses: sources.events, over: true, parallel: true, progress: reading source calendars,
-                options: { timeMin: "{{.win.min}}", timeMax: "{{.win.max}}", singleEvents: true, showDeleted: true, maxResults: 2500 } }
-          - - { id: read_targets, uses: targets.events, over: true, parallel: true, progress: reading target calendars,
-                options: { timeMin: "{{.win.min}}", timeMax: "{{.win.max}}", singleEvents: true, showDeleted: true, maxResults: 2500 } }
+          - - { id: src, uses: sources.events, over: true, parallel: true, progress: reading source calendars,
+                options: { timeMin: "{{.window.timeMin}}", timeMax: "{{.window.timeMax}}", singleEvents: true, maxResults: 2500 } }
+          - - { id: srcraw, uses: sources.events, over: true, parallel: true,
+                options: { timeMin: "{{.window.timeMin}}", timeMax: "{{.window.timeMax}}", singleEvents: false, maxResults: 2500 } }
+          - - { id: dst, uses: targets.events, over: true, parallel: true, progress: reading target calendars,
+                options: { timeMin: "{{.window.timeMin}}", timeMax: "{{.window.timeMax}}", singleEvents: true, maxResults: 2500 } }
+          - - { id: dstraw, uses: targets.events, over: true, parallel: true,
+                options: { timeMin: "{{.window.timeMin}}", timeMax: "{{.window.timeMax}}", singleEvents: false, maxResults: 2500 } }
+
       - id: plan
         use: js
         code: "file:${pack.dir}/busy.js"
-      - log: "busy sync: {{.plan.summary}}{{if .plan.dry_run}} (dry run, nothing written: {{.plan.would}}){{end}}{{if .plan.deferred}} — {{.plan.deferred}} deferred to the next run{{end}}"
-      # Writes. Deletes first (they free time), then creates, then repairs.
-      # Each op names its target calendar, and member: sends it there (and
-      # only to a calendar in the targets list). Each fans out 8-wide and
+
+      - log: "calendar-busy-sync: {{.plan.summary}}{{if ${settings.dry_run}}} (dry run: nothing written){{end}}"
+
+      # Writes: each op names its target calendar, and member: sends it there
+      # (and only to a calendar in the targets list). Each fans out 8-wide and
       # keeps going past a failed item; `applied` fails the run at the end if
       # any did, and the next run retries.
-      - { id: apply_delete, for_each: "{{.plan.delete}}", parallel: true, continue_on_error: true, progress: removing stale blocks,
+      - { id: remove, if: "!${settings.dry_run}", for_each: "{{.plan.deletes}}", parallel: true, continue_on_error: true, progress: removing blocks,
           uses: targets.event_delete, member: "{{.item.target}}", options: { event_id: "{{.item.event_id}}" } }
-      - { id: apply_create, for_each: "{{.plan.create}}", parallel: true, continue_on_error: true, progress: adding blocks,
+      - { id: create, if: "!${settings.dry_run}", for_each: "{{.plan.creates}}", parallel: true, continue_on_error: true, progress: adding blocks,
           uses: targets.event_create, member: "{{.item.target}}", options: { event: "{{.item.event}}" } }
-      - { id: apply_update, for_each: "{{.plan.update}}", parallel: true, continue_on_error: true, progress: repairing blocks,
+      - { id: move, if: "!${settings.dry_run}", for_each: "{{.plan.updates}}", parallel: true, continue_on_error: true, progress: changing blocks,
           uses: targets.event_update, member: "{{.item.target}}", options: { event_id: "{{.item.event_id}}", event: "{{.item.event}}" } }
       - id: applied
         use: js
         code: |
-          const bad = ["apply_delete", "apply_create", "apply_update"].filter((k) => ctx[k] && ctx[k].failed);
+          const bad = ["remove", "create", "move"].filter((k) => ctx[k] && ctx[k].failed);
           if (bad.length) throw new Error("some block writes failed, the next run retries them: " + bad.map((k) => k + ": " + ctx[k].error).join("; "));
-          return { writes: ctx.plan.writes };
+          return { pending: ctx.plan.pending };
 
-  # ---------------------------------------------------------------- backup
-  backup:
-    description: "Snapshot every calendar (raw API JSON, re-insertable, and ICS) into the backup connector's tiers; unchanged snapshots are skipped, each tier's retention applies."
-    steps:
-      - id: cfg
-        set: { mode: snapshots, backup_prefix: "${settings.backup_prefix}" }
-      - id: win
-        use: js
-        code: |
-          const back = Number("${settings.backup_days_back}"), ahead = Number("${settings.backup_days_ahead}");
-          const now = Date.now();
-          const tiers = "${settings.backup_tiers}".split(",").map((s) => s.trim()).filter(Boolean);
-          return { min: new Date(now - back * 86400000).toISOString(), max: new Date(now + ahead * 86400000).toISOString(), tiers: tiers };
-      - parallel:
-          - - { id: read_sources, uses: sources.events, over: true, parallel: true,
-                options: { timeMin: "{{.win.min}}", timeMax: "{{.win.max}}", singleEvents: false, maxResults: 2500, max_pages: 200 } }
-          - - { id: read_targets, uses: targets.events, over: true, parallel: true,
-                options: { timeMin: "{{.win.min}}", timeMax: "{{.win.max}}", singleEvents: false, maxResults: 2500, max_pages: 200 } }
-      - id: snap
-        use: js
-        code: "file:${pack.dir}/busy.js"
-      - id: put
-        for_each: "{{.snap.snapshots}}"
-        progress: writing backups
-        uses: backup.put
-        options: { set: "{{.item.set}}", ext: "{{.item.ext}}", text: "{{.item.text}}", tiers: "{{.win.tiers}}" }
+# conductor counts every run of a trigger against one target as an "attempt",
+# backs off past max_attempts_per_head (3 by default) and PARKS the trigger for
+# good at twice that. That suits a fixer retrying one PR; a calendar or a cron
+# schedule is one target forever, so a sweep would stop after six runs. These
+# triggers are meant to run indefinitely, so the threshold is lifted. One run
+# at a time per trigger, and the calendar-writing triggers share one
+# serialize key, so two reconciles (or a reconcile and the cleanup) never race.
+x-policy:
+  always: &always
+    max_attempts_per_head: 1000000000
+    concurrency: { max_runs: 1 }
 
-  # ---------------------------------------------------------------- verify
-  verify:
-    description: "Restore test: restore each set's newest snapshot from every tier and check it against its recorded sha256/size, plus the backend's own consistency check."
-    steps:
-      - id: names
-        use: js
-        code: |
-          const tiers = "${settings.backup_tiers}".split(",").map((s) => s.trim()).filter(Boolean);
-          return { index: "${settings.backup_prefix}-index", tiers: tiers };
-      # The nightly backup writes an index of its sets; restore it first (an
-      # integrity-checked read), then test every set it names.
-      - id: index
-        uses: backup.read
-        options: { set: "{{.names.index}}" }
-      - id: sets
-        use: js
-        code: |
-          const sets = JSON.parse(ctx.index.content).sets;
-          if (!Array.isArray(sets) || !sets.length) throw new Error("the index names no sets");
-          return { sets: [ctx.names.index].concat(sets) };
-      - id: verify
-        for_each: "{{.sets.sets}}"
-        progress: restore-testing backups
-        continue_on_error: true
-        uses: backup.verify
-        options: { set: "{{.item}}", mode: both, sample: 1, tiers: "{{.names.tiers}}" }
-      - id: verified
-        use: js
-        code: |
-          if (ctx.verify.failed) throw new Error("restore test failed: " + ctx.verify.error);
-          const bad = [];
-          (ctx.verify.items || []).forEach((r, i) => { if (!r || r.ok !== true) bad.push(ctx.sets.sets[i]); });
-          if (bad.length) throw new Error("restore test failed for: " + bad.join(", "));
-          return { verified: (ctx.verify.items || []).length };
-
+# Every trigger ships DISARMED. Arming one in the instance block is the
+# consent to what it does.
 triggers:
-  # Push from any calendar, the cron backstop, or `conductor run <inst>/sync`.
-  # One sync at a time (a burst of pushes queues behind the running sync, and
-  # the queued one re-reads everything, so nothing is missed). The writes a
-  # sync makes push back a `changed` of their own; that run finds nothing to do.
-  - name: sync
-    "on":
-      - sources.changed
-      - targets.changed
-      - cron.busy_sync
-      - manual
+  # Push-driven: fires seconds after a source calendar changes (the
+  # connector's `changed` source; needs `watch:` on each source connector).
+  - name: on_change
+    "on": sources.changed
+    policy: *always
     serialize: { key: calendar-busy-sync }
     steps:
-      - { id: run, workflow: sync }
+      - call: reconcile
 
-  - name: backup
-    "on": [cron.busy_backup, manual]
-    serialize: { key: calendar-busy-sync-backup }
+  # Push from the targets: a block deleted or moved by hand, or time that is
+  # now busy there, is put right in seconds instead of at the next sweep. A
+  # separate trigger, since a calendar may sit in both lists (and a push
+  # source can appear only once per trigger); a calendar in both lists then
+  # queues one extra reconcile per change, which finds nothing to do.
+  - name: on_target_change
+    "on": targets.changed
+    policy: *always
+    serialize: { key: calendar-busy-sync }
     steps:
-      - { id: run, workflow: backup }
+      - call: reconcile
 
-  - name: verify
-    "on": [cron.busy_verify, manual]
-    serialize: { key: calendar-busy-sync-backup }
+  # The backstop, and `conductor run <inst>/sweep`. Google push is best-effort
+  # and nothing arrives while the daemon is down, so a periodic pass turns a
+  # missed push into latency rather than a missing block. It also rolls the
+  # window forward. KEEP IT ARMED.
+  - name: sweep
+    "on": [cron.busy_sync, manual]
+    policy: *always
+    serialize: { key: calendar-busy-sync }
     steps:
-      - { id: run, workflow: verify }
+      - call: reconcile
 
-  # Manual only: `conductor run <inst>/cleanup` reports; add
-  # `--input apply=true` to make the changes. Shares the sync's key, so it
-  # never runs alongside a sync. Up to max_fan_out deletes and series-ends
-  # per run: a large cleanup says how many remain, so run it again.
+  # Manual only, one-time: retire BusyBridge's own blocks on the targets.
+  # `conductor run <inst>/cleanup` reports; add `--input apply=true` to make
+  # the changes. Up to batch_size deletes and series-ends per run: a large
+  # cleanup says how many remain, so run it again.
   - name: cleanup
     "on": manual
     serialize: { key: calendar-busy-sync }
@@ -269,13 +275,13 @@ triggers:
           mode: cleanup
           cleanup_apply: "{{.inputs.apply}}"
           cleanup_max_ops: "${settings.cleanup_max_ops}"
-          max_fan_out: "${settings.max_fan_out}"
+          batch_size: "${settings.batch_size}"
       - id: win
         use: js
         code: "return { min: new Date().toISOString() };"
-      # Not expanded: a recurring series is one master (whose RRULE gets an
+      # Not expanded: a repeating series is one master (whose RRULE gets an
       # UNTIL) plus its exceptions, not hundreds of instances.
-      - { id: read_targets, uses: targets.events, over: true, parallel: true,
+      - { id: dstraw, uses: targets.events, over: true, parallel: true,
           options: { timeMin: "{{.win.min}}", singleEvents: false, maxResults: 2500, max_pages: 200 } }
       - id: plan
         use: js
