@@ -1,0 +1,142 @@
+# calendar-backup — a distributable conductor pack.
+#
+# Nightly snapshots of any number of Google calendars into a backup
+# connector's tiers, and a weekly restore test. Per calendar, two snapshots:
+# the raw API JSON (lossless, re-insertable through the API) and an ICS file
+# any calendar app imports; plus an index of every set, which the restore
+# test reads. Unchanged snapshots are skipped; each tier's retention applies.
+#
+# Pure verbs + one js step — no agent, no model, no cost. Read-only on the
+# calendars: it never writes to them.
+#
+# Install (in your config's `packs:` block):
+#   packs:
+#     calbak:
+#       source: github.com/NodeSpy/conductor-packs//calendar-backup
+#       version: "~> 1.0"
+#       connectors:
+#         calendars: [cal-personal, cal-work, cal-side]
+#         cron: timer              # schedules busy_backup + busy_verify
+#         backup: calbackup        # a `backup` connector and its tiers
+#       triggers:
+#         backup: { enabled: true }
+#         verify: { enabled: true }
+
+pack:
+  name: calendar-backup
+  version: 1.0.0
+  description: Nightly JSON + ICS snapshots of any number of Google calendars into a backup connector's tiers, with a weekly restore test. Read-only on the calendars. Pure verbs, no agent.
+  tags: [calendar, google-calendar, backup]
+  homepage: https://github.com/NodeSpy/conductor-packs
+  license: Apache-2.0
+  requires:
+    # >=0.106.0: list sockets (`many: true`) and `over:` steps.
+    conductor: ">=0.106.0"
+    connectors:
+      # google-calendar >=1.2.0: `events` follows every result page.
+      calendars: { many: true, type: google-calendar, version: ">=1.2.0" }
+      # Your cron connector must declare `busy_backup` and `busy_verify`.
+      cron: "*"
+      backup: ">=1.0.0"
+
+settings:
+  backup_tiers:
+    type: string
+    default: ""
+    desc: "Comma-separated backup tiers to write and verify. Empty: every tier of the bound backup connector."
+  backup_prefix:
+    type: string
+    default: calendar
+    desc: "Set names are <prefix>-<connector>-json / -ics (e.g. calendar-cal-work-ics), plus <prefix>-index."
+  backup_days_back:
+    type: integer
+    default: 365
+    desc: "The backup covers events from this many days ago..."
+  backup_days_ahead:
+    type: integer
+    default: 730
+    desc: "...to this many days ahead (repeating events are kept as one series)."
+
+workflows:
+  backup:
+    description: "Snapshot every calendar (raw API JSON, re-insertable, and ICS) into the backup connector's tiers; unchanged snapshots are skipped, each tier's retention applies."
+    steps:
+      - id: cfg
+        set: { backup_prefix: "${settings.backup_prefix}" }
+      - id: win
+        use: js
+        code: |
+          const back = Number("${settings.backup_days_back}"), ahead = Number("${settings.backup_days_ahead}");
+          const now = Date.now();
+          const tiers = "${settings.backup_tiers}".split(",").map((s) => s.trim()).filter(Boolean);
+          return { min: new Date(now - back * 86400000).toISOString(), max: new Date(now + ahead * 86400000).toISOString(), tiers: tiers };
+      # Not expanded: a repeating event is one series, not hundreds of items.
+      - { id: read, uses: calendars.events, over: true, parallel: true, progress: reading calendars,
+          options: { timeMin: "{{.win.min}}", timeMax: "{{.win.max}}", singleEvents: false, maxResults: 2500, max_pages: 200 } }
+      - id: snap
+        use: js
+        code: "file:${pack.dir}/snapshots.js"
+      - id: put
+        for_each: "{{.snap.snapshots}}"
+        progress: writing backups
+        uses: backup.put
+        options: { set: "{{.item.set}}", ext: "{{.item.ext}}", text: "{{.item.text}}", tiers: "{{.win.tiers}}" }
+
+  verify:
+    description: "Restore test: restore each set's newest snapshot from every tier and check it against its recorded sha256/size, plus the backend's own consistency check."
+    steps:
+      - id: names
+        use: js
+        code: |
+          const tiers = "${settings.backup_tiers}".split(",").map((s) => s.trim()).filter(Boolean);
+          return { index: "${settings.backup_prefix}-index", tiers: tiers };
+      # The nightly backup writes an index of its sets; restore it first (an
+      # integrity-checked read), then test every set it names.
+      - id: index
+        uses: backup.read
+        options: { set: "{{.names.index}}" }
+      - id: sets
+        use: js
+        code: |
+          const sets = JSON.parse(ctx.index.content).sets;
+          if (!Array.isArray(sets) || !sets.length) throw new Error("the index names no sets");
+          return { sets: [ctx.names.index].concat(sets) };
+      - id: verify
+        for_each: "{{.sets.sets}}"
+        progress: restore-testing backups
+        continue_on_error: true
+        uses: backup.verify
+        options: { set: "{{.item}}", mode: both, sample: 1, tiers: "{{.names.tiers}}" }
+      - id: verified
+        use: js
+        code: |
+          if (ctx.verify.failed) throw new Error("restore test failed: " + ctx.verify.error);
+          const bad = [];
+          (ctx.verify.items || []).forEach((r, i) => { if (!r || r.ok !== true) bad.push(ctx.sets.sets[i]); });
+          if (bad.length) throw new Error("restore test failed for: " + bad.join(", "));
+          return { verified: (ctx.verify.items || []).length };
+
+# conductor counts every run of a trigger against one target as an "attempt"
+# and parks a trigger past twice max_attempts_per_head (3 by default) — a cron
+# schedule is one target forever, so a nightly backup would stop after six
+# nights. Lifted here; one run at a time, and verify never overlaps backup.
+x-policy:
+  always: &always
+    max_attempts_per_head: 1000000000
+    concurrency: { max_runs: 1 }
+
+# Both ship DISARMED.
+triggers:
+  - name: backup
+    "on": [cron.busy_backup, manual]
+    policy: *always
+    serialize: { key: calendar-backup }
+    steps:
+      - call: backup
+
+  - name: verify
+    "on": [cron.busy_verify, manual]
+    policy: *always
+    serialize: { key: calendar-backup }
+    steps:
+      - call: verify
