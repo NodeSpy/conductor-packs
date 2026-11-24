@@ -55,26 +55,15 @@ the target already shows as busy gets no block either (`skip_already_busy`):
 a slot you had already blocked by hand. If the target's own event goes away
 later, the block appears on the next run.
 
-## Rules
+## What blocks time
 
-Two rule sets, picked with `rules:`.
+An event blocks time on the other calendars when it shows as busy and you
+have not declined it. That includes all-day events marked busy (Google makes
+all-day events Free unless you say otherwise, so birthdays and reminders never
+block) and out-of-office. Skipped: events marked Free, declined invitations,
+working-location entries, and any event with `[nosync]` in its description.
 
-**`uniform`** (the default) treats every source the same:
-
-| blocks | skipped |
-|---|---|
-| what shows as busy and you have not declined, out-of-office included | marked Free, declined, working-location entries, `[nosync]`, all-day (unless `mirror_all_day`) |
-
-**`busybridge`** follows BusyBridge's "Ghost Main" rules. A calendar only in
-`sources` is a read-only, personal calendar; a calendar in `targets` is one
-you are booked through:
-
-| source | blocks | all-day | marked Free | declined / out-of-office / `[nosync]` |
-|---|---|---|---|---|
-| only in `sources` | every target | skipped (`mirror_all_day`) | **still blocks** | skipped |
-| in `targets` | every other target | blocks | skipped | skipped |
-
-`sync_out_of_office: true` or `false` overrides either rule set's choice.
+Every calendar follows the same rule, whichever list it is in.
 
 ## Requires
 
@@ -262,9 +251,9 @@ Don't let the two run side by side: BusyBridge would mirror this pack's
 blocks. This pack already ignores BusyBridge's (its `bb…` ids or `bb_proj_id`
 property).
 
-1. **Dry runs.** Install with `rules: busybridge` and `dry_run: true`, and let
-   a few sweeps run alongside BusyBridge. Put the calendars BusyBridge treats
-   as personal only in `sources`, and its client calendars in both lists.
+1. **Dry runs.** Install with `dry_run: true`, and let
+   a few sweeps run alongside BusyBridge. Put the calendars you are never
+   booked through only in `sources`, and the rest in both lists.
 2. **Stop BusyBridge.**
 3. **Clean up its blocks.** Arm the `cleanup` trigger. `conductor run
    busy/cleanup` only reports; `conductor run busy/cleanup --input apply=true`
@@ -285,10 +274,9 @@ property).
 
 | Setting | Default | What it does |
 |---|---|---|
-| `rules` | `uniform` | `uniform` or `busybridge` (see [Rules](#rules)) |
-| `window_days` | `30` | How far ahead to mirror |
-| `mirror_all_day` | `false` | Also mirror all-day events that are marked busy (`busybridge`: those of calendars only in `sources`) |
-| `sync_out_of_office` | (rules) | `true` / `false` overrides the rule set |
+| `window_days` | `60` | How far ahead to mirror |
+| `mirror_all_day` | `true` | Mirror all-day events marked busy |
+| `sync_out_of_office` | `true` | Mirror out-of-office events |
 | `nosync_tag` | `[nosync]` | An event whose description has this (any case) is never mirrored. Empty turns it off |
 | `skip_already_busy` | `true` | No block where the target already shows busy on its own |
 | `repeating_blocks` | `true` | One repeating block per repeating event; `false`: one per occurrence |

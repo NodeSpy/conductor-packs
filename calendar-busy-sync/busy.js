@@ -72,18 +72,13 @@ function hasNoSync(e, tag) {
 // plan — the reconcile
 // ---------------------------------------------------------------------------
 function planMode() {
-  const preset = String(cfg.rules || "uniform").trim().toLowerCase();
-  if (preset !== "uniform" && preset !== "busybridge") {
-    throw new Error("rules must be uniform or busybridge, not " + JSON.stringify(cfg.rules));
-  }
   const rules = {
     title: cfg.block_title || "Busy",
     showDetails: bool(cfg.show_details, false),
     colorId: cfg.color_id === undefined ? "8" : String(cfg.color_id),
     description: cfg.managed_tag ? String(cfg.managed_tag) : "",
-    mirrorAllDay: bool(cfg.mirror_all_day, false),
-    // Empty: the rule set decides (uniform mirrors out-of-office, busybridge does not).
-    syncOOO: bool(cfg.sync_out_of_office, preset !== "busybridge"),
+    mirrorAllDay: bool(cfg.mirror_all_day, true),
+    syncOOO: bool(cfg.sync_out_of_office, true),
     repeatingBlocks: bool(cfg.repeating_blocks, true),
     noSyncTag: cfg.nosync_tag === undefined ? "[nosync]" : String(cfg.nosync_tag),
     skipAlreadyBusy: bool(cfg.skip_already_busy, true),
@@ -98,11 +93,6 @@ function planMode() {
   const srcNames = Object.keys(srcBy).sort();
   const dstNames = Object.keys(dstBy).sort();
 
-  // What a source calendar is, for the rules. `uniform` treats every source
-  // the same. `busybridge` tells a read-only calendar (a source only) from
-  // one that is also a target, as BusyBridge's personal and client calendars.
-  const kindOf = (source) => (preset !== "busybridge" ? "any" : source in dstBy ? "target" : "readonly");
-
   const live = (e) => e && e.status !== "cancelled" && e.start && e.end;
   // Someone's real event: never a block, ours or BusyBridge's.
   const real = (e) => live(e) && !tagOf(e) && !isBusyBridge(e);
@@ -115,17 +105,13 @@ function planMode() {
   // Busy on its own calendar: shows as busy, and you have not declined it.
   const busy = (e) => real(e) && e.transparency !== "transparent" && e.eventType !== "workingLocation" && !selfDeclined(e);
 
-  // What gets a block on the other calendars.
-  const blocks = (e, kind) => {
-    if (!real(e)) return false;
-    if (e.eventType === "workingLocation") return false;
+  // What gets a block on the other calendars: an event that shows as busy
+  // and you have not declined. Google makes all-day events Free unless you
+  // mark them busy, so a busy all-day event is a deliberate one.
+  const blocks = (e) => {
+    if (!busy(e)) return false;
     if (e.eventType === "outOfOffice" && !rules.syncOOO) return false;
-    if (selfDeclined(e) || hasNoSync(e, rules.noSyncTag)) return false;
-    // busybridge: a read-only calendar's Free events still block.
-    if (kind === "readonly") return !isAllDay(e) || rules.mirrorAllDay;
-    if (e.transparency === "transparent") return false;
-    // busybridge: a target's all-day events block the other targets.
-    if (kind === "target") return true;
+    if (hasNoSync(e, rules.noSyncTag)) return false;
     return !isAllDay(e) || rules.mirrorAllDay;
   };
 
@@ -253,7 +239,6 @@ function planMode() {
 
     for (const source of removeAll ? [] : srcNames) {
       if (source === target) continue; // a calendar never gets a block for its own events
-      const kind = kindOf(source);
       const masters = new Map();   // repeating events, by id
       const dropped = new Map();   // repeating event id -> original starts of its cancelled occurrences
       for (const r of srcRawBy[source] || []) {
@@ -268,7 +253,7 @@ function planMode() {
       const runs = new Map();      // repeating event id -> its occurrences in the window
       for (const e of srcBy[source]) {
         if (!live(e)) continue;
-        let needs = blocks(e, kind);
+        let needs = blocks(e);
         if (needs) {
           const m = meeting(e);
           // The target already has this meeting itself, or another source

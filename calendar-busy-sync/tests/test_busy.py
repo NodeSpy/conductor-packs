@@ -62,8 +62,7 @@ def per_target(out, kinds):
 
 
 def plan(p1=(), p2=(), c1=(), c2=(), **cfg):
-    """BusyBridge rules, its block look ([Busy] description, no colour)."""
-    c = {"mode": "plan", "rules": "busybridge", "managed_tag": "[Busy]", "color_id": ""}
+    c = {"mode": "plan", "managed_tag": "[Busy]"}
     c.update(cfg)
     ctx = {"cfg": c}
     ctx.update(reads(p1, p2, c1, c2))
@@ -84,8 +83,8 @@ def on(out, block):
 T = "2026-11-25T10:00:00-07:00"
 
 
-class BusyBridgeRules(unittest.TestCase):
-    def test_personal_timed_event_blocks_both_clients(self):
+class Rules(unittest.TestCase):
+    def test_block_shape(self):
         out = plan(p1=[ev("a", T, summary="Dentist", location="Main St")])
         for c in ("client_1", "client_2"):
             self.assertEqual(len(out[c]["creates"]), 1)
@@ -97,44 +96,34 @@ class BusyBridgeRules(unittest.TestCase):
             self.assertEqual(body["reminders"], {"useDefault": False, "overrides": []})
             self.assertEqual(body["start"], {"dateTime": T, "timeZone": "America/Denver"})
             self.assertNotIn("location", body)
-            self.assertNotIn("colorId", body)
             self.assertEqual(body["extendedProperties"]["private"]["conductorBusySync"], "personal_1/a")
 
-    def test_personal_free_event_still_blocks(self):
-        out = plan(p1=[ev("a", T, transparency="transparent")])
-        self.assertEqual(blocked(out, "client_1"), ["a"])
-
-    def test_personal_all_day_skipped_unless_enabled(self):
-        a = ev("a", "2026-11-25", "2026-11-26")
-        self.assertEqual(blocked(plan(p1=[a]), "client_1"), [])
-        self.assertEqual(blocked(plan(p1=[a], mirror_all_day="true"), "client_1"), ["a"])
-
-    def test_client_source_blocks_only_the_other_client(self):
-        out = plan(c1=[ev("m", T)])
+    def test_every_source_follows_the_same_rule(self):
+        evs = [ev("busy", T), ev("free", T, transparency="transparent"),
+               ev("day", "2026-11-25", "2026-11-26"), ev("ooo", T, eventType="outOfOffice")]
+        out = plan(p1=evs)
+        self.assertEqual(blocked(out, "client_1"), ["busy", "day", "ooo"])
+        out = plan(c1=evs)
         self.assertEqual(blocked(out, "client_1"), [])
-        self.assertEqual(blocked(out, "client_2"), ["m"])
+        self.assertEqual(blocked(out, "client_2"), ["busy", "day", "ooo"])
 
-    def test_client_all_day_blocks_but_free_does_not(self):
-        out = plan(c1=[ev("d", "2026-11-25", "2026-11-26"), ev("f", T, transparency="transparent")])
-        self.assertEqual(blocked(out, "client_2"), ["d"])
-        self.assertEqual(out["client_2"]["creates"][0]["event"]["start"], {"date": "2026-11-25"})
+    def test_all_day_and_out_of_office_can_be_turned_off(self):
+        evs = [ev("day", "2026-11-25", "2026-11-26"), ev("ooo", T, eventType="outOfOffice")]
+        out = plan(p1=evs, mirror_all_day="false", sync_out_of_office="false")
+        self.assertEqual(blocked(out, "client_1"), [])
 
     def test_skips(self):
         skipped = [
             ev("x1", T, status="cancelled"),
-            ev("x2", T, eventType="outOfOffice"),
             ev("x3", T, description="lunch [NoSync] please"),
             ev("x4", T, attendees=[{"email": "me@x", "self": True, "responseStatus": "declined"}]),
+            ev("x6", T, eventType="workingLocation"),
             ev("bb0123456789abc", T),  # a BusyBridge block
             ev("x5", T, extendedProperties={"private": {"bb_proj_id": "7"}}),
         ]
         out = plan(p1=skipped, c1=skipped)
         self.assertEqual(blocked(out, "client_1"), [])
         self.assertEqual(blocked(out, "client_2"), [])
-
-    def test_out_of_office_mirrors_when_enabled(self):
-        out = plan(c1=[ev("o", T, eventType="outOfOffice")], sync_out_of_office="true")
-        self.assertEqual(blocked(out, "client_2"), ["o"])
 
     def test_our_own_blocks_never_feed_back(self):
         first = plan(c1=[ev("m", T)])
@@ -143,30 +132,12 @@ class BusyBridgeRules(unittest.TestCase):
         self.assertEqual(blocked(out, "client_1"), [])
         self.assertEqual((out["creates"], out["updates"], out["deletes"]), ([], [], []))
 
-
-class UniformRules(unittest.TestCase):
-    def test_default_rules_treat_every_source_alike(self):
-        c = {"mode": "plan"}
-        ctx = {"cfg": c}
-        ctx.update(reads(p1=[ev("free", T, transparency="transparent"), ev("ooo", T.replace("T10", "T13"), eventType="outOfOffice")],
-                         c1=[ev("d", "2026-11-25", "2026-11-26")]))
-        out = per_target(run(ctx), ("creates", "updates", "deletes"))
-        # a free event does not block, out-of-office does, all-day does not
-        self.assertEqual(blocked(out, "client_1"), ["ooo"])
-        self.assertEqual(blocked(out, "client_2"), ["ooo"])
-        self.assertEqual(out["client_1"]["creates"][0]["event"]["colorId"], "8")
-        self.assertNotIn("description", out["client_1"]["creates"][0]["event"])
-
-    def test_unknown_rules_refused(self):
-        ctx = {"cfg": {"mode": "plan", "rules": "ghost"}}
-        ctx.update(reads())
-        with self.assertRaisesRegex(RuntimeError, "rules must be uniform or busybridge"):
-            run(ctx)
-
-    def test_busybridge_blocks_are_never_mirrored(self):
+    def test_defaults(self):
         ctx = {"cfg": {"mode": "plan"}}
-        ctx.update(reads(p1=[ev("bb0123456789abc", T)]))
-        self.assertEqual(run(ctx)["creates"], [])
+        ctx.update(reads(p1=[ev("a", T)]))
+        body = run(ctx)["creates"][0]["event"]
+        self.assertEqual(body["colorId"], "8")
+        self.assertNotIn("description", body)
 
 
 class Diff(unittest.TestCase):
@@ -195,7 +166,7 @@ class Diff(unittest.TestCase):
         # three targets, one source-only: each target gets the source and the two others
         src = {"home": [ev("h", T)], "w1": [ev("a", "2026-11-26T10:00:00Z", "2026-11-26T11:00:00Z")], "w2": [], "w3": []}
         dst = {"w1": src["w1"], "w2": [], "w3": []}
-        ctx = {"cfg": {"mode": "plan", "rules": "busybridge"},
+        ctx = {"cfg": {"mode": "plan"},
                "src": by(src), "srcraw": by(src), "dst": by(dst), "dstraw": by(dst)}
         out = run(ctx)
         self.assertIn("home -> w1 1, home -> w2 1, home -> w3 1, w1 -> w2 1, w1 -> w3 1", out["summary"])
@@ -298,10 +269,12 @@ class Manifest(unittest.TestCase):
         with open(os.path.join(PACK, "conductor-pack.yaml")) as f:
             self.man = yaml.safe_load(f)
 
-    def test_0_1_0_settings_and_defaults_are_kept(self):
+    def test_settings_and_defaults(self):
         s = self.man["settings"]
-        want = {"window_days": 30, "block_title": "Busy", "show_details": False, "color_id": "8",
-                "mirror_all_day": False, "tag": "conductorBusySync", "max_deletes": 50,
+        # window_days and mirror_all_day changed default (30 -> 60, false -> true);
+        # the rest are 0.1.0's.
+        want = {"window_days": 60, "block_title": "Busy", "show_details": False, "color_id": "8",
+                "mirror_all_day": True, "tag": "conductorBusySync", "max_deletes": 50,
                 "remove_all": False, "batch_size": 50, "dry_run": False}
         self.assertEqual({k: s[k]["default"] for k in want}, want)
 

@@ -12,13 +12,9 @@
 # naming the source event it stands for, so a rerun is a no-op and a missed
 # run is caught up by the next.
 #
-# Two rule sets (`rules:`):
-#   uniform     (default) every source calendar is treated the same: what
-#               shows as busy, and you have not declined, blocks the others
-#   busybridge  BusyBridge's "Ghost Main" rules: a calendar only in `sources`
-#               is read-only/personal (its Free events still block, all-day
-#               only with mirror_all_day); a calendar in `targets` blocks the
-#               other targets with its all-day events too, never its Free ones
+# What blocks time: an event that shows as busy and that you have not
+# declined — all-day and out-of-office included, Free events and anything
+# with `[nosync]` in its description not.
 #
 # Triggers: on_change / on_target_change (Google push), sweep (cron backstop
 # + manual), cleanup (manual, one-time: retire BusyBridge's blocks).
@@ -41,7 +37,7 @@
 pack:
   name: calendar-busy-sync
   version: 1.0.0
-  description: Mirror busy time across any number of Google calendars as private "Busy" blocks, kept in step by Google push plus a sweep; one repeating block per repeating event; optional BusyBridge rules and a one-time BusyBridge cleanup. Pure verbs, no agent.
+  description: Mirror busy time across any number of Google calendars as private "Busy" blocks, kept in step by Google push plus a sweep; one repeating block per repeating event; a one-time cleanup of BusyBridge blocks for moving over. Pure verbs, no agent.
   tags: [calendar, google-calendar, busy, scheduling, sync]
   homepage: https://github.com/NodeSpy/conductor-packs
   license: Apache-2.0
@@ -61,22 +57,18 @@ pack:
 
 settings:
   # ---- what gets a block
-  rules:
-    type: string
-    default: uniform
-    desc: "uniform: every source is treated the same. busybridge: BusyBridge's rules — a calendar only in sources still blocks with its Free events; a target's all-day events block the other targets."
   window_days:
     type: integer
-    default: 30
+    default: 60
     desc: "How far ahead to mirror. Blocks beyond this appear as the window rolls forward."
   mirror_all_day:
     type: boolean
-    default: false
-    desc: "Also mirror all-day events that are marked busy (busybridge: all-day events of the source-only calendars; a target's always block). Off by default: most all-day events are reminders."
+    default: true
+    desc: "Mirror all-day events that are marked busy. Google makes all-day events Free unless you mark them busy, so reminders and birthdays never block either way."
   sync_out_of_office:
-    type: string
-    default: ""
-    desc: "Mirror out-of-office events: true or false. Empty: the rules decide (uniform mirrors them, busybridge does not)."
+    type: boolean
+    default: true
+    desc: "Mirror out-of-office events."
   nosync_tag:
     type: string
     default: "[nosync]"
@@ -88,7 +80,7 @@ settings:
   repeating_blocks:
     type: boolean
     default: true
-    desc: "A repeating event gets one repeating block. Off: a block per occurrence, as BusyBridge does."
+    desc: "A repeating event gets one repeating block. Off: a block per occurrence."
   # ---- what a block looks like
   block_title:
     type: string
@@ -144,7 +136,6 @@ workflows:
       - id: cfg
         set:
           mode: plan
-          rules: "${settings.rules}"
           window_days: "${settings.window_days}"
           block_title: "${settings.block_title}"
           show_details: "${settings.show_details}"
