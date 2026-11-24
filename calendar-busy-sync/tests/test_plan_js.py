@@ -1,4 +1,4 @@
-"""The reconcile's deterministic `plan` step (busy.js, mode plan) and the
+"""The reconcile's deterministic `plan` step and the
 manifest's `window` step, run under node exactly as the js engine runs them:
 which busy blocks get created, moved and removed.
 
@@ -15,7 +15,6 @@ import yaml
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 MANIFEST = os.path.join(HERE, "..", "conductor-pack.yaml")
-BUSY_JS = open(os.path.join(HERE, "..", "busy.js")).read()
 TAG = "conductorBusySync"
 
 CFG = {
@@ -33,8 +32,6 @@ CFG = {
 
 
 def step_code(step_id):
-    if step_id == "plan":
-        return BUSY_JS
     with open(MANIFEST) as f:
         man = yaml.safe_load(f)
     for s in man["workflows"]["reconcile"]["steps"]:

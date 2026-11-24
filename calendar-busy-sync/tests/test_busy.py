@@ -1,4 +1,4 @@
-"""busy.js — the pack's reconcile and BusyBridge-cleanup logic — run under node exactly
+"""The reconcile / cleanup js step (`plan`) — run under node exactly
 as the js engine runs it (the file is an IIFE body; `ctx` is the step scope).
 
     python3 -m unittest discover -s calendar-busy-sync/tests
@@ -14,7 +14,11 @@ import yaml
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PACK = os.path.join(HERE, "..")
-SRC = open(os.path.join(PACK, "busy.js")).read()
+with open(os.path.join(PACK, "conductor-pack.yaml")) as _f:
+    _MAN = yaml.safe_load(_f)
+# The plan step's code, as shipped in the manifest (the js engine has no file
+# access, so it is inline there).
+SRC = next(s for s in _MAN["workflows"]["reconcile"]["steps"] if s.get("id") == "plan")["code"]
 NOW = "2026-11-20T12:00:00Z"
 
 
@@ -262,7 +266,7 @@ class Cleanup(unittest.TestCase):
 
 
 class Manifest(unittest.TestCase):
-    """The manifest wires busy.js the way these tests assume, and keeps the
+    """The manifest wires the plan step the way these tests assume, and keeps the
     0.1.0 contract (#42): its settings, triggers and sockets."""
 
     def setUp(self):

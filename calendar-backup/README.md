@@ -69,4 +69,9 @@ it to your alerts like any other.
 
 ```sh
 python3 -m unittest discover -s calendar-backup/tests   # needs node + PyYAML
+bash calendar-backup/e2e/run.sh                         # needs go, a conductor-plugins checkout
 ```
+
+The e2e runs the real daemon and the real google-calendar and backup plugins
+against the fake Google Calendar API: backup, skip-if-unchanged, verify, and a
+corrupted snapshot failing verify.

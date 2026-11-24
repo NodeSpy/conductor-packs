@@ -324,7 +324,13 @@ property).
 
 ```sh
 python3 -m unittest discover -s calendar-busy-sync/tests   # needs node + PyYAML
+bash calendar-busy-sync/e2e/run.sh                         # needs go, a conductor-plugins checkout
 ```
 
-The tests run `busy.js` and the manifest's `window` step under node, exactly
-as the js engine runs them. The workflow's Google calls are not exercised.
+The tests run the manifest's `plan` and `window` js steps under node, exactly
+as the js engine runs them. The e2e runs the real daemon, the real google-calendar plugin (managed OAuth,
+paging, push) and the js engine against a fake Google Calendar API
+(`e2e/gcalfake.py`): sync, idempotence, moves and cancellations, hand-deleted
+blocks, push from sources and targets, 0.1.0 blocks adopted, the delete
+guard, `remove_all`, the BusyBridge cleanup, and many sweeps without the
+trigger being parked.

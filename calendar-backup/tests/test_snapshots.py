@@ -1,4 +1,4 @@
-"""snapshots.js — the backup pack's snapshot step — run under node exactly as
+"""The backup pack's snapshot step (`snap`) — run under node exactly as
 the js engine runs it, and the manifest wiring.
 
     python3 -m unittest discover -s calendar-backup/tests
@@ -14,7 +14,8 @@ import yaml
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PACK = os.path.join(HERE, "..")
-SRC = open(os.path.join(PACK, "snapshots.js")).read()
+with open(os.path.join(PACK, "conductor-pack.yaml")) as _f:
+    SRC = next(s for s in yaml.safe_load(_f)["workflows"]["backup"]["steps"] if s.get("id") == "snap")["code"]
 
 
 def run(ctx):
