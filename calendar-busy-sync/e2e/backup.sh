@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
-# End-to-end: calendar-backup through the real conductor daemon, the real
-# google-calendar and backup plugins, against the fake Google Calendar API
-# (../../calendar-busy-sync/e2e/gcalfake.py): a backup writes JSON + ICS per
+# End-to-end: calendar-busy-sync's optional backups through the real
+# conductor daemon, the real google-calendar and backup plugins, against the
+# fake Google Calendar API (gcalfake.py): a backup writes JSON + ICS per
 # calendar and an index to a local tier; verify restore-tests every set; a
 # corrupted snapshot fails verify.
 #
-# Usage: bash calendar-backup/e2e/run.sh   (KEEP=1 keeps the work dir)
-#   CONDUCTOR / PLUGINS_SRC as in calendar-busy-sync/e2e/run.sh.
+# Usage: bash calendar-busy-sync/e2e/backup.sh   (KEEP=1 keeps the work dir)
+#   CONDUCTOR / PLUGINS_SRC as in run.sh.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 PACK="$(cd "$HERE/.." && pwd)"
-FAKEPY="$(cd "$HERE/../../calendar-busy-sync/e2e" && pwd)/gcalfake.py"
+FAKEPY="$HERE/gcalfake.py"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/calbak-e2e.XXXXXX")"
 FAKE_PID=""; DAEMON_PID=""
 cleanup() { [ -n "${BK:-}" ] && rm -rf "$BK"; [ -n "$DAEMON_PID" ] && kill "$DAEMON_PID" 2>/dev/null; [ -n "$FAKE_PID" ] && kill "$FAKE_PID" 2>/dev/null; [ -n "${KEEP:-}" ] && echo "kept $WORK" || rm -rf "$WORK"; }
@@ -33,7 +33,7 @@ mkdir -p "$HOME" "$XDG_STATE_HOME" "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME" "$WORK/c
 # The backup plugin's jail refuses a directory under /tmp (other programs'
 # sockets live there), so the tier lives under the real home.
 BK="$(mktemp -d "$(eval echo ~"$(id -un)")/.calbak-e2e.XXXXXX")"
-cp -r "$PACK" "$WORK/cfg/calendar-backup"; rm -rf "$WORK/cfg/calendar-backup/tests" "$WORK/cfg/calendar-backup/e2e"
+cp -r "$PACK" "$WORK/cfg/calendar-busy-sync"; rm -rf "$WORK/cfg/calendar-busy-sync/tests" "$WORK/cfg/calendar-busy-sync/e2e"
 
 PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1])')
 FAKE="http://127.0.0.1:$PORT"
@@ -58,7 +58,7 @@ cat > "$WORK/cfg/config.yaml" <<YAML
 connectors:
 $(gc home)
 $(gc work)
-  timer: { use: cron, schedules: { busy_backup: { every: 24h }, busy_verify: { every: 24h } } }
+  timer: { use: cron, schedules: { busy_sync: { every: 24h }, busy_backup: { every: 24h }, busy_verify: { every: 24h } } }
   calbackup:
     use: $WORK/conductor-backup
     allow_unverified: true
@@ -67,8 +67,8 @@ $(gc work)
       - { name: local, driver: local, dir: $BK/cal, keep_daily: 7 }
 packs:
   calbak:
-    use: ./calendar-backup
-    connectors: { calendars: [home, work], cron: timer, backup: calbackup }
+    use: ./calendar-busy-sync
+    connectors: { sources: [home], targets: [work], cron: timer, backup: calbackup }
     triggers: { backup: { enabled: true }, verify: { enabled: true } }
 YAML
 

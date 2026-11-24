@@ -289,7 +289,7 @@ class Manifest(unittest.TestCase):
         req = self.man["pack"]["requires"]["connectors"]
         self.assertTrue(req["sources"]["many"] and req["targets"]["many"])
         self.assertNotIn("min", req["targets"])
-        self.assertNotIn("backup", req)
+        self.assertIs(req["backup"]["required"], False)
         self.assertEqual(req["cron"], "*")
 
     def test_sweep_and_push_share_one_queue_and_lift_the_attempt_limit(self):

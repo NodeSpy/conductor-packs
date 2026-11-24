@@ -67,7 +67,7 @@ Every calendar follows the same rule, whichever list it is in.
 
 ## Requires
 
-- conductor `>=0.106.0` (list sockets).
+- conductor `>=0.107.0`.
 - The [`google-calendar`](https://github.com/NodeSpy/conductor-plugins/blob/main/docs/connectors/google-calendar.md)
   connector `>=1.2.0`, one instance per calendar.
 - A `cron` connector with a `busy_sync` schedule.
@@ -75,8 +75,8 @@ Every calendar follows the same rule, whichever list it is in.
   funnel, cloudflared, ngrok) so Google can reach each connector's `watch`
   receiver. Without one, arm only `sweep`.
 
-Backups of the same calendars are a separate pack,
-[`calendar-backup`](../calendar-backup/).
+- For backups (optional): a [`backup`](https://github.com/NodeSpy/conductor-plugins/blob/main/docs/connectors/backup.md)
+  connector, and `busy_backup` / `busy_verify` schedules. See [Backups](#backups).
 
 ## Google setup
 
@@ -232,6 +232,45 @@ the plan expects.
 
 When the split looks right, remove `dry_run` and reload.
 
+## Backups
+
+Optional. Bind a `backup` connector and arm the `backup` and `verify`
+triggers; without one, they are dormant and `conductor init` says so.
+
+```yaml
+connectors:
+  timer:
+    use: cron
+    schedules:
+      busy_sync:   { every: 15m }
+      busy_backup: { cron: "17 3 * * *" }   # nightly
+      busy_verify: { cron: "41 4 * * 0" }   # weekly restore test
+  calbackup:
+    use: backup
+    tiers:
+      - { name: local, driver: local, dir: ~/backups/calendar, keep_daily: 14, keep_weekly: 8, keep_monthly: 12 }
+      # - { name: offsite, driver: s3, … }   # any backup tier
+    allow_paths: [~/backups/calendar]
+
+packs:
+  busy:
+    connectors: { sources: […], targets: […], cron: timer, backup: calbackup }
+    triggers:
+      backup: { enabled: true }
+      verify: { enabled: true }
+```
+
+- **`backup` (nightly).** Every calendar in either list, two snapshots each:
+  - `<prefix>-<connector>-json`: the raw API events, lossless and re-insertable.
+  - `<prefix>-<connector>-ics`: for any calendar app.
+
+  Plus `<prefix>-index`, the list of sets. A year back to two years ahead,
+  repeating events kept as series. Unchanged snapshots are skipped; each
+  tier's retention applies. Read-only on the calendars.
+- **`verify` (weekly).** Restores the index, then each set's newest snapshot
+  from every tier, checks its sha256 and size, and runs the backend's own
+  check. The run fails if anything doesn't match.
+
 ## Alerts
 
 A failed run (a write Google refused, the delete guard) is an ordinary
@@ -290,6 +329,9 @@ property).
 | `batch_size` | `50` | Most blocks created, moved or removed per run (and cleanup changes). The rest follow on the next runs. Keep it under your `policy.max_fan_out` (100 by default) |
 | `remove_all` | `false` | Remove every block in the window instead of syncing |
 | `cleanup_max_ops` | `1000` | BusyBridge cleanup cap |
+| `backup_tiers` | all | Comma-separated tiers to write and verify |
+| `backup_prefix` | `calendar` | Backup set-name prefix |
+| `backup_days_back` / `_ahead` | `365` / `730` | Backup window |
 
 ## Good to know
 
@@ -325,6 +367,7 @@ property).
 ```sh
 python3 -m unittest discover -s calendar-busy-sync/tests   # needs node + PyYAML
 bash calendar-busy-sync/e2e/run.sh                         # needs go, a conductor-plugins checkout
+bash calendar-busy-sync/e2e/backup.sh
 ```
 
 The tests run the manifest's `plan` and `window` js steps under node, exactly
@@ -333,4 +376,6 @@ paging, push) and the js engine against a fake Google Calendar API
 (`e2e/gcalfake.py`): sync, idempotence, moves and cancellations, hand-deleted
 blocks, push from sources and targets, 0.1.0 blocks adopted, the delete
 guard, `remove_all`, the BusyBridge cleanup, and many sweeps without the
-trigger being parked.
+trigger being parked; and a config without a backup connector loading with
+backups dormant. `backup.sh` runs the backups through the real backup plugin:
+backup, skip-if-unchanged, verify, and a corrupted snapshot failing verify.

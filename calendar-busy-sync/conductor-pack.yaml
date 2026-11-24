@@ -18,7 +18,8 @@
 #
 # Triggers: on_change / on_target_change (Google push), sweep (cron backstop
 # + manual), cleanup (manual, one-time: retire BusyBridge's blocks).
-# Backups of the calendars are the sibling pack `calendar-backup`.
+# backup / verify (nightly JSON + ICS snapshots and a weekly restore test),
+# only when a backup connector is bound.
 #
 # Install (in your config's `packs:` block — see README.md for the full config
 # and the Google OAuth setup):
@@ -36,15 +37,16 @@
 
 pack:
   name: calendar-busy-sync
-  version: 1.0.0
-  description: Mirror busy time across any number of Google calendars as private "Busy" blocks, kept in step by Google push plus a sweep; one repeating block per repeating event; a one-time cleanup of BusyBridge blocks for moving over. Pure verbs, no agent.
-  tags: [calendar, google-calendar, busy, scheduling, sync]
+  version: 1.1.0
+  description: Mirror busy time across any number of Google calendars as private "Busy" blocks, kept in step by Google push plus a sweep; one repeating block per repeating event; optional nightly JSON/ICS backups with a restore test; a one-time cleanup of BusyBridge blocks for moving over. Pure verbs, no agent.
+  tags: [calendar, google-calendar, busy, scheduling, sync, backup]
   homepage: https://github.com/NodeSpy/conductor-packs
   license: Apache-2.0
   requires:
-    # >=0.106.0: list sockets (`many: true`) and the `over:`/`member:` step
-    # fields that address them.
-    conductor: ">=0.106.0"
+    # >=0.107.0: list sockets (`many: true`) with `over:`/`member:` steps
+    # (0.106), and an unbound optional connector parking the workflows that
+    # call it (0.107) — so a config without a backup connector loads.
+    conductor: ">=0.107.0"
     connectors:
       # List sockets: you name every calendar the pack may read and write. A
       # calendar may sit in both lists (two work calendars that block each
@@ -52,8 +54,12 @@ pack:
       # google-calendar >=1.2.0: the `changed` push source and paged `events`.
       sources: { many: true, type: google-calendar, version: ">=1.2.0" }
       targets: { many: true, type: google-calendar, version: ">=1.2.0" }
-      # The sweep schedule. Your cron connector must declare `busy_sync`.
+      # The sweep schedule. Your cron connector must declare `busy_sync`
+      # (and `busy_backup` / `busy_verify` if you arm those triggers).
       cron: "*"
+      # Optional: bind a backup connector to get nightly backups and a weekly
+      # restore test. Leave it out and those two triggers are dormant.
+      backup: { version: ">=1.0.0", required: false }
 
 settings:
   # ---- what gets a block
@@ -119,6 +125,23 @@ settings:
     type: boolean
     default: false
     desc: "Remove every block in the window (and a year back) instead of syncing. Leave it on for a few sweeps before uninstalling, then disarm."
+  # ---- backups (only with a backup connector bound)
+  backup_tiers:
+    type: string
+    default: ""
+    desc: "Comma-separated backup tiers to write and verify. Empty: every tier of the bound backup connector."
+  backup_prefix:
+    type: string
+    default: calendar
+    desc: "Set names are <prefix>-<connector>-json / -ics (e.g. calendar-cal-work-ics), plus <prefix>-index."
+  backup_days_back:
+    type: integer
+    default: 365
+    desc: "The backup covers events from this many days ago..."
+  backup_days_ahead:
+    type: integer
+    default: 730
+    desc: "...to this many days ahead (repeating events are kept as one series)."
   # ---- BusyBridge cleanup
   cleanup_max_ops:
     type: integer
@@ -642,6 +665,155 @@ workflows:
           if (bad.length) throw new Error("some block writes failed, the next run retries them: " + bad.map((k) => k + ": " + ctx[k].error).join("; "));
           return { pending: ctx.plan.pending };
 
+  backup:
+    description: "Snapshot every calendar (raw API JSON, re-insertable, and ICS) into the backup connector's tiers; unchanged snapshots are skipped, each tier's retention applies."
+    steps:
+      - id: cfg
+        set: { backup_prefix: "${settings.backup_prefix}" }
+      - id: win
+        use: js
+        code: |
+          const back = Number("${settings.backup_days_back}"), ahead = Number("${settings.backup_days_ahead}");
+          const now = Date.now();
+          const tiers = "${settings.backup_tiers}".split(",").map((s) => s.trim()).filter(Boolean);
+          return { min: new Date(now - back * 86400000).toISOString(), max: new Date(now + ahead * 86400000).toISOString(), tiers: tiers };
+      # Not expanded: a repeating event is one series, not hundreds of items.
+      - parallel:
+          - - { id: srcraw, uses: sources.events, over: true, parallel: true, progress: reading calendars,
+                options: { timeMin: "{{.win.min}}", timeMax: "{{.win.max}}", singleEvents: false, maxResults: 2500, max_pages: 200 } }
+          - - { id: dstraw, uses: targets.events, over: true, parallel: true,
+                options: { timeMin: "{{.win.min}}", timeMax: "{{.win.max}}", singleEvents: false, maxResults: 2500, max_pages: 200 } }
+      - id: snap
+        use: js
+        code: |
+          // The backup snapshot step, run as a `use: js` code step body (an
+          // IIFE: top-level `return` is the step's outputs).
+          //
+          // The calendars arrive keyed by connector name from the `over:` read steps
+          // (ctx.srcraw / ctx.dstraw .by_member = { <connector>: { items } }); for each one this returns
+          // two snapshots to store — the raw API JSON (lossless, re-insertable) and an
+          // ICS file any calendar app can import — plus an index of every set, which
+          // the restore test reads. Pure: the workflow does the I/O.
+
+          const cfg = ctx.cfg || {};
+
+          function calendars(id) {
+            const s = ctx[id];
+            const by = s && s.by_member;
+            if (!by || typeof by !== "object") throw new Error("step " + id + " returned no calendars");
+            const out = {};
+            for (const name of Object.keys(by).sort()) {
+              const r = by[name];
+              const items = Array.isArray(r) ? r : r && r.items;
+              if (!Array.isArray(items)) throw new Error("step " + id + ": " + name + " returned no items");
+              out[name] = items;
+            }
+            return out;
+          }
+
+          function icsEscape(s) {
+            return String(s).replace(/\\/g, "\\\\").replace(/;/g, "\\;").replace(/,/g, "\\,")
+              .replace(/\r\n|\r|\n/g, "\\n");
+          }
+          function icsFold(line) {
+            // RFC 5545 §3.1: lines over 75 octets fold with CRLF + space. Count UTF-16
+            // units conservatively (≤ 74) so a multi-byte character never splits badly.
+            const out = [];
+            while (line.length > 74) {
+              out.push(line.slice(0, 74));
+              line = " " + line.slice(74);
+            }
+            out.push(line);
+            return out.join("\r\n");
+          }
+          function icsTime(name, t) {
+            if (t.date) return name + ";VALUE=DATE:" + t.date.replace(/-/g, "");
+            const d = new Date(t.dateTime);
+            const p = (n) => ("0" + n).slice(-2);
+            return name + ":" + d.getUTCFullYear() + p(d.getUTCMonth() + 1) + p(d.getUTCDate()) + "T" +
+              p(d.getUTCHours()) + p(d.getUTCMinutes()) + p(d.getUTCSeconds()) + "Z";
+          }
+          function toICS(name, evs) {
+            const L = ["BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//NodeSpy//calendar-busy-sync//EN", "X-WR-CALNAME:" + icsEscape(name)];
+            for (const e of evs) {
+              if (e.status === "cancelled" || !e.start || !e.end) continue;
+              L.push("BEGIN:VEVENT");
+              L.push("UID:" + icsEscape(e.iCalUID || e.id));
+              if (e.recurringEventId && e.originalStartTime) L.push(icsTime("RECURRENCE-ID", e.originalStartTime));
+              L.push(icsTime("DTSTART", e.start));
+              L.push(icsTime("DTEND", e.end));
+              if (e.updated) L.push(icsTime("DTSTAMP", { dateTime: e.updated }));
+              for (const r of e.recurrence || []) L.push(r);
+              if (e.summary) L.push("SUMMARY:" + icsEscape(e.summary));
+              if (e.description) L.push("DESCRIPTION:" + icsEscape(e.description));
+              if (e.location) L.push("LOCATION:" + icsEscape(e.location));
+              if (e.status) L.push("STATUS:" + e.status.toUpperCase());
+              if (e.transparency === "transparent") L.push("TRANSP:TRANSPARENT");
+              L.push("END:VEVENT");
+            }
+            L.push("END:VCALENDAR");
+            return L.map(icsFold).join("\r\n") + "\r\n";
+          }
+          function snapshotsMode() {
+            const prefix = cfg.backup_prefix || "calendar";
+            const snaps = [];
+            // A calendar in both lists is read twice; it is snapshot once.
+            const cal = Object.assign({}, calendars("srcraw"), calendars("dstraw"));
+            for (const s of Object.keys(cal).sort()) {
+              const evs = cal[s];
+              const set = prefix + "-" + s.replace(/[^A-Za-z0-9._-]/g, "-");
+              snaps.push({ set: set + "-json", ext: "json", text: JSON.stringify(evs) });
+              snaps.push({ set: set + "-ics", ext: "ics", text: toICS(s, evs) });
+            }
+            // The index lists every set, so the restore test knows what to verify
+            // without reading the calendars.
+            const sets = snaps.map((x) => x.set);
+            snaps.push({ set: prefix + "-index", ext: "json", text: JSON.stringify({ sets: sets }) });
+            return { snapshots: snaps, sets: sets };
+          }
+
+
+          return snapshotsMode();
+      - id: put
+        for_each: "{{.snap.snapshots}}"
+        progress: writing backups
+        uses: backup.put
+        options: { set: "{{.item.set}}", ext: "{{.item.ext}}", text: "{{.item.text}}", tiers: "{{.win.tiers}}" }
+
+  verify:
+    description: "Restore test: restore each set's newest snapshot from every tier and check it against its recorded sha256/size, plus the backend's own consistency check."
+    steps:
+      - id: names
+        use: js
+        code: |
+          const tiers = "${settings.backup_tiers}".split(",").map((s) => s.trim()).filter(Boolean);
+          return { index: "${settings.backup_prefix}-index", tiers: tiers };
+      # The nightly backup writes an index of its sets; restore it first (an
+      # integrity-checked read), then test every set it names.
+      - id: index
+        uses: backup.read
+        options: { set: "{{.names.index}}" }
+      - id: sets
+        use: js
+        code: |
+          const sets = JSON.parse(ctx.index.content).sets;
+          if (!Array.isArray(sets) || !sets.length) throw new Error("the index names no sets");
+          return { sets: [ctx.names.index].concat(sets) };
+      - id: verify
+        for_each: "{{.sets.sets}}"
+        progress: restore-testing backups
+        continue_on_error: true
+        uses: backup.verify
+        options: { set: "{{.item}}", mode: both, sample: 1, tiers: "{{.names.tiers}}" }
+      - id: verified
+        use: js
+        code: |
+          if (ctx.verify.failed) throw new Error("restore test failed: " + ctx.verify.error);
+          const bad = [];
+          (ctx.verify.items || []).forEach((r, i) => { if (!r || r.ok !== true) bad.push(ctx.sets.sets[i]); });
+          if (bad.length) throw new Error("restore test failed for: " + bad.join(", "));
+          return { verified: (ctx.verify.items || []).length };
+
 # conductor counts every run of a trigger against one target as an "attempt",
 # backs off past max_attempts_per_head (3 by default) and PARKS the trigger for
 # good at twice that. That suits a fixer retrying one PR; a calendar or a cron
@@ -688,6 +860,20 @@ triggers:
     serialize: { key: calendar-busy-sync }
     steps:
       - call: reconcile
+
+  - name: backup
+    "on": [cron.busy_backup, manual]
+    policy: *always
+    serialize: { key: calendar-busy-sync-backup }
+    steps:
+      - call: backup
+
+  - name: verify
+    "on": [cron.busy_verify, manual]
+    policy: *always
+    serialize: { key: calendar-busy-sync-backup }
+    steps:
+      - call: verify
 
   # Manual only, one-time: retire BusyBridge's own blocks on the targets.
   # `conductor run <inst>/cleanup` reports; add `--input apply=true` to make

@@ -1,7 +1,7 @@
-"""The backup pack's snapshot step (`snap`) — run under node exactly as
+"""The backup workflow's snapshot step (`snap`) — run under node exactly as
 the js engine runs it, and the manifest wiring.
 
-    python3 -m unittest discover -s calendar-backup/tests
+    python3 -m unittest discover -s calendar-busy-sync/tests
 
 Needs node and PyYAML.
 """
@@ -37,8 +37,11 @@ def ev(id, start, end=None, **kw):
     return e
 
 
-def reads(*names, items=()):
-    return {"read": {"by_member": {n: {"items": list(items)} for n in names}}}
+def reads(*names, items=(), targets=()):
+    """srcraw holds every named calendar; dstraw the targets (which are also
+    in srcraw, as a calendar in both lists is)."""
+    by = lambda ns: {"by_member": {n: {"items": list(items)} for n in ns}}
+    return {"srcraw": by(names), "dstraw": by(targets)}
 
 
 T = "2026-11-25T10:00:00-07:00"
@@ -52,9 +55,9 @@ class Backup(unittest.TestCase):
                ev("d", "2026-11-25", "2026-11-26", summary="Holiday"),
                ev("z", T, status="cancelled")]
         ctx = {"cfg": {"backup_prefix": "cal"}}
-        ctx.update(reads("personal_1", "personal_2", "client_1", "client_2", items=evs))
+        ctx.update(reads("personal_1", "personal_2", "client_1", "client_2", items=evs, targets=("client_1", "client_2")))
         out = run(ctx)
-        self.assertEqual(len(out["snapshots"]), 9)  # 4 calendars x (json, ics), + the index
+        self.assertEqual(len(out["snapshots"]), 9)  # 4 calendars (one in both lists counted once) x (json, ics), + the index
         self.assertEqual(out["sets"][:2], ["cal-client_1-json", "cal-client_1-ics"])
         index = out["snapshots"][-1]
         self.assertEqual(index["set"], "cal-index")
@@ -75,7 +78,7 @@ class Backup(unittest.TestCase):
 
     def test_a_calendar_that_read_back_without_items_fails(self):
         bad = reads("a")
-        bad["read"]["by_member"]["b"] = {}
+        bad["srcraw"]["by_member"]["b"] = {}
         with self.assertRaisesRegex(RuntimeError, "b returned no items"):
             run(dict(bad, cfg={}))
 
@@ -86,18 +89,31 @@ class Manifest(unittest.TestCase):
             self.man = yaml.safe_load(f)
 
     def test_reads_every_calendar_unexpanded(self):
-        read = next(s for s in self.man["workflows"]["backup"]["steps"] if s.get("id") == "read")
-        self.assertTrue(read["over"])
-        self.assertEqual(read["uses"], "calendars.events")
-        self.assertIs(read["options"]["singleEvents"], False)
+        steps = self.man["workflows"]["backup"]["steps"]
+        reads = [b[0] for s in steps if isinstance(s.get("parallel"), list) for b in s["parallel"]]
+        self.assertEqual(sorted(r["uses"] for r in reads), ["sources.events", "targets.events"])
+        for r in reads:
+            self.assertTrue(r["over"])
+            self.assertIs(r["options"]["singleEvents"], False)
 
-    def test_never_writes_to_a_calendar(self):
-        uses = [s.get("uses", "") for w in self.man["workflows"].values() for s in w["steps"]]
-        self.assertFalse([u for u in uses if u.startswith("calendars.") and u != "calendars.events"])
+    def test_backup_and_verify_never_write_to_a_calendar(self):
+        for wf in ("backup", "verify"):
+            uses = []
+            def walk(steps):
+                for s in steps:
+                    uses.append(s.get("uses", ""))
+                    for b in s.get("parallel", []) if isinstance(s.get("parallel"), list) else []:
+                        walk(b)
+            walk(self.man["workflows"][wf]["steps"])
+            self.assertFalse([u for u in uses if u.split(".")[0] in ("sources", "targets") and u.split(".")[1] != "events"])
 
-    def test_triggers_lift_the_attempt_limit(self):
+    def test_backup_connector_is_optional(self):
+        self.assertIs(self.man["pack"]["requires"]["connectors"]["backup"]["required"], False)
+
+    def test_backup_triggers_lift_the_attempt_limit(self):
         for t in self.man["triggers"]:
-            self.assertGreaterEqual(t["policy"]["max_attempts_per_head"], 10**9)
+            if t["name"] in ("backup", "verify"):
+                self.assertGreaterEqual(t["policy"]["max_attempts_per_head"], 10**9)
 
 
 if __name__ == "__main__":
