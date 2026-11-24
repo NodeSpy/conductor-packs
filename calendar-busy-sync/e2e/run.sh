@@ -141,6 +141,12 @@ sweep() { # run one sweep and wait for it to finish
 }
 last_plan() { grep "calendar-busy-sync: " "$WORK/daemon.log" | tail -1 | sed 's/.*calendar-busy-sync: //'; }
 
+echo "== 0. no backup connector: backups are dormant, the rest loads"
+write_config "{ dry_run: true }"
+(cd "$WORK/cfg" && "$CONDUCTOR" init --config config.yaml >"$WORK/init.log" 2>&1) || { cat "$WORK/init.log"; exit 1; }
+grep -q 'optional connector "backup" is not bound, so what uses it is DORMANT' "$WORK/init.log" && ok "init says backups are dormant" || bad "no dormant notice: $(grep -i backup "$WORK/init.log" | head -2)"
+(cd "$WORK/cfg" && "$CONDUCTOR" validate --config config.yaml >"$WORK/validate.log" 2>&1) && ok "validate passes" || { bad "validate failed"; grep -E "^error" "$WORK/validate.log"; }
+
 echo "== 1. dry run writes nothing"
 write_config "{ dry_run: true }"
 start
